@@ -239,17 +239,19 @@ class NeuralMemory(nn.Module):
                         params[n] = w[i].detach()
 
                 # Forward pass: M(k) for this batch item
-                k_i = keys[i:i+1]  # [1, T, C]
-                pred = torch.func.functional_call(self.memory_mlp, params, (k_i,))  # [1, T, C]
+                # Use enable_grad to allow gradient computation even in no_grad context
+                with torch.enable_grad():
+                    k_i = keys[i:i+1]  # [1, T, C]
+                    pred = torch.func.functional_call(self.memory_mlp, params, (k_i,))  # [1, T, C]
 
-                # Target: v
-                v_i = values[i:i+1]  # [1, T, C]
+                    # Target: v
+                    v_i = values[i:i+1]  # [1, T, C]
 
-                # MSE loss (eq 12 from paper)
-                loss = F.mse_loss(pred, v_i)
+                    # MSE loss (eq 12 from paper)
+                    loss = F.mse_loss(pred, v_i)
 
-                # Compute gradient (surprise)
-                grad = torch.autograd.grad(loss, w_i, create_graph=False)[0]
+                    # Compute gradient (surprise)
+                    grad = torch.autograd.grad(loss, w_i, create_graph=False)[0]
 
                 # Surprise is negative gradient (we want to move towards reducing loss)
                 surprise = -grad
