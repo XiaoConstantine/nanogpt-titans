@@ -615,16 +615,16 @@ class TitansGPT(nn.Module):
                 if fpn == "lm_head.weight":
                     continue
 
+                # Check no_decay conditions first (they take priority)
                 if pn.endswith("bias"):
+                    no_decay.add(fpn)
+                elif "memory_mlp" in fpn or "persist_mem" in fpn:
+                    # Memory MLP weights are templates for per-sequence memory
+                    no_decay.add(fpn)
+                elif pn.endswith("weight") and isinstance(m, blacklist_weight_modules):
                     no_decay.add(fpn)
                 elif pn.endswith("weight") and isinstance(m, whitelist_weight_modules):
                     decay.add(fpn)
-                elif (
-                    (pn.endswith("weight") and isinstance(m, blacklist_weight_modules))
-                    or "memory_mlp" in fpn  # Memory MLP weights are templates, not trained directly
-                    or "persist_mem" in fpn
-                ):
-                    no_decay.add(fpn)
 
         param_dict = dict(self.named_parameters())
         inter_params = decay & no_decay
