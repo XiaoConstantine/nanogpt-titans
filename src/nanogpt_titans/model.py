@@ -36,7 +36,8 @@ class TitansConfig:
 
     # Titans-specific config
     segment_len: int = 64  # tokens per segment
-    memory_depth: int = 2  # MLP layers in neural memory
+    memory_depth: int = 2  # MLP layers in neural memory (paper uses 1-4, default 2)
+    memory_expansion: int = 2  # hidden dim multiplier (2 = n_embd*2, reduced from 4 for memory)
     num_persist_mem: int = 4  # persistent memory tokens
     num_longterm_mem: int = 16  # long-term memory tokens retrieved
     memory_lr: float = 0.01  # learning rate for surprise-based updates
@@ -107,7 +108,8 @@ class NeuralMemory(nn.Module):
         self.num_longterm_mem = config.num_longterm_mem  # type: ignore[assignment]
 
         # Template MLP - its weights are cloned per-sequence as initial memory
-        hidden_dim = config.n_embd * 4
+        # Use smaller hidden_dim for memory efficiency
+        hidden_dim = config.n_embd * config.memory_expansion
         self.memory_mlp = MemoryMLP(
             dim=config.n_embd,
             hidden_dim=hidden_dim,
