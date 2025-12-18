@@ -58,21 +58,46 @@ class LayerNorm(nn.Module):
 
 @dataclass
 class MemoryState:
-    """Per-sequence memory state."""
+    """Per-sequence memory state - stores MLP weights as the memory."""
 
-    memory_tokens: torch.Tensor  # [B, num_longterm_mem, C] - the actual memory content
-    momentum_buffer: torch.Tensor  # [B, num_longterm_mem, C] - surprise momentum
+    # MLP weights per batch item: dict mapping param_name -> [B, *param_shape]
+    weights: dict[str, torch.Tensor]
+    # Momentum buffer for each weight: same structure as weights
+    momentum: dict[str, torch.Tensor]
     step: int = 0
+
+
+class MemoryMLP(nn.Module):
+    """
+    Small MLP whose weights serve as the memory.
+
+    This is a stateless module - actual weights are passed in via functional_call.
+    """
+
+    def __init__(self, dim: int, hidden_dim: int, depth: int = 2, bias: bool = True) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList()
+        in_dim = dim
+        for _ in range(depth - 1):
+            self.layers.append(nn.Linear(in_dim, hidden_dim, bias=bias))
+            in_dim = hidden_dim
+        self.layers.append(nn.Linear(in_dim, dim, bias=bias))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers[:-1]:  # type: ignore[union-attr]
+            x = F.silu(layer(x))
+        return self.layers[-1](x)
 
 
 class NeuralMemory(nn.Module):
     """
     Neural Memory Module that learns at test time.
 
-    Fixed version:
-    - initial_memory is a learned parameter (template)
-    - Actual memory is stored in MemoryState (per-sequence)
-    - Updates modify state, not global parameters
+    Correct implementation based on Titans paper:
+    - Memory IS the MLP weights (stored per-sequence in MemoryState)
+    - Surprise = gradient of MSE loss w.r.t. MLP weights
+    - Memory update = weight update with momentum and decay
+    - Retrieval = forward pass through MLP with per-sequence weights
     """
 
     def __init__(self, config: TitansConfig) -> None:
@@ -81,25 +106,21 @@ class NeuralMemory(nn.Module):
         self.n_embd = config.n_embd  # type: ignore[assignment]
         self.num_longterm_mem = config.num_longterm_mem  # type: ignore[assignment]
 
-        # Memory MLP: transforms memory tokens for retrieval
+        # Template MLP - its weights are cloned per-sequence as initial memory
         hidden_dim = config.n_embd * 4
-        layers: list[nn.Module] = []
-        in_dim = config.n_embd
-        for _ in range(config.memory_depth - 1):
-            layers.extend(
-                [
-                    nn.Linear(in_dim, hidden_dim, bias=config.bias),
-                    nn.SiLU(),
-                ]
-            )
-            in_dim = hidden_dim
-        layers.append(nn.Linear(in_dim, config.n_embd, bias=config.bias))
-        self.memory_mlp = nn.Sequential(*layers)
-
-        # Initial memory tokens (learned template, cloned per-sequence)
-        self.initial_memory = nn.Parameter(
-            torch.randn(1, config.num_longterm_mem, config.n_embd) * 0.02
+        self.memory_mlp = MemoryMLP(
+            dim=config.n_embd,
+            hidden_dim=hidden_dim,
+            depth=config.memory_depth,
+            bias=config.bias,
         )
+
+        # Query projection for retrieval
+        self.query_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+
+        # Key/Value projections for storage
+        self.key_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.value_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
 
         # Output projection
         self.out_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
@@ -109,20 +130,35 @@ class NeuralMemory(nn.Module):
         self.momentum = config.memory_momentum  # type: ignore[assignment]
         self.decay = config.memory_decay  # type: ignore[assignment]
 
-    def init_state(self, batch_size: int, _device: torch.device) -> MemoryState:
-        """Initialize memory state for a new sequence."""
-        # Clone initial memory for each batch item (detach to make it mutable state)
-        memory_tokens = self.initial_memory.expand(batch_size, -1, -1).clone()
-        momentum_buffer = torch.zeros_like(memory_tokens)
-        return MemoryState(
-            memory_tokens=memory_tokens,
-            momentum_buffer=momentum_buffer,
-            step=0,
-        )
+    def init_state(self, batch_size: int, device: torch.device) -> MemoryState:
+        """Initialize memory state - clone MLP weights for each batch item."""
+        weights: dict[str, torch.Tensor] = {}
+        momentum: dict[str, torch.Tensor] = {}
+
+        for name, param in self.memory_mlp.named_parameters():
+            # Expand weights to [B, *param_shape] and clone
+            expanded = param.detach().unsqueeze(0).expand(batch_size, *param.shape).clone()
+            weights[name] = expanded.to(device)
+            momentum[name] = torch.zeros_like(expanded)
+
+        return MemoryState(weights=weights, momentum=momentum, step=0)
+
+    def _forward_with_weights(
+        self,
+        x: torch.Tensor,
+        weights: dict[str, torch.Tensor],
+        batch_idx: int,
+    ) -> torch.Tensor:
+        """Forward pass through MLP using specific weights for one batch item."""
+        # Extract weights for this batch item
+        params = {name: w[batch_idx] for name, w in weights.items()}
+
+        # Use functional_call to apply MLP with these weights
+        return torch.func.functional_call(self.memory_mlp, params, (x,))
 
     def forward(
         self,
-        _x: torch.Tensor,
+        x: torch.Tensor,
         state: MemoryState,
     ) -> torch.Tensor:
         """
@@ -130,14 +166,33 @@ class NeuralMemory(nn.Module):
 
         Args:
             x: Input tensor [B, T, C]
-            state: Current memory state
+            state: Current memory state (contains per-sequence MLP weights)
 
         Returns:
             retrieved: Memory context [B, num_longterm_mem, C]
         """
-        # Transform memory through MLP
-        memory_out = self.memory_mlp(state.memory_tokens)
-        return self.out_proj(memory_out)
+        b, _t, _c = x.shape
+
+        # Project input to queries
+        queries = self.query_proj(x)  # [B, T, C]
+
+        # Retrieve by passing queries through per-sequence MLP
+        retrieved_list = []
+        for i in range(b):
+            # Get memory output for this batch item
+            q_i = queries[i:i+1]  # [1, T, C]
+            mem_out = self._forward_with_weights(q_i, state.weights, i)  # [1, T, C]
+            retrieved_list.append(mem_out)
+
+        retrieved = torch.cat(retrieved_list, dim=0)  # [B, T, C]
+
+        # Pool to num_longterm_mem tokens
+        # Use adaptive pooling to get fixed number of memory tokens
+        retrieved = retrieved.transpose(1, 2)  # [B, C, T]
+        retrieved = F.adaptive_avg_pool1d(retrieved, self.num_longterm_mem)  # [B, C, num_longterm_mem]
+        retrieved = retrieved.transpose(1, 2)  # [B, num_longterm_mem, C]
+
+        return self.out_proj(retrieved)
 
     def update(
         self,
@@ -145,11 +200,11 @@ class NeuralMemory(nn.Module):
         state: MemoryState,
     ) -> MemoryState:
         """
-        Update memory based on surprise.
+        Update memory based on surprise (gradient of MSE loss w.r.t. MLP weights).
 
-        The update rule (from paper):
-        - Surprise = how unexpected is the input (measured by reconstruction error gradient)
-        - Memory is updated with: new = decay * old + lr * surprise * input_signal
+        From paper eq (12): Loss = |M(k) - v|^2
+        Surprise = -grad(Loss) w.r.t. MLP weights
+        Update: weights += lr * surprise (with momentum and decay)
 
         Args:
             x: Current segment output [B, T, C]
@@ -158,34 +213,64 @@ class NeuralMemory(nn.Module):
         Returns:
             new_state: Updated memory state
         """
-        _b, _t, _c = x.shape  # Validate shape
+        b, _t, _c = x.shape
 
-        # Compute "surprise" - gradient magnitude of reconstruction error
-        # Use the segment mean as the signal to memorize
-        input_signal = x.mean(dim=1, keepdim=True)  # [B, 1, C]
+        # Project to keys and values for storage
+        keys = self.key_proj(x.detach())  # [B, T, C]
+        values = self.value_proj(x.detach())  # [B, T, C]
 
-        # Compute reconstruction error (how well can memory predict the input?)
-        with torch.enable_grad():
-            x_for_grad = input_signal.detach().requires_grad_(True)
-            memory_pred = self.memory_mlp(state.memory_tokens).mean(dim=1, keepdim=True)
-            recon_loss = F.mse_loss(memory_pred, x_for_grad)
-            grad = torch.autograd.grad(recon_loss, x_for_grad, create_graph=False)[0]
-            surprise = grad.abs().mean(dim=-1, keepdim=True)
+        new_weights: dict[str, torch.Tensor] = {}
+        new_momentum: dict[str, torch.Tensor] = {}
 
-        # Update momentum (exponential moving average of surprise)
-        new_momentum = self.momentum * state.momentum_buffer + (1 - self.momentum) * surprise
+        for name in state.weights:
+            # Initialize accumulators
+            weight_updates = []
 
-        # Compute memory update
-        # Expand input signal to match memory shape
-        update_signal = input_signal.expand(-1, self.num_longterm_mem, -1)
+            for i in range(b):
+                # Get current weights for this batch item
+                w_i = state.weights[name][i].clone().requires_grad_(True)
 
-        # Apply update: new_memory = decay * old_memory + lr * surprise * signal
-        decay_factor = 1 - self.decay
-        new_memory = decay_factor * state.memory_tokens + self.lr * surprise * update_signal
+                # Create params dict with this weight requiring grad
+                params = {}
+                for n, w in state.weights.items():
+                    if n == name:
+                        params[n] = w_i
+                    else:
+                        params[n] = w[i].detach()
+
+                # Forward pass: M(k) for this batch item
+                k_i = keys[i:i+1]  # [1, T, C]
+                pred = torch.func.functional_call(self.memory_mlp, params, (k_i,))  # [1, T, C]
+
+                # Target: v
+                v_i = values[i:i+1]  # [1, T, C]
+
+                # MSE loss (eq 12 from paper)
+                loss = F.mse_loss(pred, v_i)
+
+                # Compute gradient (surprise)
+                grad = torch.autograd.grad(loss, w_i, create_graph=False)[0]
+
+                # Surprise is negative gradient (we want to move towards reducing loss)
+                surprise = -grad
+
+                weight_updates.append(surprise)
+
+            # Stack updates: [B, *param_shape]
+            stacked_updates = torch.stack(weight_updates, dim=0)
+
+            # Apply momentum
+            new_mom = self.momentum * state.momentum[name] + (1 - self.momentum) * stacked_updates
+            new_momentum[name] = new_mom
+
+            # Apply weight update with decay
+            decay_factor = 1 - self.decay
+            updated_weights = decay_factor * state.weights[name] + self.lr * new_mom
+            new_weights[name] = updated_weights
 
         return MemoryState(
-            memory_tokens=new_memory,
-            momentum_buffer=new_momentum,
+            weights=new_weights,
+            momentum=new_momentum,
             step=state.step + 1,
         )
 
@@ -536,7 +621,7 @@ class TitansGPT(nn.Module):
                     decay.add(fpn)
                 elif (
                     (pn.endswith("weight") and isinstance(m, blacklist_weight_modules))
-                    or "initial_memory" in fpn
+                    or "memory_mlp" in fpn  # Memory MLP weights are templates, not trained directly
                     or "persist_mem" in fpn
                 ):
                     no_decay.add(fpn)
