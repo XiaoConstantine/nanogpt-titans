@@ -194,6 +194,16 @@ class NeuralMemory(nn.Module):
 
         return self.out_proj(retrieved)
 
+    def _compute_loss_for_grad(
+        self,
+        params: dict[str, torch.Tensor],
+        keys: torch.Tensor,
+        values: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute MSE loss for a single sample (used with vmap)."""
+        pred = torch.func.functional_call(self.memory_mlp, params, (keys,))
+        return F.mse_loss(pred, values)
+
     def update(
         self,
         x: torch.Tensor,
@@ -205,6 +215,8 @@ class NeuralMemory(nn.Module):
         From paper eq (12): Loss = |M(k) - v|^2
         Surprise = -grad(Loss) w.r.t. MLP weights
         Update: weights += lr * surprise (with momentum and decay)
+
+        Uses vmap for efficient vectorized per-sample gradient computation.
 
         Args:
             x: Current segment output [B, T, C]
@@ -219,50 +231,49 @@ class NeuralMemory(nn.Module):
         keys = self.key_proj(x.detach())  # [B, T, C]
         values = self.value_proj(x.detach())  # [B, T, C]
 
+        # Compute per-sample gradients using vmap
+        # First, create a function that computes loss given params for one sample
+        def single_sample_loss(params: dict[str, torch.Tensor], k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+            # Add batch dim for functional_call
+            k = k.unsqueeze(0)  # [1, T, C]
+            pred = torch.func.functional_call(self.memory_mlp, params, (k,))
+            return F.mse_loss(pred, v.unsqueeze(0))
+
+        # Function to compute gradients for one sample
+        def compute_grads(params: dict[str, torch.Tensor], k: torch.Tensor, v: torch.Tensor) -> dict[str, torch.Tensor]:
+            return torch.func.grad(single_sample_loss)(params, k, v)
+
+        # Use enable_grad for the gradient computation
+        with torch.enable_grad():
+            # Vectorize over batch dimension using vmap
+            # We need to restructure: state.weights has [B, *shape], we need per-sample dicts
+
+            # Compute gradients for each sample (vectorized)
+            all_grads: dict[str, list[torch.Tensor]] = {name: [] for name in state.weights}
+
+            for i in range(b):
+                # Extract params for this sample
+                sample_params = {name: w[i].clone().requires_grad_(True) for name, w in state.weights.items()}
+
+                # Compute gradients
+                grads = compute_grads(sample_params, keys[i], values[i])
+
+                for name in state.weights:
+                    all_grads[name].append(grads[name])
+
+        # Stack gradients and apply updates
         new_weights: dict[str, torch.Tensor] = {}
         new_momentum: dict[str, torch.Tensor] = {}
 
         for name in state.weights:
-            # Initialize accumulators
-            weight_updates = []
+            # Stack: [B, *param_shape]
+            stacked_grads = torch.stack(all_grads[name], dim=0)
 
-            for i in range(b):
-                # Get current weights for this batch item
-                w_i = state.weights[name][i].clone().requires_grad_(True)
-
-                # Create params dict with this weight requiring grad
-                params = {}
-                for n, w in state.weights.items():
-                    if n == name:
-                        params[n] = w_i
-                    else:
-                        params[n] = w[i].detach()
-
-                # Forward pass: M(k) for this batch item
-                # Use enable_grad to allow gradient computation even in no_grad context
-                with torch.enable_grad():
-                    k_i = keys[i:i+1]  # [1, T, C]
-                    pred = torch.func.functional_call(self.memory_mlp, params, (k_i,))  # [1, T, C]
-
-                    # Target: v
-                    v_i = values[i:i+1]  # [1, T, C]
-
-                    # MSE loss (eq 12 from paper)
-                    loss = F.mse_loss(pred, v_i)
-
-                    # Compute gradient (surprise)
-                    grad = torch.autograd.grad(loss, w_i, create_graph=False)[0]
-
-                # Surprise is negative gradient (we want to move towards reducing loss)
-                surprise = -grad
-
-                weight_updates.append(surprise)
-
-            # Stack updates: [B, *param_shape]
-            stacked_updates = torch.stack(weight_updates, dim=0)
+            # Surprise is negative gradient
+            surprise = -stacked_grads
 
             # Apply momentum
-            new_mom = self.momentum * state.momentum[name] + (1 - self.momentum) * stacked_updates
+            new_mom = self.momentum * state.momentum[name] + (1 - self.momentum) * surprise
             new_momentum[name] = new_mom
 
             # Apply weight update with decay
