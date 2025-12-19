@@ -119,7 +119,7 @@ def get_batch(
     config: TrainConfig,
     data_dir: Path,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Get a batch of data."""
+    """Get a random batch of data (for evaluation)."""
     data_file = data_dir / f"{split}.bin"
     data = np.memmap(data_file, dtype=np.uint16, mode="r")
 
@@ -137,6 +137,63 @@ def get_batch(
     y = y.pin_memory().to(device, non_blocking=True)
 
     return x, y
+
+
+class SequentialDataIterator:
+    """
+    Sequential data iterator for contiguous sequences (like the Titans paper).
+
+    Each batch item reads from a contiguous stream. Memory persists across
+    micro-steps within each iteration, accumulating knowledge from earlier
+    segments to help later segments.
+    """
+
+    def __init__(
+        self,
+        data_dir: Path,
+        config: TrainConfig,
+        rank: int = 0,
+        world_size: int = 1,
+    ) -> None:
+        self.config = config
+        self.data = np.memmap(data_dir / "train.bin", dtype=np.uint16, mode="r")
+        self.data_len = len(self.data)
+
+        # Each batch item has its own position in the data
+        # Spread them evenly across the dataset
+        total_streams = config.batch_size * world_size
+        stream_spacing = self.data_len // total_streams
+
+        # This rank's batch items start at offset positions
+        base_offset = rank * config.batch_size * stream_spacing
+        self.positions = [
+            base_offset + i * stream_spacing
+            for i in range(config.batch_size)
+        ]
+
+    def get_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Get next contiguous batch, advancing positions."""
+        block_size = self.config.block_size
+
+        xs, ys = [], []
+        for i, pos in enumerate(self.positions):
+            # Wrap around if we reach the end
+            if pos + block_size + 1 >= self.data_len:
+                pos = pos % (self.data_len - block_size - 1)
+                self.positions[i] = pos
+
+            x = torch.from_numpy(self.data[pos:pos + block_size].astype(np.int64))
+            y = torch.from_numpy(self.data[pos + 1:pos + 1 + block_size].astype(np.int64))
+            xs.append(x)
+            ys.append(y)
+
+            # Advance position for next call
+            self.positions[i] = pos + block_size
+
+        x = torch.stack(xs).pin_memory().to(device, non_blocking=True)
+        y = torch.stack(ys).pin_memory().to(device, non_blocking=True)
+
+        return x, y
 
 
 class BatchPrefetcher:
@@ -306,17 +363,22 @@ def train(config: TrainConfig) -> None:
         import wandb
         wandb.init(project=config.wandb_project, name=config.wandb_run_name, config=vars(config))
 
-    # Training with async data prefetching
-    prefetcher = BatchPrefetcher(config, data_dir, prefetch_count=2)
-    x, y = prefetcher.get_batch()
+    # Training with sequential data (contiguous sequences like the Titans paper)
+    # Memory persists across micro-steps, accumulating knowledge within each iteration
+    data_iter = SequentialDataIterator(data_dir, config, rank=ddp_rank, world_size=ddp_world_size)
+    x, y = data_iter.get_batch()
     t0 = time.time()
     local_iter_num = 0
 
-    # Pre-allocate memory states once (will be reset in-place)
+    # Pre-allocate memory states once (will be reset at start of each iteration)
     memory_states = raw_model.init_memory_states(config.batch_size, device)  # type: ignore[arg-type]
+
+    # Enable memory updates - memory accumulates across micro-steps
+    raw_model.set_memory_update(True)
 
     if master_process:
         print(f"Starting training for {config.max_iters} iterations")
+        print(f"Using contiguous sequences (Titans paper style)")
         print(f"DDP: {ddp}, World size: {ddp_world_size}")
         print(f"Tokens per iter: {config.tokens_per_iter * ddp_world_size:,} (across all GPUs)")
 
@@ -354,22 +416,23 @@ def train(config: TrainConfig) -> None:
                     torch.save(checkpoint, Path(config.out_dir) / "ckpt.pt")
 
         # Forward + backward
-        raw_model.reset_memory_states(memory_states)  # Reset in-place (no allocation)
+        # Reset memory at start of each iteration (new long sequence)
+        raw_model.reset_memory_states(memory_states)
 
         for micro_step in range(config.gradient_accumulation_steps):
             if ddp:
                 wrapped_model.require_backward_grad_sync = (micro_step == config.gradient_accumulation_steps - 1)  # type: ignore[union-attr]
 
             with ctx:
+                # Memory persists across micro-steps (contiguous sequence)
                 _, loss, memory_states = raw_model(x, targets=y, memory_states=memory_states)
                 loss = loss / config.gradient_accumulation_steps
 
-            # Backward BEFORE reset (reset modifies tensors in computation graph)
+            # Backward
             scaler.scale(loss).backward()
 
-            # Now safe to get next batch and reset states
-            x, y = prefetcher.get_batch()
-            raw_model.reset_memory_states(memory_states)
+            # Get next contiguous batch (memory continues to accumulate)
+            x, y = data_iter.get_batch()
 
         if config.grad_clip != 0.0:
             scaler.unscale_(optimizer)
@@ -390,9 +453,6 @@ def train(config: TrainConfig) -> None:
 
         iter_num += 1
         local_iter_num += 1
-
-    # Cleanup
-    prefetcher.stop()
 
     if ddp:
         dist.destroy_process_group()  # type: ignore[attr-defined]

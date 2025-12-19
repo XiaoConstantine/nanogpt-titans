@@ -403,6 +403,7 @@ class TitansBlock(nn.Module):
         self.config = config  # type: ignore[assignment]
         self.num_longterm_mem = config.num_longterm_mem  # type: ignore[assignment]
         self.num_persist_mem = config.num_persist_mem  # type: ignore[assignment]
+        self.update_memory = True  # Can be disabled during training for speed
 
         # Neural memory module
         self.memory = NeuralMemory(config)
@@ -465,8 +466,11 @@ class TitansBlock(nn.Module):
         # 6. MLP with residual
         x = x + self.mlp(self.ln_2(x))
 
-        # 7. Update memory based on this segment
-        new_state = self.memory.update(x, memory_state)
+        # 7. Update memory based on this segment (skip if update_memory=False)
+        if self.update_memory:
+            new_state = self.memory.update(x, memory_state)
+        else:
+            new_state = memory_state  # Skip expensive update
 
         return x, new_state
 
@@ -532,6 +536,11 @@ class TitansGPT(nn.Module):
         """Reset memory states in-place - avoids reallocation."""
         for block, state in zip(self.transformer["h"], states):  # type: ignore[not-iterable]
             block.reset_state(state)
+
+    def set_memory_update(self, enabled: bool) -> None:
+        """Enable/disable memory updates. Disable during training for speed."""
+        for block in self.transformer["h"]:  # type: ignore[not-iterable]
+            block.update_memory = enabled
 
     def forward(
         self,
