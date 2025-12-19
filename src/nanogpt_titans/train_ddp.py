@@ -364,10 +364,12 @@ def train(config: TrainConfig) -> None:
                 _, loss, memory_states = raw_model(x, targets=y, memory_states=memory_states)
                 loss = loss / config.gradient_accumulation_steps
 
-            x, y = prefetcher.get_batch()  # Async prefetched batch
-            raw_model.reset_memory_states(memory_states)  # Reset in-place
-
+            # Backward BEFORE reset (reset modifies tensors in computation graph)
             scaler.scale(loss).backward()
+
+            # Now safe to get next batch and reset states
+            x, y = prefetcher.get_batch()
+            raw_model.reset_memory_states(memory_states)
 
         if config.grad_clip != 0.0:
             scaler.unscale_(optimizer)

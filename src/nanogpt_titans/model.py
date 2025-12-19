@@ -265,12 +265,12 @@ class NeuralMemory(nn.Module):
 
             # Apply momentum
             new_mom = self.momentum * state.momentum[name] + (1 - self.momentum) * surprise
-            new_momentum[name] = new_mom
+            new_momentum[name] = new_mom.detach()  # Detach from graph
 
             # Apply weight update with decay
             decay_factor = 1 - self.decay
             updated_weights = decay_factor * state.weights[name] + self.lr * new_mom
-            new_weights[name] = updated_weights
+            new_weights[name] = updated_weights.detach()  # Detach from graph
 
         return MemoryState(
             weights=new_weights,
