@@ -321,6 +321,15 @@ def profile_with_torch_profiler(
     print("KERNEL SUMMARY")
     print("=" * 60)
 
+    # Helper to get CUDA time (attribute name varies by PyTorch version)
+    def get_cuda_time(event) -> float:
+        for attr in ["cuda_time_total", "self_cuda_time_total", "device_time_total"]:
+            if hasattr(event, attr):
+                val = getattr(event, attr)
+                if val is not None:
+                    return val
+        return 0.0
+
     # Look for Triton kernels
     triton_kernels = [
         e for e in prof.key_averages() if "triton" in e.key.lower() or "kernel" in e.key.lower()
@@ -328,7 +337,7 @@ def profile_with_torch_profiler(
     if triton_kernels:
         print("\nTriton/Custom kernels found:")
         for k in triton_kernels[:10]:
-            print(f"  {k.key}: {k.cuda_time_total / 1000:.2f}ms")
+            print(f"  {k.key}: {get_cuda_time(k) / 1000:.2f}ms")
     else:
         print("\nNo Triton kernels detected in trace.")
 
@@ -337,7 +346,7 @@ def profile_with_torch_profiler(
     if vmap_ops:
         print("\nvmap operations found:")
         for k in vmap_ops[:5]:
-            print(f"  {k.key}: {k.cuda_time_total / 1000:.2f}ms")
+            print(f"  {k.key}: {get_cuda_time(k) / 1000:.2f}ms")
 
 
 def profile_memory_update_detailed(
