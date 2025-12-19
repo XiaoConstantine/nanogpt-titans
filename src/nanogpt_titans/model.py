@@ -196,16 +196,6 @@ class NeuralMemory(nn.Module):
 
         return self.out_proj(retrieved)
 
-    def _compute_loss_for_grad(
-        self,
-        params: dict[str, torch.Tensor],
-        keys: torch.Tensor,
-        values: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute MSE loss for a single sample (used with vmap)."""
-        pred = torch.func.functional_call(self.memory_mlp, params, (keys,))
-        return F.mse_loss(pred, values)
-
     def update(
         self,
         x: torch.Tensor,
@@ -233,46 +223,35 @@ class NeuralMemory(nn.Module):
         keys = self.key_proj(x.detach())  # [B, T, C]
         values = self.value_proj(x.detach())  # [B, T, C]
 
-        # Compute per-sample gradients using vmap
-        # First, create a function that computes loss given params for one sample
-        def single_sample_loss(params: dict[str, torch.Tensor], k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-            # Add batch dim for functional_call
+        # Define loss function for a single sample (no batch dim)
+        def single_loss(params: dict[str, torch.Tensor], k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
             k = k.unsqueeze(0)  # [1, T, C]
             pred = torch.func.functional_call(self.memory_mlp, params, (k,))
             return F.mse_loss(pred, v.unsqueeze(0))
 
-        # Function to compute gradients for one sample
-        def compute_grads(params: dict[str, torch.Tensor], k: torch.Tensor, v: torch.Tensor) -> dict[str, torch.Tensor]:
-            return torch.func.grad(single_sample_loss)(params, k, v)
+        # Create grad function
+        grad_fn = torch.func.grad(single_loss)
 
-        # Use enable_grad for the gradient computation
+        # vmap over batch dimension - create in_dims for dict
+        # in_dims for params dict: each tensor has batch dim 0
+        params_in_dims = {name: 0 for name in state.weights}
+
+        # Vectorized gradient function
+        batched_grad_fn = torch.func.vmap(grad_fn, in_dims=(params_in_dims, 0, 0))
+
+        # Compute all gradients in one vectorized call
         with torch.enable_grad():
-            # Vectorize over batch dimension using vmap
-            # We need to restructure: state.weights has [B, *shape], we need per-sample dicts
+            # Need to clone and require grad for the weights
+            params_for_grad = {name: w.clone().requires_grad_(True) for name, w in state.weights.items()}
+            all_grads = batched_grad_fn(params_for_grad, keys, values)
 
-            # Compute gradients for each sample (vectorized)
-            all_grads: dict[str, list[torch.Tensor]] = {name: [] for name in state.weights}
-
-            for i in range(b):
-                # Extract params for this sample
-                sample_params = {name: w[i].clone().requires_grad_(True) for name, w in state.weights.items()}
-
-                # Compute gradients
-                grads = compute_grads(sample_params, keys[i], values[i])
-
-                for name in state.weights:
-                    all_grads[name].append(grads[name])
-
-        # Stack gradients and apply updates
+        # Apply updates
         new_weights: dict[str, torch.Tensor] = {}
         new_momentum: dict[str, torch.Tensor] = {}
 
         for name in state.weights:
-            # Stack: [B, *param_shape]
-            stacked_grads = torch.stack(all_grads[name], dim=0)
-
             # Surprise is negative gradient
-            surprise = -stacked_grads
+            surprise = -all_grads[name]
 
             # Apply momentum
             new_mom = self.momentum * state.momentum[name] + (1 - self.momentum) * surprise
