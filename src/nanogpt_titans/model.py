@@ -9,16 +9,180 @@ Fixed version addressing:
 - Per-sequence memory state (not global)
 - Memory updates during training
 - Correct state passing between segments
+- FIXED: Causal memory retrieval (no future token leakage)
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import lru_cache
 
 import torch
 from torch import nn
 from torch.nn import functional as F
+
+# FlexAttention imports (available in PyTorch 2.5+)
+_FLEX_ATTENTION_AVAILABLE = False
+try:
+    from torch.nn.attention.flex_attention import (
+        flex_attention,
+        create_block_mask,
+        or_masks,
+    )
+    # Only enable if CUDA is available (flex_attention requires GPU)
+    if torch.cuda.is_available():
+        _FLEX_ATTENTION_AVAILABLE = True
+        # Compile flex_attention for better performance
+        flex_attention = torch.compile(flex_attention)
+except ImportError:
+    pass
+
+
+# --- FlexAttention mask functions ---
+
+def causal_mask(b, h, q_idx, kv_idx):
+    """Standard causal mask: each position can only attend to previous positions."""
+    return q_idx >= kv_idx
+
+
+def prefix_lm_mask(prefix_len: int):
+    """
+    Create prefix-LM mask function.
+
+    Prefix tokens (0:prefix_len) can attend to all prefix tokens.
+    Suffix tokens (prefix_len:) can attend to prefix + causally to suffix.
+    """
+    def mask_fn(b, h, q_idx, kv_idx):
+        # If query is in prefix, it can attend to all prefix tokens
+        in_prefix = q_idx < prefix_len
+        # If key is in prefix, it can always be attended to
+        key_in_prefix = kv_idx < prefix_len
+        # Causal mask for suffix
+        causal = q_idx >= kv_idx
+        # Prefix can attend to prefix; suffix can attend to prefix + causal suffix
+        return (in_prefix & key_in_prefix) | (key_in_prefix & ~in_prefix) | (~in_prefix & ~key_in_prefix & causal)
+    return mask_fn
+
+
+def document_causal_mask(document_ids: torch.Tensor):
+    """
+    Create document-aware causal mask for packed sequences.
+
+    Each position can only attend to positions in the same document,
+    with causal masking within each document.
+
+    Args:
+        document_ids: [seq_len] tensor where document_ids[i] = doc index for token i
+    """
+    def mask_fn(b, h, q_idx, kv_idx):
+        same_doc = document_ids[q_idx] == document_ids[kv_idx]
+        causal = q_idx >= kv_idx
+        return same_doc & causal
+    return mask_fn
+
+
+@lru_cache(maxsize=32)
+def get_causal_block_mask(seq_len: int, device: torch.device):
+    """Cache causal block masks for common sequence lengths."""
+    if not _FLEX_ATTENTION_AVAILABLE:
+        return None
+    return create_block_mask(
+        causal_mask,
+        B=None,
+        H=None,
+        Q_LEN=seq_len,
+        KV_LEN=seq_len,
+        device=device,
+    )
+
+
+def parallel_scan_log(gates: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
+    """
+    Parallel associative scan via cumsum trick.
+
+    Solves the recurrence: x[t] = gate[t] * x[t-1] + token[t]
+
+    This is O(n) and fully parallelizable on CPU/GPU/TPU using cumsum.
+    Based on: https://github.com/PeaBrane/mamba-tiny
+    See also: https://srush.github.io/annotated-mamba/hard.html
+
+    Args:
+        gates: Decay/gate values [*, T] in range (0, 1), e.g., momentum coefficient
+        tokens: Input values [*, T, ...] to accumulate, e.g., surprises
+
+    Returns:
+        Accumulated values [*, T, ...] where each position contains
+        the momentum-weighted sum of all previous tokens
+    """
+    # Handle the case where tokens has more dims than gates
+    # gates: [*, T], tokens: [*, T, D1, D2, ...]
+    token_dims = tokens.dim() - gates.dim()
+    for _ in range(token_dims):
+        gates = gates.unsqueeze(-1)
+
+    # Clamp gates to avoid log(0)
+    gates = gates.clamp(min=1e-7, max=1.0 - 1e-7)
+
+    # Log-space computation for numerical stability
+    log_gates = torch.log(gates)
+    log_cumsum_gates = torch.cumsum(log_gates, dim=-2 - token_dims + 1)  # cumsum along T dim
+
+    # Scale tokens by inverse cumulative gate product
+    # This "normalizes" each token to the same reference point
+    scaling = torch.exp(-log_cumsum_gates)
+    scaled_tokens = tokens * scaling
+
+    # Cumsum of scaled tokens
+    cumsum_scaled = torch.cumsum(scaled_tokens, dim=-2 - token_dims + 1)
+
+    # Rescale back by cumulative gate product
+    result = cumsum_scaled * torch.exp(log_cumsum_gates)
+
+    return result
+
+
+def parallel_momentum(
+    surprises: torch.Tensor,
+    momentum: float,
+    prev_momentum: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Compute momentum updates in parallel using cumsum trick.
+
+    Computes: m[t] = momentum * m[t-1] + (1 - momentum) * surprise[t]
+
+    This is equivalent to exponential moving average of surprises.
+
+    Args:
+        surprises: Surprise values [B, T, ...] to accumulate
+        momentum: Momentum coefficient (e.g., 0.9)
+        prev_momentum: Previous momentum state [B, ...] from last segment
+
+    Returns:
+        Momentum values [B, T, ...] for each timestep
+    """
+    B, T = surprises.shape[:2]
+    device = surprises.device
+
+    # Gates are constant momentum value
+    gates = torch.full((B, T), momentum, device=device, dtype=surprises.dtype)
+
+    # Scale surprises by (1 - momentum)
+    tokens = (1 - momentum) * surprises
+
+    # If we have previous momentum, prepend it and adjust
+    if prev_momentum is not None:
+        # Prepend previous momentum as first "token" with gate 1.0
+        # This propagates the previous state through the scan
+        prev_expanded = prev_momentum.unsqueeze(1)  # [B, 1, ...]
+        tokens = torch.cat([prev_expanded, tokens], dim=1)  # [B, T+1, ...]
+        gates = torch.cat([torch.ones(B, 1, device=device), gates], dim=1)
+
+        result = parallel_scan_log(gates, tokens)
+        return result[:, 1:]  # Remove the prepended position
+
+    return parallel_scan_log(gates, tokens)
 
 
 @dataclass
@@ -64,8 +228,10 @@ class MemoryState:
 
     # MLP weights per batch item: dict mapping param_name -> [B, *param_shape]
     weights: dict[str, torch.Tensor]
-    # Momentum buffer for each weight: same structure as weights
-    momentum: dict[str, torch.Tensor]
+    # Last momentum value for each weight (for continuity across segments): [B, *param_shape]
+    last_momentum: dict[str, torch.Tensor]
+    # Last segment's output representation for causal retrieval: [B, T, C] or None
+    last_segment_output: torch.Tensor | None = None
     step: int = 0
 
 
@@ -100,6 +266,9 @@ class NeuralMemory(nn.Module):
     - Surprise = gradient of MSE loss w.r.t. MLP weights
     - Memory update = weight update with momentum and decay
     - Retrieval = forward pass through MLP with per-sequence weights
+
+    FIXED: Retrieval now uses previous segment's output (stored in state)
+    to avoid leaking future token information.
     """
 
     def __init__(self, config: TitansConfig) -> None:
@@ -128,6 +297,9 @@ class NeuralMemory(nn.Module):
         # Output projection
         self.out_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
 
+        # Learned initial query for first segment (when no previous output exists)
+        self.init_query = nn.Parameter(torch.randn(1, 1, config.n_embd) * 0.02)
+
         # Hyperparameters for test-time learning
         self.lr = config.memory_lr  # type: ignore[assignment]
         self.momentum = config.memory_momentum  # type: ignore[assignment]
@@ -136,15 +308,21 @@ class NeuralMemory(nn.Module):
     def init_state(self, batch_size: int, device: torch.device) -> MemoryState:
         """Initialize memory state - clone MLP weights for each batch item."""
         weights: dict[str, torch.Tensor] = {}
-        momentum: dict[str, torch.Tensor] = {}
+        last_momentum: dict[str, torch.Tensor] = {}
 
         for name, param in self.memory_mlp.named_parameters():
             # Expand weights to [B, *param_shape] and clone
             expanded = param.detach().unsqueeze(0).expand(batch_size, *param.shape).clone()
             weights[name] = expanded.to(device)
-            momentum[name] = torch.zeros_like(expanded)
+            # Last momentum starts at zero
+            last_momentum[name] = torch.zeros_like(expanded)
 
-        return MemoryState(weights=weights, momentum=momentum, step=0)
+        return MemoryState(
+            weights=weights,
+            last_momentum=last_momentum,
+            last_segment_output=None,
+            step=0
+        )
 
     def reset_state(self, state: MemoryState) -> None:
         """Reset memory state in-place - avoids reallocation."""
@@ -153,7 +331,8 @@ class NeuralMemory(nn.Module):
             state.weights[name].copy_(
                 param.detach().unsqueeze(0).expand_as(state.weights[name])
             )
-            state.momentum[name].zero_()
+            state.last_momentum[name].zero_()
+        state.last_segment_output = None
         state.step = 0
 
     def _forward_with_weights(
@@ -175,33 +354,41 @@ class NeuralMemory(nn.Module):
         state: MemoryState,
     ) -> torch.Tensor:
         """
-        Retrieve from memory.
+        Retrieve from memory using PREVIOUS segment's output (causal).
 
         Args:
-            x: Input tensor [B, T, C]
-            state: Current memory state (contains per-sequence MLP weights)
+            x: Input tensor [B, T, C] - current segment (NOT used for retrieval to maintain causality)
+            state: Current memory state (contains previous segment's output)
 
         Returns:
             retrieved: Memory context [B, num_longterm_mem, C]
         """
-        b, _t, _c = x.shape
+        b, t, c = x.shape
 
-        # Project input to queries
-        queries = self.query_proj(x)  # [B, T, C]
+        # FIXED: Use previous segment's output for retrieval, NOT current segment
+        # This ensures causality - we only use information from the past
+        if state.last_segment_output is not None:
+            query_source = state.last_segment_output  # [B, T_prev, C]
+        else:
+            # First segment: use learned initial query expanded for batch
+            query_source = self.init_query.expand(b, -1, -1)  # [B, 1, C]
+
+        # Project to queries
+        queries = self.query_proj(query_source)  # [B, T_prev, C] or [B, 1, C]
 
         # Retrieve by passing queries through per-sequence MLP
         retrieved_list = []
         for i in range(b):
             # Get memory output for this batch item
-            q_i = queries[i:i+1]  # [1, T, C]
-            mem_out = self._forward_with_weights(q_i, state.weights, i)  # [1, T, C]
+            q_i = queries[i:i+1]  # [1, T_prev, C]
+            mem_out = self._forward_with_weights(q_i, state.weights, i)  # [1, T_prev, C]
             retrieved_list.append(mem_out)
 
-        retrieved = torch.cat(retrieved_list, dim=0)  # [B, T, C]
+        retrieved = torch.cat(retrieved_list, dim=0)  # [B, T_prev, C]
 
         # Pool to num_longterm_mem tokens
         # Use adaptive pooling to get fixed number of memory tokens
-        retrieved = retrieved.transpose(1, 2)  # [B, C, T]
+        retrieved = retrieved.transpose(1, 2)  # [B, C, T_prev]
         retrieved = F.adaptive_avg_pool1d(retrieved, self.num_longterm_mem)  # [B, C, num_longterm_mem]
         retrieved = retrieved.transpose(1, 2)  # [B, num_longterm_mem, C]
 
@@ -217,65 +404,87 @@ class NeuralMemory(nn.Module):
 
         From paper eq (12): Loss = |M(k) - v|^2
         Surprise = -grad(Loss) w.r.t. MLP weights
-        Update: weights += lr * surprise (with momentum and decay)
+        Update: weights += lr * momentum(surprise) (with decay)
 
-        Uses vmap for efficient vectorized per-sample gradient computation.
+        Uses:
+        - vmap for efficient vectorized per-sample gradient computation
+        - parallel_momentum (cumsum trick) for O(n) parallel momentum across tokens
 
         Args:
             x: Current segment output [B, T, C]
             state: Current memory state
 
         Returns:
-            new_state: Updated memory state
+            new_state: Updated memory state (includes storing x for next segment's retrieval)
         """
-        b, _t, _c = x.shape
+        b, t, _c = x.shape
 
         # Project to keys and values for storage
         keys = self.key_proj(x.detach())  # [B, T, C]
         values = self.value_proj(x.detach())  # [B, T, C]
 
-        # Define loss function for a single sample (no batch dim)
-        def single_loss(params: dict[str, torch.Tensor], k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-            k = k.unsqueeze(0)  # [1, T, C]
+        # Define loss function for a single token (no batch or time dim)
+        def single_token_loss(
+            params: dict[str, torch.Tensor], k: torch.Tensor, v: torch.Tensor
+        ) -> torch.Tensor:
+            # k, v: [C]
+            k = k.unsqueeze(0).unsqueeze(0)  # [1, 1, C]
+            v = v.unsqueeze(0).unsqueeze(0)  # [1, 1, C]
             pred = torch.func.functional_call(self.memory_mlp, params, (k,))
-            return F.mse_loss(pred, v.unsqueeze(0))
+            return F.mse_loss(pred, v)
 
-        # Create grad function
-        grad_fn = torch.func.grad(single_loss)
+        # Create grad function for single token
+        grad_fn = torch.func.grad(single_token_loss)
 
-        # vmap over batch dimension - create in_dims for dict
+        # vmap over batch and time dimensions
         # in_dims for params dict: each tensor has batch dim 0
         params_in_dims = {name: 0 for name in state.weights}
 
-        # Vectorized gradient function
-        batched_grad_fn = torch.func.vmap(grad_fn, in_dims=(params_in_dims, 0, 0))
+        # First vmap over time (tokens), then over batch
+        # This gives us per-token gradients for each batch item
+        batched_grad_fn = torch.func.vmap(
+            torch.func.vmap(grad_fn, in_dims=(None, 0, 0)),  # Over T tokens
+            in_dims=(params_in_dims, 0, 0),  # Over B batches
+        )
 
-        # Compute all gradients in one vectorized call
+        # Compute all per-token gradients in one vectorized call
+        # Result: {name: [B, T, *param_shape]} for each parameter
         with torch.enable_grad():
-            # Need to clone and require grad for the weights
-            params_for_grad = {name: w.clone().requires_grad_(True) for name, w in state.weights.items()}
+            params_for_grad = {
+                name: w.clone().requires_grad_(True) for name, w in state.weights.items()
+            }
             all_grads = batched_grad_fn(params_for_grad, keys, values)
 
-        # Apply updates
+        # Apply updates with parallel momentum
         new_weights: dict[str, torch.Tensor] = {}
-        new_momentum: dict[str, torch.Tensor] = {}
+        new_last_momentum: dict[str, torch.Tensor] = {}
 
         for name in state.weights:
-            # Surprise is negative gradient
-            surprise = -all_grads[name]
+            # Surprise is negative gradient: [B, T, *param_shape]
+            surprises = -all_grads[name]
 
-            # Apply momentum
-            new_mom = self.momentum * state.momentum[name] + (1 - self.momentum) * surprise
-            new_momentum[name] = new_mom.detach()  # Detach from graph
+            # Compute momentum in parallel across all T tokens
+            # Uses cumsum trick: O(T) parallel instead of O(T) sequential
+            # Result: [B, T, *param_shape] momentum values for each token
+            momentum_values = parallel_momentum(
+                surprises,
+                self.momentum,
+                prev_momentum=state.last_momentum[name],
+            )
+
+            # Use the final momentum value (at t=T) for weight update
+            final_momentum = momentum_values[:, -1]  # [B, *param_shape]
+            new_last_momentum[name] = final_momentum.detach()
 
             # Apply weight update with decay
             decay_factor = 1 - self.decay
-            updated_weights = decay_factor * state.weights[name] + self.lr * new_mom
-            new_weights[name] = updated_weights.detach()  # Detach from graph
+            updated_weights = decay_factor * state.weights[name] + self.lr * final_momentum
+            new_weights[name] = updated_weights.detach()
 
         return MemoryState(
             weights=new_weights,
-            momentum=new_momentum,
+            last_momentum=new_last_momentum,
+            last_segment_output=x.detach(),  # Store current segment for next retrieval
             step=state.step + 1,
         )
 
@@ -287,6 +496,9 @@ class CausalSelfAttention(nn.Module):
     For Titans MAC architecture:
     - Prefix tokens (memory + persistent) can attend to each other fully
     - Current segment tokens can attend to prefix + causally to each other
+
+    Uses FlexAttention when available (CUDA + PyTorch 2.5+) for better performance.
+    Falls back to standard SDPA or manual attention otherwise.
     """
 
     def __init__(self, config: TitansConfig) -> None:
@@ -306,11 +518,50 @@ class CausalSelfAttention(nn.Module):
         self.dropout = config.dropout  # type: ignore[assignment]
 
         self.flash = hasattr(F, "scaled_dot_product_attention")  # type: ignore[assignment]
+        self.use_flex_attn = _FLEX_ATTENTION_AVAILABLE  # type: ignore[assignment]
+
+        # Cache for block masks (avoid recreating every forward pass)
+        self._block_mask_cache: dict[tuple, object] = {}
+
+    def _get_block_mask(
+        self,
+        seq_len: int,
+        prefix_len: int,
+        device: torch.device,
+        document_ids: torch.Tensor | None = None,
+    ):
+        """Get or create a block mask for the given configuration."""
+        cache_key = (seq_len, prefix_len, document_ids is not None)
+
+        if cache_key not in self._block_mask_cache:
+            if document_ids is not None:
+                # Document-aware causal mask for packed sequences
+                mask_fn = document_causal_mask(document_ids)
+            elif prefix_len > 0:
+                # Prefix-LM mask
+                mask_fn = prefix_lm_mask(prefix_len)
+            else:
+                # Standard causal mask
+                mask_fn = causal_mask
+
+            block_mask = create_block_mask(
+                mask_fn,
+                B=None,
+                H=None,
+                Q_LEN=seq_len,
+                KV_LEN=seq_len,
+                device=device,
+            )
+            self._block_mask_cache[cache_key] = block_mask
+
+        return self._block_mask_cache[cache_key]
 
     def forward(
         self,
         x: torch.Tensor,
         prefix_len: int = 0,
+        packed_mask: torch.Tensor | None = None,
+        document_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Forward pass with prefix-LM attention mask.
@@ -319,6 +570,12 @@ class CausalSelfAttention(nn.Module):
             x: Input tensor [B, T, C] where T = prefix_len + segment_len
             prefix_len: Number of prefix tokens (memory + persistent)
                        These tokens can attend to each other fully.
+            packed_mask: Optional [B, T, T] boolean mask for packed sequences.
+                        True = can attend, False = cannot attend.
+                        If provided, overrides prefix_len behavior.
+                        (Used when FlexAttention is not available)
+            document_ids: Optional [T] tensor of document IDs for packed sequences.
+                         Used with FlexAttention for efficient document masking.
 
         Returns:
             Output tensor [B, T, C]
@@ -330,8 +587,39 @@ class CausalSelfAttention(nn.Module):
         q = q.view(b, t, self.n_head, c // self.n_head).transpose(1, 2)
         v = v.view(b, t, self.n_head, c // self.n_head).transpose(1, 2)
 
-        if self.flash and prefix_len == 0:
-            # Standard causal attention (no prefix)
+        # Try FlexAttention first (most efficient on CUDA)
+        if self.use_flex_attn and x.is_cuda and packed_mask is None:
+            # Use FlexAttention with block mask
+            block_mask = self._get_block_mask(t, prefix_len, x.device, document_ids)
+            y = flex_attention(q, k, v, block_mask=block_mask)
+
+        elif packed_mask is not None:
+            # Use provided packed attention mask (fallback for non-CUDA or complex masks)
+            # Convert boolean mask (True=attend) to float mask (0=attend, -inf=block)
+            # packed_mask: [B, T, T] -> need [B, 1, T, T] for broadcasting
+            attn_mask = packed_mask.unsqueeze(1)  # [B, 1, T, T]
+            float_mask = torch.zeros_like(attn_mask, dtype=q.dtype)
+            float_mask.masked_fill_(~attn_mask, float("-inf"))
+
+            if self.flash:
+                # Flash attention with explicit mask
+                y = F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=float_mask,
+                    dropout_p=self.dropout if self.training else 0,
+                    is_causal=False,  # We provide explicit mask
+                )
+            else:
+                att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+                att = att + float_mask
+                att = F.softmax(att, dim=-1)
+                att = self.attn_dropout(att)
+                y = att @ v
+
+        elif self.flash and prefix_len == 0:
+            # Standard causal attention (no prefix) - use SDPA
             y = F.scaled_dot_product_attention(
                 q,
                 k,
@@ -341,27 +629,28 @@ class CausalSelfAttention(nn.Module):
                 is_causal=True,
             )
         else:
-            # Build prefix-LM mask
-            # Shape: [T, T] where:
-            # - prefix tokens (0:prefix_len) can attend to all prefix tokens
-            # - segment tokens (prefix_len:) can attend to prefix + causal within segment
-            mask = torch.zeros(t, t, device=x.device, dtype=torch.bool)
+            # Manual attention with prefix-LM mask (CPU fallback or prefix > 0 without FlexAttention)
+            # Build the mask manually
+            mask = torch.ones(t, t, device=x.device, dtype=torch.bool)
 
             if prefix_len > 0:
-                # Segment tokens cannot attend to future segment tokens
-                segment_len = t - prefix_len
-                if segment_len > 0:
-                    # Create causal mask for segment portion
-                    segment_mask = torch.triu(
-                        torch.ones(segment_len, segment_len, device=x.device, dtype=torch.bool),
+                # Prefix tokens can attend to all prefix tokens
+                mask[:prefix_len, :prefix_len] = False
+                # Suffix tokens can attend to all prefix tokens
+                mask[prefix_len:, :prefix_len] = False
+                # Suffix tokens have causal attention among themselves
+                suffix_len = t - prefix_len
+                if suffix_len > 0:
+                    suffix_causal = torch.triu(
+                        torch.ones(suffix_len, suffix_len, device=x.device, dtype=torch.bool),
                         diagonal=1,
                     )
-                    mask[prefix_len:, prefix_len:] = segment_mask
+                    mask[prefix_len:, prefix_len:] = suffix_causal
             else:
                 # Pure causal mask
                 mask = torch.triu(torch.ones(t, t, device=x.device, dtype=torch.bool), diagonal=1)
 
-            # Apply attention with mask
+            # Apply attention with mask (True = masked out)
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(mask, float("-inf"))
             att = F.softmax(att, dim=-1)
@@ -397,6 +686,7 @@ class TitansBlock(nn.Module):
     - Uses per-sequence memory state
     - Proper prefix-LM attention masking
     - Updates memory during both training and inference
+    - FIXED: Causal memory retrieval
     """
 
     def __init__(self, config: TitansConfig, has_memory: bool = True) -> None:
@@ -440,6 +730,7 @@ class TitansBlock(nn.Module):
         self,
         x: torch.Tensor,
         memory_state: MemoryState | None,
+        packed_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, MemoryState | None]:
         """
         Forward pass with memory integration.
@@ -447,6 +738,7 @@ class TitansBlock(nn.Module):
         Args:
             x: Input tensor [B, T, C]
             memory_state: Current memory state (None if no memory)
+            packed_mask: Optional [B, T, T] attention mask for packed sequences
 
         Returns:
             output: Transformed tensor [B, T, C]
@@ -454,13 +746,13 @@ class TitansBlock(nn.Module):
         """
         # If no memory, just do standard transformer block
         if not self.has_memory:
-            x = x + self.attn(self.ln_1(x))
+            x = x + self.attn(self.ln_1(x), packed_mask=packed_mask)
             x = x + self.mlp(self.ln_2(x))
             return x, None
 
         b, _t, _c = x.shape
 
-        # 1. Retrieve from long-term memory
+        # 1. Retrieve from long-term memory (uses PREVIOUS segment, not current - FIXED)
         mem_context = self.memory(x, memory_state)  # [B, num_longterm_mem, C]
 
         # 2. Expand persistent memory for batch
@@ -471,7 +763,25 @@ class TitansBlock(nn.Module):
         context = torch.cat([mem_context, persist, x], dim=1)  # [B, prefix_len + T, C]
 
         # 4. Self-attention with prefix-LM mask
-        attn_out = self.attn(self.ln_1(context), prefix_len=prefix_len)
+        # Note: For packed sequences with memory, we need to expand the mask
+        # to include prefix tokens (memory can attend to all, segment uses packed_mask)
+        if packed_mask is not None:
+            # Expand packed_mask to include prefix tokens
+            # Prefix tokens can attend to themselves and be attended by all
+            t = x.shape[1]
+            full_len = prefix_len + t
+            expanded_mask = torch.zeros(
+                b, full_len, full_len, dtype=torch.bool, device=x.device
+            )
+            # Prefix tokens can attend to all prefix tokens (bidirectional)
+            expanded_mask[:, :prefix_len, :prefix_len] = True
+            # Segment tokens can attend to prefix
+            expanded_mask[:, prefix_len:, :prefix_len] = True
+            # Segment tokens use packed_mask for attending to each other
+            expanded_mask[:, prefix_len:, prefix_len:] = packed_mask
+            attn_out = self.attn(self.ln_1(context), packed_mask=expanded_mask)
+        else:
+            attn_out = self.attn(self.ln_1(context), prefix_len=prefix_len)
 
         # 5. Extract only the current segment positions (residual connection)
         x = x + attn_out[:, prefix_len:]
@@ -479,7 +789,7 @@ class TitansBlock(nn.Module):
         # 6. MLP with residual
         x = x + self.mlp(self.ln_2(x))
 
-        # 7. Update memory based on this segment (skip if update_memory=False)
+        # 7. Update memory based on this segment (stores x for next segment's retrieval)
         if self.update_memory:
             new_state = self.memory.update(x, memory_state)
         else:
@@ -496,6 +806,7 @@ class TitansGPT(nn.Module):
     - Proper memory state management
     - Memory updates during training
     - Correct state passing between segments
+    - FIXED: Causal memory retrieval
     """
 
     def __init__(self, config: TitansConfig) -> None:
@@ -577,6 +888,8 @@ class TitansGPT(nn.Module):
         idx: torch.Tensor,
         targets: torch.Tensor | None = None,
         memory_states: list[MemoryState | None] | None = None,
+        position_ids: torch.Tensor | None = None,
+        packed_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, list[MemoryState | None]]:
         """
         Forward pass with segmented processing.
@@ -585,6 +898,10 @@ class TitansGPT(nn.Module):
             idx: Input token indices [B, T]
             targets: Target token indices [B, T] (optional, for training)
             memory_states: List of memory states per layer (initialized if None)
+            position_ids: Optional [B, T] position indices for packed sequences.
+                         If None, uses sequential positions 0..T-1.
+            packed_mask: Optional [B, T, T] attention mask for packed sequences.
+                        True = can attend, False = cannot attend.
 
         Returns:
             logits: Output logits [B, T, vocab_size]
@@ -612,16 +929,28 @@ class TitansGPT(nn.Module):
             end = min(start + segment_len, t)
             seg_tokens = idx[:, start:end]
 
-            # Token and position embeddings
+            # Token embeddings
             tok_emb = self.transformer["wte"](seg_tokens)
-            pos = torch.arange(start, end, dtype=torch.long, device=device)
-            pos_emb = self.transformer["wpe"](pos)
+
+            # Position embeddings - use provided position_ids or sequential
+            if position_ids is not None:
+                seg_pos = position_ids[:, start:end]
+                pos_emb = self.transformer["wpe"](seg_pos)
+            else:
+                pos = torch.arange(start, end, dtype=torch.long, device=device)
+                pos_emb = self.transformer["wpe"](pos)
+
             x = self.transformer["drop"](tok_emb + pos_emb)
+
+            # Extract segment mask if provided
+            seg_mask = None
+            if packed_mask is not None:
+                seg_mask = packed_mask[:, start:end, start:end]
 
             # Process through transformer blocks, updating memory states
             new_states: list[MemoryState | None] = []
             for i, block in enumerate(self.transformer["h"]):  # type: ignore[arg-type]
-                x, new_state = block(x, memory_states[i])
+                x, new_state = block(x, memory_states[i], packed_mask=seg_mask)
                 new_states.append(new_state)
             memory_states = new_states
 
@@ -670,7 +999,7 @@ class TitansGPT(nn.Module):
                 # Check no_decay conditions first (they take priority)
                 if pn.endswith("bias"):
                     no_decay.add(fpn)
-                elif "memory_mlp" in fpn or "persist_mem" in fpn:
+                elif "memory_mlp" in fpn or "persist_mem" in fpn or "init_query" in fpn:
                     # Memory MLP weights are templates for per-sequence memory
                     no_decay.add(fpn)
                 elif pn.endswith("weight") and isinstance(m, blacklist_weight_modules):

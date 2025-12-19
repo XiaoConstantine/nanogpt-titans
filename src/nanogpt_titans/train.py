@@ -46,6 +46,7 @@ class TrainConfig:
     gradient_accumulation_steps: int = 4
     batch_size: int = 4
     block_size: int = 256
+    use_packing: bool = False  # Enable padding-free packing
 
     # model
     n_layer: int = 6
@@ -191,6 +192,28 @@ def train(config: TrainConfig) -> None:
         msg = f"Dataset directory {data_dir} not found. Run data preparation script first."
         raise FileNotFoundError(msg)
 
+    # Setup packed data loaders if enabled
+    packed_train_loader = None
+    packed_val_loader = None
+    if config.use_packing:
+        from nanogpt_titans.packed_data import PackedDataLoader
+
+        print("Using padding-free packing for training")
+        packed_train_loader = PackedDataLoader(
+            data_path=data_dir / "train.bin",
+            block_size=config.block_size,
+            batch_size=config.batch_size,
+            device=device,
+            shuffle=True,
+        )
+        packed_val_loader = PackedDataLoader(
+            data_path=data_dir / "val.bin",
+            block_size=config.block_size,
+            batch_size=config.batch_size,
+            device=device,
+            shuffle=False,
+        )
+
     # Model
     model_config = TitansConfig(
         block_size=config.block_size,
@@ -258,13 +281,23 @@ def train(config: TrainConfig) -> None:
         wandb.init(project=config.wandb_project, name=config.wandb_run_name, config=vars(config))
 
     # Training loop
-    x, y = get_batch("train", config, data_dir, device, device_type)
+    if config.use_packing:
+        # Get initial packed batch
+        packed_batch = packed_train_loader.get_batch()
+        x, y = packed_batch.input_ids, packed_batch.targets
+        position_ids, packed_mask = packed_batch.position_ids, packed_batch.attention_mask
+    else:
+        x, y = get_batch("train", config, data_dir, device, device_type)
+        position_ids, packed_mask = None, None
+
     t0 = time.time()
     local_iter_num = 0
     running_mfu = -1.0
 
     print(f"Starting training for {config.max_iters} iterations")
     print(f"Tokens per iteration: {config.tokens_per_iter:,}")
+    if config.use_packing:
+        print("Padding-free packing enabled - maximizing GPU utilization")
 
     while iter_num < config.max_iters:
         # Learning rate schedule
@@ -314,12 +347,27 @@ def train(config: TrainConfig) -> None:
         for _micro_step in range(config.gradient_accumulation_steps):
             with ctx:
                 # Pass memory states and get updated states
-                _logits, loss, memory_states = model(x, targets=y, memory_states=memory_states)
+                # Use packed data if enabled (includes position_ids and attention mask)
+                _logits, loss, memory_states = model(
+                    x,
+                    targets=y,
+                    memory_states=memory_states,
+                    position_ids=position_ids,
+                    packed_mask=packed_mask,
+                )
                 loss = loss / config.gradient_accumulation_steps
 
-            # Get next batch (note: this resets the sequence, so we reinit memory)
-            x, y = get_batch("train", config, data_dir, device, device_type)
-            # Reset memory for new random batch
+            # Get next batch
+            if config.use_packing:
+                packed_batch = packed_train_loader.get_batch()
+                x, y = packed_batch.input_ids, packed_batch.targets
+                position_ids = packed_batch.position_ids
+                packed_mask = packed_batch.attention_mask
+            else:
+                x, y = get_batch("train", config, data_dir, device, device_type)
+                position_ids, packed_mask = None, None
+
+            # Reset memory for new batch
             memory_states = model.init_memory_states(config.batch_size, device)  # type: ignore[union-attr]
 
             # Backward
@@ -345,9 +393,13 @@ def train(config: TrainConfig) -> None:
             if local_iter_num >= 5:
                 mfu = model.get_num_params() * config.tokens_per_iter / (dt * 1e12)
                 running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
+            utilization = ""
+            if config.use_packing:
+                util_pct = packed_batch.total_tokens / (config.batch_size * config.block_size) * 100
+                utilization = f", util {util_pct:.1f}%"
             print(
                 f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms, "
-                f"mfu {running_mfu * 100:.2f}%"
+                f"mfu {running_mfu * 100:.2f}%{utilization}"
             )
 
         iter_num += 1
@@ -377,6 +429,7 @@ def main() -> None:
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--block_size", type=int, default=512)
+    parser.add_argument("--use_packing", action="store_true", help="Enable padding-free packing")
     parser.add_argument("--n_layer", type=int, default=6)
     parser.add_argument("--n_head", type=int, default=6)
     parser.add_argument("--n_embd", type=int, default=384)
