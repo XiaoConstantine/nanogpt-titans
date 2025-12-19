@@ -15,7 +15,7 @@ Fixed version addressing:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import lru_cache
 
 import torch
@@ -27,17 +27,32 @@ from torch.nn import functional as F
 _FLEX_ATTENTION_AVAILABLE = False
 try:
     from torch.nn.attention.flex_attention import (
-        flex_attention,
         create_block_mask,
+        flex_attention,
     )
+
     if torch.cuda.is_available():
         _FLEX_ATTENTION_AVAILABLE = True
         flex_attention = torch.compile(flex_attention)
 except ImportError:
     pass
 
+# Triton kernels for fused memory operations
+_TRITON_AVAILABLE = False
+triton_momentum_update = None  # type: ignore[assignment]
+try:
+    from nanogpt_titans.triton_kernels import (
+        triton_momentum_update,
+    )
+
+    if torch.cuda.is_available():
+        _TRITON_AVAILABLE = True
+except ImportError:
+    pass
+
 
 # --- FlexAttention mask functions ---
+
 
 def causal_mask(b, h, q_idx, kv_idx):
     """Standard causal mask: each position can only attend to previous positions."""
@@ -51,6 +66,7 @@ def prefix_lm_mask(prefix_len: int):
     Prefix tokens (0:prefix_len) can attend to all prefix tokens.
     Suffix tokens (prefix_len:) can attend to prefix + causally to suffix.
     """
+
     def mask_fn(b, h, q_idx, kv_idx):
         # If query is in prefix, it can attend to all prefix tokens
         in_prefix = q_idx < prefix_len
@@ -59,7 +75,12 @@ def prefix_lm_mask(prefix_len: int):
         # Causal mask for suffix
         causal = q_idx >= kv_idx
         # Prefix can attend to prefix; suffix can attend to prefix + causal suffix
-        return (in_prefix & key_in_prefix) | (key_in_prefix & ~in_prefix) | (~in_prefix & ~key_in_prefix & causal)
+        return (
+            (in_prefix & key_in_prefix)
+            | (key_in_prefix & ~in_prefix)
+            | (~in_prefix & ~key_in_prefix & causal)
+        )
+
     return mask_fn
 
 
@@ -73,10 +94,12 @@ def document_causal_mask(document_ids: torch.Tensor):
     Args:
         document_ids: [seq_len] tensor where document_ids[i] = doc index for token i
     """
+
     def mask_fn(b, h, q_idx, kv_idx):
         same_doc = document_ids[q_idx] == document_ids[kv_idx]
         causal = q_idx >= kv_idx
         return same_doc & causal
+
     return mask_fn
 
 
@@ -316,19 +339,14 @@ class NeuralMemory(nn.Module):
             last_momentum[name] = torch.zeros_like(expanded)
 
         return MemoryState(
-            weights=weights,
-            last_momentum=last_momentum,
-            last_segment_output=None,
-            step=0
+            weights=weights, last_momentum=last_momentum, last_segment_output=None, step=0
         )
 
     def reset_state(self, state: MemoryState) -> None:
         """Reset memory state in-place - avoids reallocation."""
         for name, param in self.memory_mlp.named_parameters():
             # Copy initial weights in-place
-            state.weights[name].copy_(
-                param.detach().unsqueeze(0).expand_as(state.weights[name])
-            )
+            state.weights[name].copy_(param.detach().unsqueeze(0).expand_as(state.weights[name]))
             state.last_momentum[name].zero_()
         state.last_segment_output = None
         state.step = 0
@@ -361,7 +379,7 @@ class NeuralMemory(nn.Module):
         Returns:
             retrieved: Memory context [B, num_longterm_mem, C]
         """
-        b, t, c = x.shape
+        b, _t, _c = x.shape
 
         # FIXED: Use previous segment's output for retrieval, NOT current segment
         # This ensures causality - we only use information from the past
@@ -378,7 +396,7 @@ class NeuralMemory(nn.Module):
         retrieved_list = []
         for i in range(b):
             # Get memory output for this batch item
-            q_i = queries[i:i+1]  # [1, T_prev, C]
+            q_i = queries[i : i + 1]  # [1, T_prev, C]
             mem_out = self._forward_with_weights(q_i, state.weights, i)  # [1, T_prev, C]
             retrieved_list.append(mem_out)
 
@@ -387,7 +405,9 @@ class NeuralMemory(nn.Module):
         # Pool to num_longterm_mem tokens
         # Use adaptive pooling to get fixed number of memory tokens
         retrieved = retrieved.transpose(1, 2)  # [B, C, T_prev]
-        retrieved = F.adaptive_avg_pool1d(retrieved, self.num_longterm_mem)  # [B, C, num_longterm_mem]
+        retrieved = F.adaptive_avg_pool1d(
+            retrieved, self.num_longterm_mem
+        )  # [B, C, num_longterm_mem]
         retrieved = retrieved.transpose(1, 2)  # [B, num_longterm_mem, C]
 
         return self.out_proj(retrieved)
@@ -415,7 +435,7 @@ class NeuralMemory(nn.Module):
         Returns:
             new_state: Updated memory state (includes storing x for next segment's retrieval)
         """
-        b, t, _c = x.shape
+        _b, _t, _c = x.shape
 
         # Project to keys and values for storage
         keys = self.key_proj(x.detach())  # [B, T, C]
@@ -461,17 +481,23 @@ class NeuralMemory(nn.Module):
             # Surprise is negative gradient: [B, T, *param_shape]
             surprises = -all_grads[name]
 
-            # Compute momentum in parallel across all T tokens
-            # Uses cumsum trick: O(T) parallel instead of O(T) sequential
-            # Result: [B, T, *param_shape] momentum values for each token
-            momentum_values = parallel_momentum(
-                surprises,
-                self.momentum,
-                prev_momentum=state.last_momentum[name],
-            )
+            # Compute momentum - use Triton kernel if available for ~2x speedup
+            if _TRITON_AVAILABLE and surprises.is_cuda:
+                # Triton kernel computes final momentum directly (no intermediate tensor)
+                final_momentum = triton_momentum_update(
+                    surprises,
+                    self.momentum,
+                    state.last_momentum[name],
+                )
+            else:
+                # Fallback: parallel scan via cumsum trick
+                momentum_values = parallel_momentum(
+                    surprises,
+                    self.momentum,
+                    prev_momentum=state.last_momentum[name],
+                )
+                final_momentum = momentum_values[:, -1]  # [B, *param_shape]
 
-            # Use the final momentum value (at t=T) for weight update
-            final_momentum = momentum_values[:, -1]  # [B, *param_shape]
             new_last_momentum[name] = final_momentum.detach()
 
             # Apply weight update with decay
@@ -782,9 +808,7 @@ class TitansBlock(nn.Module):
             # Prefix tokens can attend to themselves and be attended by all
             t = x.shape[1]
             full_len = prefix_len + t
-            expanded_mask = torch.zeros(
-                b, full_len, full_len, dtype=torch.bool, device=x.device
-            )
+            expanded_mask = torch.zeros(b, full_len, full_len, dtype=torch.bool, device=x.device)
             # Prefix tokens can attend to all prefix tokens (bidirectional)
             expanded_mask[:, :prefix_len, :prefix_len] = True
             # Segment tokens can attend to prefix
@@ -843,10 +867,12 @@ class TitansGPT(nn.Module):
                 "wte": nn.Embedding(config.vocab_size, config.n_embd),
                 "wpe": nn.Embedding(config.block_size, config.n_embd),
                 "drop": nn.Dropout(config.dropout),
-                "h": nn.ModuleList([
-                    TitansBlock(config, has_memory=(i in memory_layers))
-                    for i in range(config.n_layer)
-                ]),
+                "h": nn.ModuleList(
+                    [
+                        TitansBlock(config, has_memory=(i in memory_layers))
+                        for i in range(config.n_layer)
+                    ]
+                ),
                 "ln_f": LayerNorm(config.n_embd, bias=config.bias),
             }
         )
@@ -864,7 +890,9 @@ class TitansGPT(nn.Module):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
 
         mem_layers_str = ",".join(str(i) for i in sorted(memory_layers))
-        print(f"TitansGPT initialized with {self.get_num_params() / 1e6:.2f}M parameters (memory on layer {mem_layers_str})")
+        print(
+            f"TitansGPT initialized with {self.get_num_params() / 1e6:.2f}M parameters (memory on layer {mem_layers_str})"
+        )
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
