@@ -33,8 +33,7 @@ try:
     # Only enable if CUDA is available (flex_attention requires GPU)
     if torch.cuda.is_available():
         _FLEX_ATTENTION_AVAILABLE = True
-        # Compile flex_attention for better performance
-        flex_attention = torch.compile(flex_attention)
+        # Note: Don't compile flex_attention - causes Triton OOM on some GPUs
 except ImportError:
     pass
 
