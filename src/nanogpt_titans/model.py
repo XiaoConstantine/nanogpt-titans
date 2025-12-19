@@ -22,20 +22,9 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-# FlexAttention imports (available in PyTorch 2.5+)
+# FlexAttention disabled - SDPA is 50x faster on T4 GPUs without torch.compile
+# Set to True only if you have compiled FlexAttention working (A100, H100, etc.)
 _FLEX_ATTENTION_AVAILABLE = False
-try:
-    from torch.nn.attention.flex_attention import (
-        flex_attention,
-        create_block_mask,
-        or_masks,
-    )
-    # Only enable if CUDA is available (flex_attention requires GPU)
-    if torch.cuda.is_available():
-        _FLEX_ATTENTION_AVAILABLE = True
-        # Note: Don't compile flex_attention - causes Triton OOM on some GPUs
-except ImportError:
-    pass
 
 
 # --- FlexAttention mask functions ---
