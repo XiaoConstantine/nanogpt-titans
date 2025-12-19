@@ -145,6 +145,16 @@ class NeuralMemory(nn.Module):
 
         return MemoryState(weights=weights, momentum=momentum, step=0)
 
+    def reset_state(self, state: MemoryState) -> None:
+        """Reset memory state in-place - avoids reallocation."""
+        for name, param in self.memory_mlp.named_parameters():
+            # Copy initial weights in-place
+            state.weights[name].copy_(
+                param.detach().unsqueeze(0).expand_as(state.weights[name])
+            )
+            state.momentum[name].zero_()
+        state.step = 0
+
     def _forward_with_weights(
         self,
         x: torch.Tensor,
@@ -414,6 +424,10 @@ class TitansBlock(nn.Module):
         """Initialize memory state for this block."""
         return self.memory.init_state(batch_size, device)
 
+    def reset_state(self, state: MemoryState) -> None:
+        """Reset memory state in-place."""
+        self.memory.reset_state(state)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -513,6 +527,11 @@ class TitansGPT(nn.Module):
     def init_memory_states(self, batch_size: int, device: torch.device) -> list[MemoryState]:
         """Initialize memory states for all layers."""
         return [block.init_state(batch_size, device) for block in self.transformer["h"]]  # type: ignore[not-iterable]
+
+    def reset_memory_states(self, states: list[MemoryState]) -> None:
+        """Reset memory states in-place - avoids reallocation."""
+        for block, state in zip(self.transformer["h"], states):  # type: ignore[not-iterable]
+            block.reset_state(state)
 
     def forward(
         self,

@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from queue import Queue
 from typing import Any
 
 import numpy as np
@@ -135,6 +137,42 @@ def get_batch(
     y = y.pin_memory().to(device, non_blocking=True)
 
     return x, y
+
+
+class BatchPrefetcher:
+    """Prefetch batches in background thread to overlap I/O with compute."""
+
+    def __init__(
+        self,
+        config: TrainConfig,
+        data_dir: Path,
+        prefetch_count: int = 2,
+    ) -> None:
+        self.config = config
+        self.data_dir = data_dir
+        self.prefetch_count = prefetch_count
+        self.queue: Queue[tuple[torch.Tensor, torch.Tensor]] = Queue(maxsize=prefetch_count)
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._prefetch_loop, daemon=True)
+        self.thread.start()
+
+    def _prefetch_loop(self) -> None:
+        """Background thread that continuously prefetches batches."""
+        while not self.stop_event.is_set():
+            if not self.queue.full():
+                batch = get_batch("train", self.config, self.data_dir)
+                self.queue.put(batch)
+            else:
+                time.sleep(0.001)  # Small sleep to avoid busy waiting
+
+    def get_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Get a prefetched batch (blocks if none available)."""
+        return self.queue.get()
+
+    def stop(self) -> None:
+        """Stop the prefetch thread."""
+        self.stop_event.set()
+        self.thread.join(timeout=1.0)
 
 
 def get_lr(it: int, config: TrainConfig) -> float:
@@ -268,10 +306,14 @@ def train(config: TrainConfig) -> None:
         import wandb
         wandb.init(project=config.wandb_project, name=config.wandb_run_name, config=vars(config))
 
-    # Training
-    x, y = get_batch("train", config, data_dir)
+    # Training with async data prefetching
+    prefetcher = BatchPrefetcher(config, data_dir, prefetch_count=2)
+    x, y = prefetcher.get_batch()
     t0 = time.time()
     local_iter_num = 0
+
+    # Pre-allocate memory states once (will be reset in-place)
+    memory_states = raw_model.init_memory_states(config.batch_size, device)  # type: ignore[arg-type]
 
     if master_process:
         print(f"Starting training for {config.max_iters} iterations")
@@ -312,7 +354,7 @@ def train(config: TrainConfig) -> None:
                     torch.save(checkpoint, Path(config.out_dir) / "ckpt.pt")
 
         # Forward + backward
-        memory_states = raw_model.init_memory_states(config.batch_size, device)  # type: ignore[arg-type]
+        raw_model.reset_memory_states(memory_states)  # Reset in-place (no allocation)
 
         for micro_step in range(config.gradient_accumulation_steps):
             if ddp:
@@ -322,8 +364,8 @@ def train(config: TrainConfig) -> None:
                 _, loss, memory_states = raw_model(x, targets=y, memory_states=memory_states)
                 loss = loss / config.gradient_accumulation_steps
 
-            x, y = get_batch("train", config, data_dir)
-            memory_states = raw_model.init_memory_states(config.batch_size, device)  # type: ignore[arg-type]
+            x, y = prefetcher.get_batch()  # Async prefetched batch
+            raw_model.reset_memory_states(memory_states)  # Reset in-place
 
             scaler.scale(loss).backward()
 
@@ -346,6 +388,9 @@ def train(config: TrainConfig) -> None:
 
         iter_num += 1
         local_iter_num += 1
+
+    # Cleanup
+    prefetcher.stop()
 
     if ddp:
         dist.destroy_process_group()  # type: ignore[attr-defined]
