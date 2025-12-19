@@ -43,6 +43,7 @@ class TitansConfig:
     memory_lr: float = 0.01  # learning rate for surprise-based updates
     memory_momentum: float = 0.9  # momentum for past surprise
     memory_decay: float = 0.001  # forgetting/decay factor
+    memory_layer: int = -1  # which layer has memory (-1 = middle layer, -2 = all layers)
 
 
 class LayerNorm(nn.Module):
@@ -398,20 +399,23 @@ class TitansBlock(nn.Module):
     - Updates memory during both training and inference
     """
 
-    def __init__(self, config: TitansConfig) -> None:
+    def __init__(self, config: TitansConfig, has_memory: bool = True) -> None:
         super().__init__()
         self.config = config  # type: ignore[assignment]
-        self.num_longterm_mem = config.num_longterm_mem  # type: ignore[assignment]
-        self.num_persist_mem = config.num_persist_mem  # type: ignore[assignment]
+        self.has_memory = has_memory
+        self.num_longterm_mem = config.num_longterm_mem if has_memory else 0
+        self.num_persist_mem = config.num_persist_mem if has_memory else 0
         self.update_memory = True  # Can be disabled during training for speed
 
-        # Neural memory module
-        self.memory = NeuralMemory(config)
-
-        # Persistent memory (learnable, input-independent task knowledge)
-        self.persist_mem = nn.Parameter(
-            torch.randn(1, config.num_persist_mem, config.n_embd) * 0.02
-        )
+        # Neural memory module (only if this layer has memory)
+        if has_memory:
+            self.memory = NeuralMemory(config)
+            self.persist_mem = nn.Parameter(
+                torch.randn(1, config.num_persist_mem, config.n_embd) * 0.02
+            )
+        else:
+            self.memory = None  # type: ignore[assignment]
+            self.persist_mem = None  # type: ignore[assignment]
 
         # Layer norms
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
@@ -421,30 +425,39 @@ class TitansBlock(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.mlp = MLP(config)
 
-    def init_state(self, batch_size: int, device: torch.device) -> MemoryState:
+    def init_state(self, batch_size: int, device: torch.device) -> MemoryState | None:
         """Initialize memory state for this block."""
+        if not self.has_memory:
+            return None
         return self.memory.init_state(batch_size, device)
 
-    def reset_state(self, state: MemoryState) -> None:
+    def reset_state(self, state: MemoryState | None) -> None:
         """Reset memory state in-place."""
-        self.memory.reset_state(state)
+        if self.has_memory and state is not None:
+            self.memory.reset_state(state)
 
     def forward(
         self,
         x: torch.Tensor,
-        memory_state: MemoryState,
-    ) -> tuple[torch.Tensor, MemoryState]:
+        memory_state: MemoryState | None,
+    ) -> tuple[torch.Tensor, MemoryState | None]:
         """
         Forward pass with memory integration.
 
         Args:
             x: Input tensor [B, T, C]
-            memory_state: Current memory state
+            memory_state: Current memory state (None if no memory)
 
         Returns:
             output: Transformed tensor [B, T, C]
-            new_state: Updated memory state
+            new_state: Updated memory state (None if no memory)
         """
+        # If no memory, just do standard transformer block
+        if not self.has_memory:
+            x = x + self.attn(self.ln_1(x))
+            x = x + self.mlp(self.ln_2(x))
+            return x, None
+
         b, _t, _c = x.shape
 
         # 1. Retrieve from long-term memory
@@ -489,12 +502,28 @@ class TitansGPT(nn.Module):
         super().__init__()
         self.config = config  # type: ignore[assignment]
 
+        # Determine which layers have memory
+        if config.memory_layer == -2:
+            # All layers have memory (backwards compat)
+            memory_layers = set(range(config.n_layer))
+        elif config.memory_layer == -1:
+            # Default: only middle layer has memory (like lucidrains)
+            memory_layers = {config.n_layer // 2}
+        else:
+            # Specific layer
+            memory_layers = {config.memory_layer}
+
+        self.memory_layers = memory_layers
+
         self.transformer = nn.ModuleDict(
             {
                 "wte": nn.Embedding(config.vocab_size, config.n_embd),
                 "wpe": nn.Embedding(config.block_size, config.n_embd),
                 "drop": nn.Dropout(config.dropout),
-                "h": nn.ModuleList([TitansBlock(config) for _ in range(config.n_layer)]),
+                "h": nn.ModuleList([
+                    TitansBlock(config, has_memory=(i in memory_layers))
+                    for i in range(config.n_layer)
+                ]),
                 "ln_f": LayerNorm(config.n_embd, bias=config.bias),
             }
         )
@@ -511,7 +540,8 @@ class TitansGPT(nn.Module):
             if pn.endswith("c_proj.weight"):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
 
-        print(f"TitansGPT initialized with {self.get_num_params() / 1e6:.2f}M parameters")
+        mem_layers_str = ",".join(str(i) for i in sorted(memory_layers))
+        print(f"TitansGPT initialized with {self.get_num_params() / 1e6:.2f}M parameters (memory on layer {mem_layers_str})")
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -528,11 +558,11 @@ class TitansGPT(nn.Module):
             n_params -= self.transformer["wpe"].weight.numel()  # type: ignore[call-non-callable]
         return n_params
 
-    def init_memory_states(self, batch_size: int, device: torch.device) -> list[MemoryState]:
-        """Initialize memory states for all layers."""
+    def init_memory_states(self, batch_size: int, device: torch.device) -> list[MemoryState | None]:
+        """Initialize memory states for all layers (None for layers without memory)."""
         return [block.init_state(batch_size, device) for block in self.transformer["h"]]  # type: ignore[not-iterable]
 
-    def reset_memory_states(self, states: list[MemoryState]) -> None:
+    def reset_memory_states(self, states: list[MemoryState | None]) -> None:
         """Reset memory states in-place - avoids reallocation."""
         for block, state in zip(self.transformer["h"], states):  # type: ignore[not-iterable]
             block.reset_state(state)
@@ -546,8 +576,8 @@ class TitansGPT(nn.Module):
         self,
         idx: torch.Tensor,
         targets: torch.Tensor | None = None,
-        memory_states: list[MemoryState] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, list[MemoryState]]:
+        memory_states: list[MemoryState | None] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, list[MemoryState | None]]:
         """
         Forward pass with segmented processing.
 
@@ -589,7 +619,7 @@ class TitansGPT(nn.Module):
             x = self.transformer["drop"](tok_emb + pos_emb)
 
             # Process through transformer blocks, updating memory states
-            new_states: list[MemoryState] = []
+            new_states: list[MemoryState | None] = []
             for i, block in enumerate(self.transformer["h"]):  # type: ignore[arg-type]
                 x, new_state = block(x, memory_states[i])
                 new_states.append(new_state)

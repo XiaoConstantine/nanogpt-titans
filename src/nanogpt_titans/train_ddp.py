@@ -60,6 +60,7 @@ class TrainConfig:
     memory_lr: float = 0.01
     memory_depth: int = 2
     memory_expansion: int = 2
+    memory_layer: int = -1  # -1=middle layer, -2=all layers
     memory_momentum: float = 0.9
     memory_decay: float = 0.001
     dropout: float = 0.0
@@ -302,6 +303,7 @@ def train(config: TrainConfig) -> None:
         memory_lr=config.memory_lr,
         memory_depth=config.memory_depth,
         memory_expansion=config.memory_expansion,
+        memory_layer=config.memory_layer,
         memory_momentum=config.memory_momentum,
         memory_decay=config.memory_decay,
     )
@@ -485,6 +487,8 @@ def main() -> None:
     parser.add_argument("--memory_lr", type=float, default=0.01)
     parser.add_argument("--memory_depth", type=int, default=2)
     parser.add_argument("--memory_expansion", type=int, default=2)
+    parser.add_argument("--memory_layer", type=int, default=-1,
+                       help="Which layer has memory (-1=middle, -2=all)")
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--learning_rate", type=float, default=6e-4)
     parser.add_argument("--max_iters", type=int, default=10000)
@@ -519,6 +523,7 @@ def main() -> None:
         memory_lr=args.memory_lr,
         memory_depth=args.memory_depth,
         memory_expansion=args.memory_expansion,
+        memory_layer=args.memory_layer,
         dropout=args.dropout,
         learning_rate=args.learning_rate,
         max_iters=args.max_iters,
