@@ -616,29 +616,38 @@ class CausalSelfAttention(nn.Module):
                 dropout_p=self.dropout if self.training else 0,
                 is_causal=True,
             )
-        else:
-            # Manual attention with prefix-LM mask (CPU fallback or prefix > 0 without FlexAttention)
-            # Build the mask manually
+        elif self.flash and prefix_len > 0:
+            # Prefix-LM attention using SDPA with explicit mask
+            # Build prefix-LM mask: prefix bidirectional, suffix causal + can see prefix
             mask = torch.ones(t, t, device=x.device, dtype=torch.bool)
+            # Prefix tokens can attend to all prefix tokens
+            mask[:prefix_len, :prefix_len] = False
+            # Suffix tokens can attend to all prefix tokens
+            mask[prefix_len:, :prefix_len] = False
+            # Suffix tokens have causal attention among themselves
+            suffix_len = t - prefix_len
+            if suffix_len > 0:
+                suffix_causal = torch.triu(
+                    torch.ones(suffix_len, suffix_len, device=x.device, dtype=torch.bool),
+                    diagonal=1,
+                )
+                mask[prefix_len:, prefix_len:] = suffix_causal
 
-            if prefix_len > 0:
-                # Prefix tokens can attend to all prefix tokens
-                mask[:prefix_len, :prefix_len] = False
-                # Suffix tokens can attend to all prefix tokens
-                mask[prefix_len:, :prefix_len] = False
-                # Suffix tokens have causal attention among themselves
-                suffix_len = t - prefix_len
-                if suffix_len > 0:
-                    suffix_causal = torch.triu(
-                        torch.ones(suffix_len, suffix_len, device=x.device, dtype=torch.bool),
-                        diagonal=1,
-                    )
-                    mask[prefix_len:, prefix_len:] = suffix_causal
-            else:
-                # Pure causal mask
-                mask = torch.triu(torch.ones(t, t, device=x.device, dtype=torch.bool), diagonal=1)
+            # Convert to float mask for SDPA (True -> -inf, False -> 0)
+            float_mask = torch.zeros(t, t, device=x.device, dtype=q.dtype)
+            float_mask.masked_fill_(mask, float("-inf"))
 
-            # Apply attention with mask (True = masked out)
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=float_mask,
+                dropout_p=self.dropout if self.training else 0,
+                is_causal=False,  # We provide explicit mask
+            )
+        else:
+            # CPU fallback - manual attention
+            mask = torch.triu(torch.ones(t, t, device=x.device, dtype=torch.bool), diagonal=1)
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(mask, float("-inf"))
             att = F.softmax(att, dim=-1)
