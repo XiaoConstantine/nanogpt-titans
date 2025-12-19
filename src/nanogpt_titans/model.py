@@ -510,6 +510,8 @@ class CausalSelfAttention(nn.Module):
 
         # Cache for block masks (avoid recreating every forward pass)
         self._block_mask_cache: dict[tuple, object] = {}
+        # Cache for SDPA float masks
+        self._sdpa_mask_cache: dict[tuple, torch.Tensor] = {}
 
     def _get_block_mask(
         self,
@@ -617,31 +619,34 @@ class CausalSelfAttention(nn.Module):
                 is_causal=True,
             )
         elif self.flash and prefix_len > 0:
-            # Prefix-LM attention using SDPA with explicit mask
-            # Build prefix-LM mask: prefix bidirectional, suffix causal + can see prefix
-            mask = torch.ones(t, t, device=x.device, dtype=torch.bool)
-            # Prefix tokens can attend to all prefix tokens
-            mask[:prefix_len, :prefix_len] = False
-            # Suffix tokens can attend to all prefix tokens
-            mask[prefix_len:, :prefix_len] = False
-            # Suffix tokens have causal attention among themselves
-            suffix_len = t - prefix_len
-            if suffix_len > 0:
-                suffix_causal = torch.triu(
-                    torch.ones(suffix_len, suffix_len, device=x.device, dtype=torch.bool),
-                    diagonal=1,
-                )
-                mask[prefix_len:, prefix_len:] = suffix_causal
+            # Prefix-LM attention using SDPA with cached explicit mask
+            cache_key = (t, prefix_len, x.device, q.dtype)
+            if cache_key not in self._sdpa_mask_cache:
+                # Build prefix-LM mask: prefix bidirectional, suffix causal + can see prefix
+                mask = torch.ones(t, t, device=x.device, dtype=torch.bool)
+                # Prefix tokens can attend to all prefix tokens
+                mask[:prefix_len, :prefix_len] = False
+                # Suffix tokens can attend to all prefix tokens
+                mask[prefix_len:, :prefix_len] = False
+                # Suffix tokens have causal attention among themselves
+                suffix_len = t - prefix_len
+                if suffix_len > 0:
+                    suffix_causal = torch.triu(
+                        torch.ones(suffix_len, suffix_len, device=x.device, dtype=torch.bool),
+                        diagonal=1,
+                    )
+                    mask[prefix_len:, prefix_len:] = suffix_causal
 
-            # Convert to float mask for SDPA (True -> -inf, False -> 0)
-            float_mask = torch.zeros(t, t, device=x.device, dtype=q.dtype)
-            float_mask.masked_fill_(mask, float("-inf"))
+                # Convert to float mask for SDPA (True -> -inf, False -> 0)
+                float_mask = torch.zeros(t, t, device=x.device, dtype=q.dtype)
+                float_mask.masked_fill_(mask, float("-inf"))
+                self._sdpa_mask_cache[cache_key] = float_mask
 
             y = F.scaled_dot_product_attention(
                 q,
                 k,
                 v,
-                attn_mask=float_mask,
+                attn_mask=self._sdpa_mask_cache[cache_key],
                 dropout_p=self.dropout if self.training else 0,
                 is_causal=False,  # We provide explicit mask
             )
