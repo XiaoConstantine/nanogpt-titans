@@ -326,6 +326,10 @@ class NeuralMemory(nn.Module):
         self.momentum = config.memory_momentum  # type: ignore[assignment]
         self.decay = config.memory_decay  # type: ignore[assignment]
 
+        # Cache vmapped functions for performance
+        self._batched_mlp_forward: callable | None = None  # type: ignore[valid-type]
+        self._batched_grad_fn: callable | None = None  # type: ignore[valid-type]
+
     def init_state(self, batch_size: int, device: torch.device) -> MemoryState:
         """Initialize memory state - clone MLP weights for each batch item."""
         weights: dict[str, torch.Tensor] = {}
@@ -392,15 +396,20 @@ class NeuralMemory(nn.Module):
         # Project to queries
         queries = self.query_proj(query_source)  # [B, T_prev, C] or [B, 1, C]
 
-        # Retrieve by passing queries through per-sequence MLP
-        retrieved_list = []
-        for i in range(b):
-            # Get memory output for this batch item
-            q_i = queries[i : i + 1]  # [1, T_prev, C]
-            mem_out = self._forward_with_weights(q_i, state.weights, i)  # [1, T_prev, C]
-            retrieved_list.append(mem_out)
+        # Retrieve by passing queries through per-sequence MLP (vectorized with vmap)
+        def single_batch_forward(params: dict[str, torch.Tensor], q: torch.Tensor) -> torch.Tensor:
+            # q: [T, C], params: {name: [*param_shape]}
+            q = q.unsqueeze(0)  # [1, T, C]
+            return torch.func.functional_call(self.memory_mlp, params, (q,)).squeeze(0)  # [T, C]
 
-        retrieved = torch.cat(retrieved_list, dim=0)  # [B, T_prev, C]
+        # vmap over batch dimension
+        if self._batched_mlp_forward is None:
+            params_in_dims = {name: 0 for name in state.weights}
+            self._batched_mlp_forward = torch.func.vmap(
+                single_batch_forward, in_dims=(params_in_dims, 0)
+            )
+
+        retrieved = self._batched_mlp_forward(state.weights, queries)  # [B, T_prev, C]
 
         # Pool to num_longterm_mem tokens
         # Use adaptive pooling to get fixed number of memory tokens
@@ -441,29 +450,26 @@ class NeuralMemory(nn.Module):
         keys = self.key_proj(x.detach())  # [B, T, C]
         values = self.value_proj(x.detach())  # [B, T, C]
 
-        # Define loss function for a single token (no batch or time dim)
-        def single_token_loss(
-            params: dict[str, torch.Tensor], k: torch.Tensor, v: torch.Tensor
-        ) -> torch.Tensor:
-            # k, v: [C]
-            k = k.unsqueeze(0).unsqueeze(0)  # [1, 1, C]
-            v = v.unsqueeze(0).unsqueeze(0)  # [1, 1, C]
-            pred = torch.func.functional_call(self.memory_mlp, params, (k,))
-            return F.mse_loss(pred, v)
+        # Cache the batched gradient function (created once, reused)
+        if self._batched_grad_fn is None:
+            # Define loss function for a single token (no batch or time dim)
+            def single_token_loss(
+                params: dict[str, torch.Tensor], k: torch.Tensor, v: torch.Tensor
+            ) -> torch.Tensor:
+                # k, v: [C]
+                k = k.unsqueeze(0).unsqueeze(0)  # [1, 1, C]
+                v = v.unsqueeze(0).unsqueeze(0)  # [1, 1, C]
+                pred = torch.func.functional_call(self.memory_mlp, params, (k,))
+                return F.mse_loss(pred, v)
 
-        # Create grad function for single token
-        grad_fn = torch.func.grad(single_token_loss)
+            grad_fn = torch.func.grad(single_token_loss)
+            params_in_dims = {name: 0 for name in state.weights}
 
-        # vmap over batch and time dimensions
-        # in_dims for params dict: each tensor has batch dim 0
-        params_in_dims = {name: 0 for name in state.weights}
-
-        # First vmap over time (tokens), then over batch
-        # This gives us per-token gradients for each batch item
-        batched_grad_fn = torch.func.vmap(
-            torch.func.vmap(grad_fn, in_dims=(None, 0, 0)),  # Over T tokens
-            in_dims=(params_in_dims, 0, 0),  # Over B batches
-        )
+            # First vmap over time (tokens), then over batch
+            self._batched_grad_fn = torch.func.vmap(
+                torch.func.vmap(grad_fn, in_dims=(None, 0, 0)),  # Over T tokens
+                in_dims=(params_in_dims, 0, 0),  # Over B batches
+            )
 
         # Compute all per-token gradients in one vectorized call
         # Result: {name: [B, T, *param_shape]} for each parameter
@@ -471,7 +477,7 @@ class NeuralMemory(nn.Module):
             params_for_grad = {
                 name: w.clone().requires_grad_(True) for name, w in state.weights.items()
             }
-            all_grads = batched_grad_fn(params_for_grad, keys, values)
+            all_grads = self._batched_grad_fn(params_for_grad, keys, values)
 
         # Apply updates with parallel momentum
         new_weights: dict[str, torch.Tensor] = {}
