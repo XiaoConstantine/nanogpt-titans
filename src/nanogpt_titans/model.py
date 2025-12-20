@@ -340,10 +340,10 @@ class NeuralMemory(nn.Module):
         last_momentum: dict[str, torch.Tensor] = {}
 
         for name, param in self.memory_mlp.named_parameters():
-            # Expand weights to [B, *param_shape] and clone
-            expanded = param.detach().unsqueeze(0).expand(batch_size, *param.shape).clone()
+            # Expand weights to [B, *param_shape] and clone - ensure contiguous
+            expanded = param.detach().unsqueeze(0).expand(batch_size, *param.shape).clone().contiguous()
             weights[name] = expanded.to(device)
-            # Last momentum starts at zero
+            # Last momentum starts at zero - already contiguous
             last_momentum[name] = torch.zeros_like(expanded)
 
         return MemoryState(
@@ -397,8 +397,8 @@ class NeuralMemory(nn.Module):
             # First segment: use learned initial query expanded for batch
             query_source = self.init_query.expand(b, -1, -1)  # [B, 1, C]
 
-        # Project to queries
-        queries = self.query_proj(query_source)  # [B, T_prev, C] or [B, 1, C]
+        # Project to queries - ensure contiguous for vmap
+        queries = self.query_proj(query_source).contiguous()  # [B, T_prev, C] or [B, 1, C]
 
         # Retrieve by passing queries through per-sequence MLP (vectorized with vmap)
         def single_batch_forward(params: dict[str, torch.Tensor], q: torch.Tensor) -> torch.Tensor:
@@ -413,15 +413,18 @@ class NeuralMemory(nn.Module):
                 single_batch_forward, in_dims=(params_in_dims, 0)
             )
 
-        retrieved = self._batched_mlp_forward(state.weights, queries)  # [B, T_prev, C]
+        # Ensure weights are contiguous for vmap
+        weights_contig = {k: v.contiguous() for k, v in state.weights.items()}
+        retrieved = self._batched_mlp_forward(weights_contig, queries)  # [B, T_prev, C]
 
-        # Pool to num_longterm_mem tokens
-        # Use adaptive pooling to get fixed number of memory tokens
-        retrieved = retrieved.transpose(1, 2)  # [B, C, T_prev]
-        retrieved = F.adaptive_avg_pool1d(
-            retrieved, self.num_longterm_mem
-        )  # [B, C, num_longterm_mem]
-        retrieved = retrieved.transpose(1, 2)  # [B, num_longterm_mem, C]
+        # Pool to num_longterm_mem tokens - use reshape to avoid transpose
+        B, T_prev, C = retrieved.shape
+        if T_prev != self.num_longterm_mem:
+            # Reshape: [B, T_prev, C] -> [B, C, T_prev] -> pool -> [B, C, mem] -> [B, mem, C]
+            retrieved = F.adaptive_avg_pool1d(
+                retrieved.transpose(1, 2).contiguous(), self.num_longterm_mem
+            ).transpose(1, 2)
+        # else: T_prev == num_longterm_mem, no pooling needed
 
         return self.out_proj(retrieved)
 
@@ -450,9 +453,10 @@ class NeuralMemory(nn.Module):
         """
         _b, _t, _c = x.shape
 
-        # Project to keys and values for storage
-        keys = self.key_proj(x.detach())  # [B, T, C]
-        values = self.value_proj(x.detach())  # [B, T, C]
+        # Project to keys and values for storage - ensure contiguous
+        x_detached = x.detach().contiguous()
+        keys = self.key_proj(x_detached).contiguous()  # [B, T, C]
+        values = self.value_proj(x_detached).contiguous()  # [B, T, C]
 
         # Cache the batched gradient function (created once, reused)
         if self._batched_grad_fn is None:
@@ -477,9 +481,11 @@ class NeuralMemory(nn.Module):
 
         # Compute all per-token gradients in one vectorized call
         # Result: {name: [B, T, *param_shape]} for each parameter
+        # Make weights contiguous and clone for grad tracking
         with torch.enable_grad():
             params_for_grad = {
-                name: w.clone().requires_grad_(True) for name, w in state.weights.items()
+                name: w.contiguous().clone().requires_grad_(True)
+                for name, w in state.weights.items()
             }
             all_grads = self._batched_grad_fn(params_for_grad, keys, values)
 
@@ -498,31 +504,35 @@ class NeuralMemory(nn.Module):
             new_last_momentum: dict[str, torch.Tensor] = {}
 
             for name in state.weights:
-                grads = all_grads[name]
+                # Ensure contiguous inputs for Triton kernel
+                grads = all_grads[name].contiguous()
+                weights_in = state.weights[name].contiguous()
+                momentum_in = state.last_momentum[name].contiguous()
+
                 updated_weights, updated_momentum = triton_fused_weight_update(
-                    state.weights[name],
+                    weights_in,
                     grads,
-                    state.last_momentum[name],
+                    momentum_in,
                     self.lr,
                     self.momentum,
                     self.decay,
                 )
-                new_weights[name] = updated_weights.detach()
-                new_last_momentum[name] = updated_momentum.detach()
+                new_weights[name] = updated_weights.detach().contiguous()
+                new_last_momentum[name] = updated_momentum.detach().contiguous()
         else:
             # Fallback: separate momentum + weight update
             new_weights = {}
             new_last_momentum = {}
 
             for name in state.weights:
-                grads = all_grads[name]
+                grads = all_grads[name].contiguous()
 
                 if _TRITON_AVAILABLE and grads.is_cuda:
                     # Triton kernel for momentum only
                     final_momentum = triton_momentum_update(
                         grads,
                         self.momentum,
-                        state.last_momentum[name],
+                        state.last_momentum[name].contiguous(),
                     )
                 else:
                     # Parallel scan via cumsum trick
@@ -533,17 +543,17 @@ class NeuralMemory(nn.Module):
                     )
                     final_momentum = momentum_values[:, -1]  # [B, *param_shape]
 
-                new_last_momentum[name] = final_momentum.detach()
+                new_last_momentum[name] = final_momentum.detach().contiguous()
 
                 # Weight update: w = decay*w - lr*momentum
                 decay_factor = 1 - self.decay
                 updated_weights = decay_factor * state.weights[name] - self.lr * final_momentum
-                new_weights[name] = updated_weights.detach()
+                new_weights[name] = updated_weights.detach().contiguous()
 
         return MemoryState(
             weights=new_weights,
             last_momentum=new_last_momentum,
-            last_segment_output=x.detach(),  # Store current segment for next retrieval
+            last_segment_output=x.detach().contiguous(),  # Store current segment for next retrieval
             step=state.step + 1,
         )
 
