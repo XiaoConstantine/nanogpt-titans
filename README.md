@@ -9,7 +9,8 @@ Titans introduces a neural long-term memory module that **learns at test time**,
 - **Memory as Context (MAC)** architecture - combines short-term attention with long-term neural memory
 - **Test-time learning** - memory updates based on "surprise" (gradient magnitude)
 - **Efficient** - linear scaling with context length instead of quadratic
-- Clean, hackable implementation in ~600 lines of PyTorch
+- **GPU optimized** - FlexAttention and custom Triton kernels for fused memory operations
+- Clean, hackable implementation in ~1100 lines of PyTorch
 
 ## Installation
 
@@ -51,7 +52,7 @@ uv run python -m nanogpt_titans.train \
     --n_layer=6 \
     --n_head=6 \
     --n_embd=384 \
-    --segment_len=64 \
+    --segment_len=128 \
     --num_longterm_mem=16 \
     --batch_size=8 \
     --max_iters=5000
@@ -105,7 +106,7 @@ Token Embeddings → Segment → [MAC Block × N] → LayerNorm → LM Head
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `segment_len` | 64 | Tokens per segment |
+| `segment_len` | 128 | Tokens per segment |
 | `num_persist_mem` | 4 | Persistent (task) memory tokens |
 | `num_longterm_mem` | 16 | Long-term memory tokens |
 | `memory_lr` | 0.01 | Learning rate for test-time updates |
@@ -124,7 +125,7 @@ config = TitansConfig(
     n_layer=6,
     n_head=6,
     n_embd=384,
-    segment_len=64,
+    segment_len=128,
     num_longterm_mem=16,
 )
 
