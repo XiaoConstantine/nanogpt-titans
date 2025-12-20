@@ -1,311 +1,193 @@
 """
-Profile TitansGPT to identify performance bottlenecks.
+Profile TitansGPT training loop to identify performance bottlenecks.
+
+This profiler closely matches the actual training loop for accurate measurements.
 
 Usage:
-    uv run python -m nanogpt_titans.profile_model              # Simple timer profiling
-    uv run python -m nanogpt_titans.profile_model --detailed   # torch.profiler for CUDA kernels
+    uv run python -m nanogpt_titans.profile_model
+    uv run python -m nanogpt_titans.profile_model --compile
+    uv run python -m nanogpt_titans.profile_model --compile --n_layer 12 --n_embd 768
 """
 
 from __future__ import annotations
 
 import argparse
 import time
-from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any
+from contextlib import nullcontext
 
 import torch
+from torch.profiler import ProfilerActivity, profile
 
-from nanogpt_titans.model import TitansConfig, TitansGPT, parallel_momentum
-
-if TYPE_CHECKING:
-    from nanogpt_titans.model import MemoryState
+from nanogpt_titans.model import TitansConfig, TitansGPT
 
 
-class Timer:
-    """Simple timer for profiling."""
-
-    def __init__(self) -> None:
-        self.times: dict[str, float] = {}
-        self.counts: dict[str, int] = {}
-
-    @contextmanager
-    def track(self, name: str):
-        torch.cuda.synchronize()
-        start = time.perf_counter()
-        yield
-        torch.cuda.synchronize()
-        elapsed = time.perf_counter() - start
-        if name not in self.times:
-            self.times[name] = 0.0
-            self.counts[name] = 0
-        self.times[name] += elapsed
-        self.counts[name] += 1
-
-    def report(self) -> None:
-        total = sum(self.times.values())
-        print(f"\n{'=' * 60}")
-        print(f"{'Component':<30} {'Time (ms)':<12} {'%':<8} {'Calls':<8}")
-        print(f"{'=' * 60}")
-        for name, t in sorted(self.times.items(), key=lambda x: -x[1]):
-            pct = 100 * t / total if total > 0 else 0
-            avg_ms = 1000 * t / self.counts[name]
-            print(f"{name:<30} {avg_ms:<12.2f} {pct:<8.1f} {self.counts[name]:<8}")
-        print(f"{'=' * 60}")
-        print(f"{'TOTAL':<30} {1000 * total:<12.2f}")
-
-
-def profile_forward_pass(
+def profile_training_iteration(
     model: TitansGPT,
     x: torch.Tensor,
-    timer: Timer,
+    targets: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype,
     num_iters: int = 10,
-) -> None:
-    """Profile a single forward pass with detailed breakdown."""
-    device = x.device
-    segment_len = model.config.segment_len
-    b, t = x.shape
-    num_segments = (t + segment_len - 1) // segment_len
+    warmup_iters: int = 3,
+) -> dict[str, float]:
+    """
+    Profile a complete training iteration (forward + backward + optimizer step).
+
+    This matches the actual training loop as closely as possible.
+    """
+    batch_size = x.shape[0]
+    seq_len = x.shape[1]
+
+    # Setup matching train.py
+    device_type = "cuda" if device.type == "cuda" else "cpu"
+    ctx = (
+        nullcontext()
+        if device_type == "cpu"
+        else torch.amp.autocast(device_type=device_type, dtype=dtype)
+    )
+    scaler = torch.amp.GradScaler(enabled=(dtype == torch.float16))
+
+    # Simple optimizer for profiling
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+    model.train()  # Training mode, not eval!
+
+    # Warmup (important for torch.compile and CUDA)
+    print(f"Warming up ({warmup_iters} iterations)...")
+    for _ in range(warmup_iters):
+        memory_states = model.init_memory_states(batch_size, device)
+        with ctx:
+            _logits, loss, memory_states = model(
+                x, targets=targets, memory_states=memory_states
+            )
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+
+    torch.cuda.synchronize()
+
+    # Timed runs
+    print(f"Profiling ({num_iters} iterations)...")
+    timings = {
+        "forward": [],
+        "backward": [],
+        "optimizer": [],
+        "total": [],
+    }
 
     for _ in range(num_iters):
-        states: list[MemoryState | None] = [
-            model.transformer["h"][i].init_state(b, device)  # type: ignore[index]
-            for i in range(len(model.transformer["h"]))  # type: ignore[arg-type]
-        ]
+        optimizer.zero_grad(set_to_none=True)
+        memory_states = model.init_memory_states(batch_size, device)
 
-        for seg_idx in range(num_segments):
-            start = seg_idx * segment_len
-            end = min(start + segment_len, t)
-            seg_tokens = x[:, start:end]
+        # Forward
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
 
-            # Embedding
-            with timer.track("1. token_embedding"):
-                tok_emb = model.transformer["wte"](seg_tokens)
-
-            with timer.track("2. position_embedding"):
-                pos = torch.arange(start, end, dtype=torch.long, device=device)
-                pos_emb = model.transformer["wpe"](pos)
-
-            with timer.track("3. dropout"):
-                h = model.transformer["drop"](tok_emb + pos_emb)
-
-            # Process through blocks
-            for i, block in enumerate(model.transformer["h"]):  # type: ignore[arg-type]
-                has_mem = block.has_memory
-
-                if has_mem:
-                    # Memory retrieval
-                    with timer.track("4. memory_retrieval"):
-                        mem_context = block.memory(h, states[i])
-
-                    with timer.track("5. persistent_mem_expand"):
-                        persist = block.persist_mem.expand(b, -1, -1)
-
-                    with timer.track("6. concat_context"):
-                        prefix_len = block.num_longterm_mem + block.num_persist_mem
-                        context = torch.cat([mem_context, persist, h], dim=1)
-
-                    with timer.track("7. ln_1"):
-                        ln_out = block.ln_1(context)
-
-                    with timer.track("8. attention"):
-                        attn_out = block.attn(ln_out, prefix_len=prefix_len)
-
-                    with timer.track("9. residual_extract"):
-                        h = h + attn_out[:, prefix_len:]
-
-                    with timer.track("10. ln_2"):
-                        ln2_out = block.ln_2(h)
-
-                    with timer.track("11. mlp"):
-                        h = h + block.mlp(ln2_out)
-
-                    with timer.track("12. memory_update"):
-                        states[i] = block.memory.update(h, states[i])
-                else:
-                    with timer.track("7. ln_1"):
-                        ln_out = block.ln_1(h)
-
-                    with timer.track("8. attention"):
-                        attn_out = block.attn(ln_out)
-
-                    with timer.track("9. residual"):
-                        h = h + attn_out
-
-                    with timer.track("10. ln_2"):
-                        ln2_out = block.ln_2(h)
-
-                    with timer.track("11. mlp"):
-                        h = h + block.mlp(ln2_out)
-
-            with timer.track("13. final_ln"):
-                h = model.transformer["ln_f"](h)
-
-            with timer.track("14. lm_head"):
-                _ = model.lm_head(h)
-
-
-def profile_memory_ops(
-    model: TitansGPT,
-    x: torch.Tensor,
-    timer: Timer,
-    num_iters: int = 10,
-) -> None:
-    """Profile memory operations in detail."""
-    device = x.device
-    b, _t = x.shape
-
-    # Find the memory layer
-    mem_block = None
-    for block in model.transformer["h"]:  # type: ignore[union-attr]
-        if block.has_memory:
-            mem_block = block
-            break
-
-    if mem_block is None:
-        print("No memory layer found!")
-        return
-
-    memory = mem_block.memory
-    state = memory.init_state(b, device)
-
-    # Simulate a segment
-    seg_len = model.config.segment_len
-    h = torch.randn(b, seg_len, model.config.n_embd, device=device)
-
-    print(f"\n{'=' * 60}")
-    print("MEMORY OPERATIONS BREAKDOWN")
-    print(f"{'=' * 60}")
-
-    for _ in range(num_iters):
-        # Retrieval breakdown
-        with timer.track("mem.query_proj"):
-            if state.last_segment_output is not None:
-                query_source = state.last_segment_output
-            else:
-                query_source = memory.init_query.expand(b, -1, -1)
-            queries = memory.query_proj(query_source)
-
-        with timer.track("mem.mlp_forward_loop"):
-            retrieved_list = []
-            for i in range(b):
-                q_i = queries[i : i + 1]
-                mem_out = memory._forward_with_weights(q_i, state.weights, i)
-                retrieved_list.append(mem_out)
-
-        with timer.track("mem.cat_retrieved"):
-            retrieved = torch.cat(retrieved_list, dim=0)
-
-        with timer.track("mem.adaptive_pool"):
-            retrieved = retrieved.transpose(1, 2)
-            retrieved = torch.nn.functional.adaptive_avg_pool1d(retrieved, memory.num_longterm_mem)
-            retrieved = retrieved.transpose(1, 2)
-
-        with timer.track("mem.out_proj"):
-            _ = memory.out_proj(retrieved)
-
-        # Update breakdown
-        with timer.track("mem.key_value_proj"):
-            keys = memory.key_proj(h.detach())
-            values = memory.value_proj(h.detach())
-
-        with timer.track("mem.vmap_grad"):
-
-            def single_token_loss(
-                params: dict[str, torch.Tensor], k: torch.Tensor, v: torch.Tensor
-            ) -> torch.Tensor:
-                k = k.unsqueeze(0).unsqueeze(0)
-                v = v.unsqueeze(0).unsqueeze(0)
-                pred = torch.func.functional_call(memory.memory_mlp, params, (k,))
-                return torch.nn.functional.mse_loss(pred, v)
-
-            grad_fn = torch.func.grad(single_token_loss)
-            params_in_dims: dict[str, Any] = dict.fromkeys(state.weights, 0)
-            batched_grad_fn = torch.func.vmap(
-                torch.func.vmap(grad_fn, in_dims=(None, 0, 0)),
-                in_dims=(params_in_dims, 0, 0),
+        with ctx:
+            _logits, loss, memory_states = model(
+                x, targets=targets, memory_states=memory_states
             )
 
-            with torch.enable_grad():
-                params_for_grad = {
-                    name: w.clone().requires_grad_(True) for name, w in state.weights.items()
-                }
-                all_grads = batched_grad_fn(params_for_grad, keys, values)
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        timings["forward"].append(t1 - t0)
 
-        with timer.track("mem.momentum_update"):
-            for name in state.weights:
-                surprises = -all_grads[name]
-                _ = parallel_momentum(
-                    surprises,
-                    memory.momentum,
-                    prev_momentum=state.last_momentum[name],
-                )
+        # Backward
+        scaler.scale(loss).backward()
 
-        # Store for next iteration
-        state = memory.update(h, state)
+        torch.cuda.synchronize()
+        t2 = time.perf_counter()
+        timings["backward"].append(t2 - t1)
+
+        # Optimizer step
+        scaler.step(optimizer)
+        scaler.update()
+
+        torch.cuda.synchronize()
+        t3 = time.perf_counter()
+        timings["optimizer"].append(t3 - t2)
+        timings["total"].append(t3 - t0)
+
+    # Compute averages
+    results = {}
+    for name, times in timings.items():
+        results[f"{name}_ms"] = 1000 * sum(times) / len(times)
+
+    results["tokens_per_sec"] = batch_size * seq_len / (results["total_ms"] / 1000)
+
+    return results
 
 
 def profile_with_torch_profiler(
     model: TitansGPT,
     x: torch.Tensor,
     targets: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype,
     num_iters: int = 3,
     export_trace: bool = False,
 ) -> None:
     """
     Profile using torch.profiler for detailed CUDA kernel analysis.
-
-    This shows actual CUDA kernel times, memory operations, and whether
-    Triton kernels are being used.
+    Profiles the complete training iteration (forward + backward).
     """
-    from torch.profiler import ProfilerActivity, profile
-
-    device = x.device
     batch_size = x.shape[0]
 
-    print("\n" + "=" * 60)
-    print("TORCH PROFILER - CUDA KERNEL ANALYSIS")
-    print("=" * 60)
+    device_type = "cuda" if device.type == "cuda" else "cpu"
+    ctx = (
+        nullcontext()
+        if device_type == "cpu"
+        else torch.amp.autocast(device_type=device_type, dtype=dtype)
+    )
+    scaler = torch.amp.GradScaler(enabled=(dtype == torch.float16))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+    model.train()
+
+    print("\n" + "=" * 70)
+    print("TORCH PROFILER - TRAINING ITERATION ANALYSIS")
+    print("=" * 70)
 
     # Warmup
     print("Warming up...")
     for _ in range(3):
-        with torch.no_grad():
-            states = model.init_memory_states(batch_size, torch.device(device))
-            model(x, targets=targets, memory_states=states)
+        memory_states = model.init_memory_states(batch_size, device)
+        with ctx:
+            _logits, loss, _ = model(x, targets=targets, memory_states=memory_states)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
 
-    # Profile
-    print(f"Profiling {num_iters} iterations...")
-    with (
-        profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            record_shapes=True,
-            with_stack=False,
-        ) as prof,
-        torch.no_grad(),
-    ):
+    torch.cuda.synchronize()
+
+    # Profile complete training iteration
+    print(f"Profiling {num_iters} training iterations (forward + backward + optim)...")
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=True,
+        with_stack=False,
+    ) as prof:
         for _ in range(num_iters):
-            states = model.init_memory_states(batch_size, torch.device(device))
-            model(x, targets=targets, memory_states=states)
+            optimizer.zero_grad(set_to_none=True)
+            memory_states = model.init_memory_states(batch_size, device)
+
+            with ctx:
+                _logits, loss, _ = model(x, targets=targets, memory_states=memory_states)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
     # Print results sorted by CUDA time
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     print("TOP CUDA OPERATIONS (by total CUDA time)")
-    print("=" * 60)
+    print("=" * 70)
     print(
         prof.key_averages().table(
             sort_by="cuda_time_total",
             row_limit=30,
-        )
-    )
-
-    # Print results sorted by CPU time
-    print("\n" + "=" * 60)
-    print("TOP CPU OPERATIONS (by total CPU time)")
-    print("=" * 60)
-    print(
-        prof.key_averages().table(
-            sort_by="cpu_time_total",
-            row_limit=20,
         )
     )
 
@@ -316,273 +198,156 @@ def profile_with_torch_profiler(
         print(f"\nChrome trace exported to: {trace_path}")
         print("Open chrome://tracing and load the file to visualize.")
 
-    # Summary stats
-    print("\n" + "=" * 60)
-    print("KERNEL SUMMARY")
-    print("=" * 60)
+    # Summarize by category
+    print("\n" + "=" * 70)
+    print("KERNEL CATEGORY SUMMARY")
+    print("=" * 70)
 
-    # Helper to get CUDA time (attribute name varies by PyTorch version)
-    def get_cuda_time(event) -> float:
-        for attr in ["cuda_time_total", "self_cuda_time_total", "device_time_total"]:
-            if hasattr(event, attr):
-                val = getattr(event, attr)
-                if val is not None:
-                    return val
-        return 0.0
+    categories = {
+        "attention": 0.0,
+        "matmul/gemm": 0.0,
+        "memory_ops": 0.0,
+        "elementwise": 0.0,
+        "triton_custom": 0.0,
+        "other": 0.0,
+    }
 
-    def simplify_kernel_name(name: str) -> str:
-        """Extract readable kernel name from verbose CUDA/Triton names."""
-        # Custom Triton kernels
-        if "_fused_weight_update_kernel" in name:
-            return "triton: fused_weight_update"
-        if "_momentum_update_kernel" in name:
-            return "triton: momentum_update"
-        if "triton_tem_fused" in name:
-            return "triton: flex_attention"
-        if "triton" in name.lower():
-            return f"triton: {name[:40]}"
-
-        # CUDA GEMM kernels
-        if "sgemm" in name.lower():
-            # Extract shape info like "128x64"
-            for part in name.split("_"):
-                if "x" in part and part.replace("x", "").isdigit():
-                    return f"cuda: sgemm_{part}"
-            return "cuda: sgemm"
-        if "gemmk1_kernel" in name:
-            return "cuda: gemmk1 (large matmul)"
-
-        # Common PyTorch kernels
-        if "SoftMax" in name:
-            return "cuda: softmax"
-        if "layer_norm" in name:
-            return "cuda: layer_norm"
-        if "CatArray" in name:
-            return "cuda: cat"
-        if "elementwise" in name:
-            if "add" in name.lower():
-                return "cuda: elementwise_add"
-            if "mul" in name.lower():
-                return "cuda: elementwise_mul"
-            if "copy" in name.lower():
-                return "cuda: elementwise_copy"
-            return "cuda: elementwise"
-        if "gather" in name:
-            return "cuda: gather"
-        if "Memcpy" in name:
-            return "cuda: memcpy_d2d"
-
-        # Truncate long names
-        if len(name) > 50:
-            return name[:47] + "..."
-        return name
-
-    # Collect kernel stats
-    kernel_stats: dict[str, float] = {}
     for e in prof.key_averages():
-        cuda_time = get_cuda_time(e)
-        if cuda_time > 0:
-            simple_name = simplify_kernel_name(e.key)
-            kernel_stats[simple_name] = kernel_stats.get(simple_name, 0) + cuda_time
+        cuda_time = getattr(e, "cuda_time_total", 0) or 0
+        if cuda_time <= 0:
+            continue
 
-    # Sort by time and print
-    sorted_kernels = sorted(kernel_stats.items(), key=lambda x: -x[1])
-    total_cuda = sum(kernel_stats.values())
+        key = e.key.lower()
+        if "attention" in key or "softmax" in key or "flash" in key:
+            categories["attention"] += cuda_time
+        elif "gemm" in key or "matmul" in key or "mm" in key or "addmm" in key:
+            categories["matmul/gemm"] += cuda_time
+        elif "_fused_weight_update" in key or "_momentum_update" in key or "_cross_entropy" in key:
+            categories["triton_custom"] += cuda_time
+        elif "copy" in key or "cat" in key or "memcpy" in key or "memset" in key:
+            categories["memory_ops"] += cuda_time
+        elif "elementwise" in key or "add" in key or "mul" in key:
+            categories["elementwise"] += cuda_time
+        else:
+            categories["other"] += cuda_time
 
-    print(f"\n{'Kernel':<40} {'Time (ms)':<12} {'%':<8}")
-    print("-" * 60)
-    for name, time_us in sorted_kernels[:15]:
+    total = sum(categories.values())
+    print(f"\n{'Category':<20} {'Time (ms)':<12} {'%':<8}")
+    print("-" * 40)
+    for cat, time_us in sorted(categories.items(), key=lambda x: -x[1]):
         time_ms = time_us / 1000
-        pct = 100 * time_us / total_cuda if total_cuda > 0 else 0
-        print(f"{name:<40} {time_ms:<12.2f} {pct:<8.1f}")
-    print("-" * 60)
-    print(f"{'Total CUDA time':<40} {total_cuda / 1000:<12.2f}")
-
-    # Highlight custom kernels
-    custom_kernels = [k for k in sorted_kernels if k[0].startswith("triton:")]
-    if custom_kernels:
-        print("\n✓ Custom Triton kernels active:")
-        for name, time_us in custom_kernels:
-            print(f"  {name}: {time_us / 1000:.2f}ms")
-
-
-def profile_memory_update_detailed(
-    model: TitansGPT,
-    x: torch.Tensor,
-    num_iters: int = 3,
-) -> None:
-    """Profile just the memory update operation with torch.profiler."""
-    from torch.profiler import ProfilerActivity, profile
-
-    device = x.device
-    b, _t = x.shape
-
-    # Find memory block
-    mem_block = None
-    for block in model.transformer["h"]:  # type: ignore[union-attr]
-        if block.has_memory:
-            mem_block = block
-            break
-
-    if mem_block is None:
-        print("No memory layer found!")
-        return
-
-    memory = mem_block.memory
-    seg_len = model.config.segment_len
-    h = torch.randn(b, seg_len, model.config.n_embd, device=device)
-
-    print("\n" + "=" * 60)
-    print("MEMORY UPDATE DETAILED PROFILE")
-    print("=" * 60)
-
-    # Warmup
-    state = memory.init_state(b, device)
-    for _ in range(3):
-        with torch.no_grad():
-            state = memory.update(h, state)
-
-    # Profile
-    state = memory.init_state(b, device)
-    with (
-        profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            record_shapes=True,
-        ) as prof,
-        torch.no_grad(),
-    ):
-        for _ in range(num_iters):
-            state = memory.update(h, state)
-
-    print(
-        prof.key_averages().table(
-            sort_by="cuda_time_total",
-            row_limit=25,
-        )
-    )
-
-
-def run_simple_profiler(model: TitansGPT, x: torch.Tensor, targets: torch.Tensor) -> None:
-    """Run the simple timer-based profiler."""
-    device = x.device
-    batch_size = x.shape[0]
-    seq_len = x.shape[1]
-
-    # Profile forward pass
-    print("\nProfiling forward pass...")
-    timer = Timer()
-    with torch.no_grad():
-        profile_forward_pass(model, x, timer, num_iters=10)
-
-    print("\nFORWARD PASS BREAKDOWN")
-    timer.report()
-
-    # Profile memory operations
-    print("\nProfiling memory operations...")
-    mem_timer = Timer()
-    with torch.no_grad():
-        profile_memory_ops(model, x, mem_timer, num_iters=10)
-
-    print("\nMEMORY OPERATIONS BREAKDOWN")
-    mem_timer.report()
-
-    # Overall timing
-    print("\n" + "=" * 60)
-    print("OVERALL FORWARD PASS TIMING")
-    print("=" * 60)
-
-    def run_forward() -> torch.Tensor | None:
-        states = model.init_memory_states(batch_size, torch.device(device))
-        _logits, loss, _ = model(x, targets=targets, memory_states=states)
-        return loss
-
-    # Warmup
-    for _ in range(3):
-        with torch.no_grad():
-            run_forward()
-
-    # Time
-    torch.cuda.synchronize()
-    start = time.perf_counter()
-    num_runs = 10
-    with torch.no_grad():
-        for _ in range(num_runs):
-            run_forward()
-    torch.cuda.synchronize()
-    elapsed = time.perf_counter() - start
-
-    print(f"Average forward pass: {1000 * elapsed / num_runs:.2f} ms")
-    print(f"Throughput: {batch_size * seq_len * num_runs / elapsed:.0f} tokens/sec")
+        pct = 100 * time_us / total if total > 0 else 0
+        print(f"{cat:<20} {time_ms:<12.2f} {pct:<8.1f}")
+    print("-" * 40)
+    print(f"{'Total':<20} {total / 1000:<12.2f}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Profile TitansGPT")
-    parser.add_argument(
-        "--detailed",
-        action="store_true",
-        help="Use torch.profiler for detailed CUDA kernel analysis",
+    parser = argparse.ArgumentParser(
+        description="Profile TitansGPT training iteration",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--memory-only",
-        action="store_true",
-        help="Profile only memory update operation (with --detailed)",
-    )
-    parser.add_argument(
-        "--export-trace",
-        action="store_true",
-        help="Export Chrome trace file (with --detailed)",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=10,
-        help="Batch size for profiling (default: 10)",
-    )
-    parser.add_argument(
-        "--seq-len",
-        type=int,
-        default=512,
-        help="Sequence length for profiling (default: 512)",
-    )
+
+    # Profiling options
+    parser.add_argument("--detailed", action="store_true", help="Use torch.profiler for kernel analysis")
+    parser.add_argument("--export-trace", action="store_true", help="Export Chrome trace file")
+    parser.add_argument("--num-iters", type=int, default=10, help="Number of iterations to profile")
+
+    # Model config (match your training setup)
+    parser.add_argument("--n_layer", type=int, default=6, help="Number of layers")
+    parser.add_argument("--n_head", type=int, default=6, help="Number of attention heads")
+    parser.add_argument("--n_embd", type=int, default=384, help="Embedding dimension")
+    parser.add_argument("--block_size", type=int, default=1024, help="Context length")
+    parser.add_argument("--segment_len", type=int, default=128, help="Segment length for memory")
+    parser.add_argument("--num_persist_mem", type=int, default=4, help="Persistent memory tokens")
+    parser.add_argument("--num_longterm_mem", type=int, default=16, help="Long-term memory tokens")
+
+    # Training config
+    parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
+    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16", "float16"])
+    parser.add_argument("--compile", action="store_true", help="Use torch.compile()")
+
     args = parser.parse_args()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype_map = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
+    dtype = dtype_map[args.dtype]
 
-    # Config matching training
+    print("=" * 70)
+    print("TITANS TRAINING PROFILER")
+    print("=" * 70)
+    print(f"Device: {device}")
+    print(f"Dtype: {args.dtype}")
+    print(f"Compile: {args.compile}")
+    print()
+
+    # Model config
     config = TitansConfig(
-        block_size=512,
+        block_size=args.block_size,
         vocab_size=50304,
-        n_layer=6,
-        n_head=6,
-        n_embd=384,
-        segment_len=128,
-        num_persist_mem=4,
-        num_longterm_mem=16,
+        n_layer=args.n_layer,
+        n_head=args.n_head,
+        n_embd=args.n_embd,
+        segment_len=args.segment_len,
+        num_persist_mem=args.num_persist_mem,
+        num_longterm_mem=args.num_longterm_mem,
     )
 
-    model = TitansGPT(config).to(device)
-    model.eval()
+    print("Model config:")
+    print(f"  n_layer: {config.n_layer}")
+    print(f"  n_head: {config.n_head}")
+    print(f"  n_embd: {config.n_embd}")
+    print(f"  block_size: {config.block_size}")
+    print(f"  segment_len: {config.segment_len}")
+    print()
 
-    # Test input
-    x = torch.randint(0, config.vocab_size, (args.batch_size, args.seq_len), device=device)
+    model = TitansGPT(config).to(device)
+    num_params = model.get_num_params()
+    print(f"Parameters: {num_params / 1e6:.2f}M")
+
+    if args.compile:
+        print("Compiling model (first run will be slow)...")
+        model = torch.compile(model)
+
+    # Test input matching training
+    x = torch.randint(0, config.vocab_size, (args.batch_size, args.block_size), device=device)
     targets = x.clone()
 
-    # Warmup
-    print("Warming up...")
-    with torch.no_grad():
-        for _ in range(3):
-            model(x, targets=targets)
+    print(f"Input shape: {x.shape}")
+    print(f"Tokens per iteration: {args.batch_size * args.block_size:,}")
+    print()
 
     if args.detailed:
-        if args.memory_only:
-            profile_memory_update_detailed(model, x, num_iters=5)
-        else:
-            profile_with_torch_profiler(
-                model, x, targets, num_iters=3, export_trace=args.export_trace
-            )
+        profile_with_torch_profiler(
+            model, x, targets, device, dtype,
+            num_iters=args.num_iters,
+            export_trace=args.export_trace,
+        )
     else:
-        run_simple_profiler(model, x, targets)
+        results = profile_training_iteration(
+            model, x, targets, device, dtype,
+            num_iters=args.num_iters,
+        )
+
+        print("\n" + "=" * 70)
+        print("TRAINING ITERATION TIMING")
+        print("=" * 70)
+        print(f"{'Phase':<20} {'Time (ms)':<12}")
+        print("-" * 32)
+        print(f"{'Forward':<20} {results['forward_ms']:<12.2f}")
+        print(f"{'Backward':<20} {results['backward_ms']:<12.2f}")
+        print(f"{'Optimizer':<20} {results['optimizer_ms']:<12.2f}")
+        print("-" * 32)
+        print(f"{'Total':<20} {results['total_ms']:<12.2f}")
+        print()
+        print(f"Throughput: {results['tokens_per_sec']:,.0f} tokens/sec")
+        print()
+
+        # Memory info
+        if device.type == "cuda":
+            mem_allocated = torch.cuda.max_memory_allocated() / 1e9
+            mem_reserved = torch.cuda.max_memory_reserved() / 1e9
+            print(f"Peak GPU memory: {mem_allocated:.2f} GB allocated, {mem_reserved:.2f} GB reserved")
 
 
 if __name__ == "__main__":
