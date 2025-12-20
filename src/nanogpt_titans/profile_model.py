@@ -330,23 +330,80 @@ def profile_with_torch_profiler(
                     return val
         return 0.0
 
-    # Look for Triton kernels
-    triton_kernels = [
-        e for e in prof.key_averages() if "triton" in e.key.lower() or "kernel" in e.key.lower()
-    ]
-    if triton_kernels:
-        print("\nTriton/Custom kernels found:")
-        for k in triton_kernels[:10]:
-            print(f"  {k.key}: {get_cuda_time(k) / 1000:.2f}ms")
-    else:
-        print("\nNo Triton kernels detected in trace.")
+    def simplify_kernel_name(name: str) -> str:
+        """Extract readable kernel name from verbose CUDA/Triton names."""
+        # Custom Triton kernels
+        if "_fused_weight_update_kernel" in name:
+            return "triton: fused_weight_update"
+        if "_momentum_update_kernel" in name:
+            return "triton: momentum_update"
+        if "triton_tem_fused" in name:
+            return "triton: flex_attention"
+        if "triton" in name.lower():
+            return f"triton: {name[:40]}"
 
-    # Look for vmap operations
-    vmap_ops = [e for e in prof.key_averages() if "vmap" in e.key.lower()]
-    if vmap_ops:
-        print("\nvmap operations found:")
-        for k in vmap_ops[:5]:
-            print(f"  {k.key}: {get_cuda_time(k) / 1000:.2f}ms")
+        # CUDA GEMM kernels
+        if "sgemm" in name.lower():
+            # Extract shape info like "128x64"
+            for part in name.split("_"):
+                if "x" in part and part.replace("x", "").isdigit():
+                    return f"cuda: sgemm_{part}"
+            return "cuda: sgemm"
+        if "gemmk1_kernel" in name:
+            return "cuda: gemmk1 (large matmul)"
+
+        # Common PyTorch kernels
+        if "SoftMax" in name:
+            return "cuda: softmax"
+        if "layer_norm" in name:
+            return "cuda: layer_norm"
+        if "CatArray" in name:
+            return "cuda: cat"
+        if "elementwise" in name:
+            if "add" in name.lower():
+                return "cuda: elementwise_add"
+            if "mul" in name.lower():
+                return "cuda: elementwise_mul"
+            if "copy" in name.lower():
+                return "cuda: elementwise_copy"
+            return "cuda: elementwise"
+        if "gather" in name:
+            return "cuda: gather"
+        if "Memcpy" in name:
+            return "cuda: memcpy_d2d"
+
+        # Truncate long names
+        if len(name) > 50:
+            return name[:47] + "..."
+        return name
+
+    # Collect kernel stats
+    kernel_stats: dict[str, float] = {}
+    for e in prof.key_averages():
+        cuda_time = get_cuda_time(e)
+        if cuda_time > 0:
+            simple_name = simplify_kernel_name(e.key)
+            kernel_stats[simple_name] = kernel_stats.get(simple_name, 0) + cuda_time
+
+    # Sort by time and print
+    sorted_kernels = sorted(kernel_stats.items(), key=lambda x: -x[1])
+    total_cuda = sum(kernel_stats.values())
+
+    print(f"\n{'Kernel':<40} {'Time (ms)':<12} {'%':<8}")
+    print("-" * 60)
+    for name, time_us in sorted_kernels[:15]:
+        time_ms = time_us / 1000
+        pct = 100 * time_us / total_cuda if total_cuda > 0 else 0
+        print(f"{name:<40} {time_ms:<12.2f} {pct:<8.1f}")
+    print("-" * 60)
+    print(f"{'Total CUDA time':<40} {total_cuda / 1000:<12.2f}")
+
+    # Highlight custom kernels
+    custom_kernels = [k for k in sorted_kernels if k[0].startswith("triton:")]
+    if custom_kernels:
+        print("\n✓ Custom Triton kernels active:")
+        for name, time_us in custom_kernels:
+            print(f"  {name}: {time_us / 1000:.2f}ms")
 
 
 def profile_memory_update_detailed(
