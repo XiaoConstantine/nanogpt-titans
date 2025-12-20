@@ -40,10 +40,10 @@ except ImportError:
 # Triton kernels for fused memory operations
 _TRITON_AVAILABLE = False
 triton_momentum_update = None  # type: ignore[assignment]
-triton_batched_weight_update = None  # type: ignore[assignment]
+triton_fused_weight_update = None  # type: ignore[assignment]
 try:
     from nanogpt_titans.triton_kernels import (
-        triton_batched_weight_update,
+        triton_fused_weight_update,
         triton_momentum_update,
     )
 
@@ -482,28 +482,31 @@ class NeuralMemory(nn.Module):
             all_grads = self._batched_grad_fn(params_for_grad, keys, values)
 
         # Apply updates with parallel momentum
-        # Check if we can use the batched Triton kernel (single kernel for ALL params)
+        # Check if we can use the fused Triton kernel
         first_grad = next(iter(all_grads.values()))
-        use_batched = (
+        use_fused = (
             _TRITON_AVAILABLE
             and first_grad.is_cuda
-            and triton_batched_weight_update is not None
+            and triton_fused_weight_update is not None
         )
 
-        if use_batched:
-            # BATCHED Triton kernel: processes ALL parameters in ONE kernel launch
-            # Instead of N kernel launches (one per param), we launch 1 kernel
-            new_weights, new_last_momentum = triton_batched_weight_update(
-                state.weights,
-                all_grads,
-                state.last_momentum,
-                self.lr,
-                self.momentum,
-                self.decay,
-            )
-            # Detach all tensors
-            new_weights = {k: v.detach() for k, v in new_weights.items()}
-            new_last_momentum = {k: v.detach() for k, v in new_last_momentum.items()}
+        if use_fused:
+            # Fused Triton kernel: momentum + weight update per parameter
+            new_weights: dict[str, torch.Tensor] = {}
+            new_last_momentum: dict[str, torch.Tensor] = {}
+
+            for name in state.weights:
+                grads = all_grads[name]
+                updated_weights, updated_momentum = triton_fused_weight_update(
+                    state.weights[name],
+                    grads,
+                    state.last_momentum[name],
+                    self.lr,
+                    self.momentum,
+                    self.decay,
+                )
+                new_weights[name] = updated_weights.detach()
+                new_last_momentum[name] = updated_momentum.detach()
         else:
             # Fallback: separate momentum + weight update
             new_weights = {}
