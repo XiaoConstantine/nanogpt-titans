@@ -340,7 +340,7 @@ def train(config: TrainConfig) -> None:
             break
 
         # Forward + backward with gradient accumulation
-        # Initialize memory states for this batch (fresh for each optimizer step)
+        # Initialize memory states once per optimizer step (reuse across micro-steps)
         memory_states = model.init_memory_states(config.batch_size, device)  # type: ignore[union-attr]
 
         for _micro_step in range(config.gradient_accumulation_steps):
@@ -356,7 +356,10 @@ def train(config: TrainConfig) -> None:
                 )
                 loss = loss / config.gradient_accumulation_steps
 
-            # Get next batch
+            # Backward before fetching next batch to overlap GPU compute with CPU data loading
+            scaler.scale(loss).backward()
+
+            # Get next batch (overlaps with async GPU ops from backward)
             if config.use_packing:
                 packed_batch = packed_train_loader.get_batch()
                 x, y = packed_batch.input_ids, packed_batch.targets
@@ -366,11 +369,8 @@ def train(config: TrainConfig) -> None:
                 x, y = get_batch("train", config, data_dir, device, device_type)
                 position_ids, packed_mask = None, None
 
-            # Reset memory for new batch
-            memory_states = model.init_memory_states(config.batch_size, device)  # type: ignore[union-attr]
-
-            # Backward
-            scaler.scale(loss).backward()
+            # Reset memory in-place for new batch (avoids reallocation)
+            model.reset_memory_states(memory_states)  # type: ignore[union-attr]
 
         # Gradient clipping
         if config.grad_clip != 0.0:
