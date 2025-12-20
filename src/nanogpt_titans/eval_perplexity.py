@@ -25,6 +25,7 @@ import torch
 from tqdm import tqdm
 
 from nanogpt_titans.model import TitansConfig, TitansGPT
+from nanogpt_titans.train import TrainConfig  # noqa: F401 - needed for checkpoint unpickling
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
