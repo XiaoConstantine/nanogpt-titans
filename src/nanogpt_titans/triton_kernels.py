@@ -249,3 +249,115 @@ def triton_fused_weight_update(
     # Reshape back to original shape
     return weights_out.view(B, *orig_shape), momentum_out.view(B, *orig_shape)
 
+
+def triton_batched_weight_update(
+    weights_dict: dict[str, torch.Tensor],
+    grads_dict: dict[str, torch.Tensor],
+    momentum_dict: dict[str, torch.Tensor],
+    lr: float,
+    momentum: float,
+    decay: float,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """
+    Batched weight update - processes ALL parameters in a single kernel launch.
+
+    Instead of launching N kernels (one per parameter), this:
+    1. Flattens and concatenates all params into single tensors
+    2. Launches ONE kernel
+    3. Splits results back to per-parameter tensors
+
+    Args:
+        weights_dict: {name: [B, *shape]} current weights
+        grads_dict: {name: [B, T, *shape]} gradients
+        momentum_dict: {name: [B, *shape]} previous momentum
+        lr: learning rate
+        momentum: momentum coefficient
+        decay: weight decay
+
+    Returns:
+        (new_weights_dict, new_momentum_dict)
+    """
+    # Get batch size and time steps from first grad
+    first_name = next(iter(grads_dict))
+    B, T = grads_dict[first_name].shape[:2]
+    device = grads_dict[first_name].device
+    dtype = grads_dict[first_name].dtype
+
+    # Track shapes for splitting later
+    param_names = list(weights_dict.keys())
+    param_sizes = []
+    param_shapes = []
+
+    # Flatten and concatenate all parameters
+    weights_list = []
+    grads_list = []
+    momentum_list = []
+
+    for name in param_names:
+        w = weights_dict[name]
+        g = grads_dict[name]
+        m = momentum_dict[name]
+
+        # Get flattened size (excluding batch dim for weights/momentum, batch+time for grads)
+        flat_size = w[0].numel()
+        param_sizes.append(flat_size)
+        param_shapes.append(w.shape[1:])  # Shape without batch dim
+
+        # Flatten to [B, D] and [B, T, D]
+        weights_list.append(w.view(B, flat_size))
+        grads_list.append(g.view(B, T, flat_size))
+        momentum_list.append(m.view(B, flat_size))
+
+    # Concatenate along D dimension: [B, total_D] and [B, T, total_D]
+    all_weights = torch.cat(weights_list, dim=1)
+    all_grads = torch.cat(grads_list, dim=2)
+    all_momentum = torch.cat(momentum_list, dim=1)
+
+    total_D = all_weights.shape[1]
+
+    # Allocate output tensors
+    weights_out = torch.empty(B, total_D, device=device, dtype=dtype)
+    momentum_out = torch.empty(B, total_D, device=device, dtype=dtype)
+
+    # Launch ONE kernel for all parameters
+    BLOCK_D = min(1024, triton.next_power_of_2(total_D))
+    grid = (B, triton.cdiv(total_D, BLOCK_D))
+
+    _fused_weight_update_kernel[grid](
+        all_weights,
+        weights_out,
+        all_grads,
+        all_momentum,
+        momentum_out,
+        lr,
+        momentum,
+        1.0 - momentum,
+        1.0 - decay,
+        T,
+        total_D,
+        all_weights.stride(0),
+        all_weights.stride(1),
+        all_grads.stride(0),
+        all_grads.stride(1),
+        all_grads.stride(2),
+        all_momentum.stride(0),
+        all_momentum.stride(1),
+        BLOCK_D=BLOCK_D,
+    )
+
+    # Split results back to per-parameter tensors
+    new_weights = {}
+    new_momentum = {}
+    offset = 0
+
+    for i, name in enumerate(param_names):
+        size = param_sizes[i]
+        shape = param_shapes[i]
+
+        # Extract slice and reshape
+        new_weights[name] = weights_out[:, offset : offset + size].view(B, *shape)
+        new_momentum[name] = momentum_out[:, offset : offset + size].view(B, *shape)
+        offset += size
+
+    return new_weights, new_momentum
+

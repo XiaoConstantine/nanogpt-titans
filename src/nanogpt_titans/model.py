@@ -40,10 +40,10 @@ except ImportError:
 # Triton kernels for fused memory operations
 _TRITON_AVAILABLE = False
 triton_momentum_update = None  # type: ignore[assignment]
-triton_fused_weight_update = None  # type: ignore[assignment]
+triton_batched_weight_update = None  # type: ignore[assignment]
 try:
     from nanogpt_titans.triton_kernels import (
-        triton_fused_weight_update,
+        triton_batched_weight_update,
         triton_momentum_update,
     )
 
@@ -482,32 +482,28 @@ class NeuralMemory(nn.Module):
             all_grads = self._batched_grad_fn(params_for_grad, keys, values)
 
         # Apply updates with parallel momentum
-        # Check if we can use the fully fused Triton kernel
+        # Check if we can use the batched Triton kernel (single kernel for ALL params)
         first_grad = next(iter(all_grads.values()))
-        use_fused = _TRITON_AVAILABLE and first_grad.is_cuda and triton_fused_weight_update is not None
+        use_batched = (
+            _TRITON_AVAILABLE
+            and first_grad.is_cuda
+            and triton_batched_weight_update is not None
+        )
 
-        if use_fused:
-            # Fused Triton kernel: momentum + weight update in one pass
-            # Returns new tensors directly (no cloning needed)
-            new_weights: dict[str, torch.Tensor] = {}
-            new_last_momentum: dict[str, torch.Tensor] = {}
-
-            for name in state.weights:
-                grads = all_grads[name]
-
-                # Fused kernel: computes momentum over T steps + weight update in one kernel
-                # Returns (new_weights, new_momentum) - no clone overhead
-                updated_weights, updated_momentum = triton_fused_weight_update(
-                    state.weights[name],
-                    grads,
-                    state.last_momentum[name],
-                    self.lr,
-                    self.momentum,
-                    self.decay,
-                )
-
-                new_weights[name] = updated_weights.detach()
-                new_last_momentum[name] = updated_momentum.detach()
+        if use_batched:
+            # BATCHED Triton kernel: processes ALL parameters in ONE kernel launch
+            # Instead of N kernel launches (one per param), we launch 1 kernel
+            new_weights, new_last_momentum = triton_batched_weight_update(
+                state.weights,
+                all_grads,
+                state.last_momentum,
+                self.lr,
+                self.momentum,
+                self.decay,
+            )
+            # Detach all tensors
+            new_weights = {k: v.detach() for k, v in new_weights.items()}
+            new_last_momentum = {k: v.detach() for k, v in new_last_momentum.items()}
         else:
             # Fallback: separate momentum + weight update
             new_weights = {}

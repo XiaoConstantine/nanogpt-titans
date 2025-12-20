@@ -22,12 +22,14 @@ CUDA_AVAILABLE = torch.cuda.is_available()
 TRITON_AVAILABLE = False
 triton_momentum_update = None
 triton_fused_weight_update = None
+triton_batched_weight_update = None
 
 if CUDA_AVAILABLE:
     try:
         from nanogpt_titans.triton_kernels import (
-            triton_momentum_update,
+            triton_batched_weight_update,
             triton_fused_weight_update,
+            triton_momentum_update,
         )
         TRITON_AVAILABLE = True
     except ImportError:
@@ -191,6 +193,112 @@ class TestFusedWeightUpdateKernel:
 
         expected = (1 - decay) * weights_in
         torch.testing.assert_close(weights_out, expected, rtol=1e-5, atol=1e-5)
+
+
+# --- Batched Weight Update Kernel Tests ---
+
+@pytest.mark.skipif(not TRITON_AVAILABLE, reason="Triton not available")
+class TestBatchedWeightUpdateKernel:
+    """Tests for the batched weight update kernel (single kernel for all params)."""
+
+    def test_matches_per_param_kernel(self):
+        """Batched kernel should match per-parameter fused kernel."""
+        torch.manual_seed(42)
+
+        B, T = 4, 64
+        momentum_coef = 0.9
+        lr = 0.01
+        decay = 0.001
+
+        # Simulate multiple parameters with different shapes
+        param_shapes = {
+            "layer1.weight": (128, 64),
+            "layer1.bias": (128,),
+            "layer2.weight": (64, 128),
+            "layer2.bias": (64,),
+        }
+
+        weights_dict = {}
+        grads_dict = {}
+        momentum_dict = {}
+
+        for name, shape in param_shapes.items():
+            weights_dict[name] = torch.randn(B, *shape, device="cuda", dtype=torch.float32)
+            grads_dict[name] = torch.randn(B, T, *shape, device="cuda", dtype=torch.float32)
+            momentum_dict[name] = torch.randn(B, *shape, device="cuda", dtype=torch.float32)
+
+        # Reference: per-parameter fused kernel
+        ref_weights = {}
+        ref_momentum = {}
+        for name in param_shapes:
+            w, m = triton_fused_weight_update(
+                weights_dict[name],
+                grads_dict[name],
+                momentum_dict[name],
+                lr,
+                momentum_coef,
+                decay,
+            )
+            ref_weights[name] = w
+            ref_momentum[name] = m
+
+        # Batched kernel: single kernel for all params
+        batched_weights, batched_momentum = triton_batched_weight_update(
+            weights_dict, grads_dict, momentum_dict, lr, momentum_coef, decay
+        )
+
+        # Verify all parameters match
+        for name in param_shapes:
+            torch.testing.assert_close(
+                ref_weights[name], batched_weights[name], rtol=1e-4, atol=1e-4
+            )
+            torch.testing.assert_close(
+                ref_momentum[name], batched_momentum[name], rtol=1e-4, atol=1e-4
+            )
+
+    def test_single_param(self):
+        """Batched kernel should work with a single parameter."""
+        torch.manual_seed(42)
+
+        B, T, D = 4, 64, 256
+        momentum_coef = 0.9
+        lr = 0.01
+        decay = 0.001
+
+        weights_dict = {"weight": torch.randn(B, D, device="cuda", dtype=torch.float32)}
+        grads_dict = {"weight": torch.randn(B, T, D, device="cuda", dtype=torch.float32)}
+        momentum_dict = {"weight": torch.randn(B, D, device="cuda", dtype=torch.float32)}
+
+        new_weights, new_momentum = triton_batched_weight_update(
+            weights_dict, grads_dict, momentum_dict, lr, momentum_coef, decay
+        )
+
+        assert "weight" in new_weights
+        assert new_weights["weight"].shape == (B, D)
+        assert not torch.isnan(new_weights["weight"]).any()
+
+    def test_preserves_param_order(self):
+        """Batched kernel should preserve parameter order in output dicts."""
+        torch.manual_seed(42)
+
+        B, T = 2, 32
+        param_names = ["z_param", "a_param", "m_param"]  # Non-alphabetical
+
+        weights_dict = {}
+        grads_dict = {}
+        momentum_dict = {}
+
+        for name in param_names:
+            weights_dict[name] = torch.randn(B, 64, device="cuda", dtype=torch.float32)
+            grads_dict[name] = torch.randn(B, T, 64, device="cuda", dtype=torch.float32)
+            momentum_dict[name] = torch.randn(B, 64, device="cuda", dtype=torch.float32)
+
+        new_weights, new_momentum = triton_batched_weight_update(
+            weights_dict, grads_dict, momentum_dict, 0.01, 0.9, 0.001
+        )
+
+        assert list(new_weights.keys()) == param_names
+        assert list(new_momentum.keys()) == param_names
 
 
 # --- Weight Update Equivalence Tests ---
