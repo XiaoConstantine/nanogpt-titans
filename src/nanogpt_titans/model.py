@@ -222,7 +222,7 @@ class TitansConfig:
     bias: bool = True
 
     # Titans-specific config
-    segment_len: int = 64  # tokens per segment
+    segment_len: int = 128  # tokens per segment
     memory_depth: int = 2  # MLP layers in neural memory (paper uses 1-4, default 2)
     memory_expansion: int = 2  # hidden dim multiplier (2 = n_embd*2, reduced from 4 for memory)
     num_persist_mem: int = 4  # persistent memory tokens

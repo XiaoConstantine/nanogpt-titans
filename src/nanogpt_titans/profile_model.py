@@ -556,7 +556,7 @@ def main() -> None:
         n_layer=6,
         n_head=6,
         n_embd=384,
-        segment_len=64,
+        segment_len=128,
         num_persist_mem=4,
         num_longterm_mem=16,
     )
