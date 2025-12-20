@@ -176,8 +176,9 @@ def _fused_weight_update_kernel(
     w_ptr = weights_ptr + pid_b * stride_wb + d_offs * stride_wd
     w = tl.load(w_ptr, mask=d_mask, other=0.0)
 
-    # Update weights: w = decay_factor * w + lr * m
-    w = decay_factor * w + lr * m
+    # Update weights: w = decay_factor * w - lr * m
+    # (subtract because we pass gradients directly, not negated surprises)
+    w = decay_factor * w - lr * m
 
     # Store updated weights
     tl.store(w_ptr, w, mask=d_mask)
@@ -259,6 +260,49 @@ def test_triton_momentum():
     print("Test passed!")
 
 
+def test_fused_weight_update():
+    """Test that fused kernel matches separate momentum + weight update."""
+    torch.manual_seed(42)
+
+    B, T, D = 10, 64, 384
+    momentum_coef = 0.9
+    lr = 0.01
+    decay = 0.001
+
+    grads = torch.randn(B, T, D, device="cuda", dtype=torch.float32)
+    weights_ref = torch.randn(B, D, device="cuda", dtype=torch.float32)
+    prev_momentum_ref = torch.randn(B, D, device="cuda", dtype=torch.float32)
+
+    # Clone for fused version
+    weights_fused = weights_ref.clone()
+    prev_momentum_fused = prev_momentum_ref.clone()
+
+    # PyTorch reference (sequential momentum + weight update)
+    m = prev_momentum_ref.clone()
+    for t in range(T):
+        m = momentum_coef * m + (1 - momentum_coef) * grads[:, t]
+    # Weight update: w = decay_factor * w - lr * m
+    decay_factor = 1 - decay
+    weights_ref_result = decay_factor * weights_ref - lr * m
+
+    # Fused Triton
+    triton_fused_weight_update(
+        weights_fused, grads, prev_momentum_fused, lr, momentum_coef, decay
+    )
+
+    # Compare weights
+    weight_diff = (weights_ref_result - weights_fused).abs().max().item()
+    print(f"Weight max difference: {weight_diff:.2e}")
+    assert weight_diff < 1e-5, f"Weight mismatch: {weight_diff}"
+
+    # Compare momentum
+    momentum_diff = (m - prev_momentum_fused).abs().max().item()
+    print(f"Momentum max difference: {momentum_diff:.2e}")
+    assert momentum_diff < 1e-5, f"Momentum mismatch: {momentum_diff}"
+
+    print("Fused weight update test passed!")
+
+
 def benchmark_momentum():
     """Benchmark Triton vs PyTorch momentum."""
     import time
@@ -299,5 +343,7 @@ def benchmark_momentum():
 
 if __name__ == "__main__":
     test_triton_momentum()
+    print()
+    test_fused_weight_update()
     print()
     benchmark_momentum()

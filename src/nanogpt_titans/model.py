@@ -40,8 +40,10 @@ except ImportError:
 # Triton kernels for fused memory operations
 _TRITON_AVAILABLE = False
 triton_momentum_update = None  # type: ignore[assignment]
+triton_fused_weight_update = None  # type: ignore[assignment]
 try:
     from nanogpt_titans.triton_kernels import (
+        triton_fused_weight_update,
         triton_momentum_update,
     )
 
@@ -480,39 +482,64 @@ class NeuralMemory(nn.Module):
             all_grads = self._batched_grad_fn(params_for_grad, keys, values)
 
         # Apply updates with parallel momentum
-        new_weights: dict[str, torch.Tensor] = {}
-        new_last_momentum: dict[str, torch.Tensor] = {}
+        # Check if we can use the fully fused Triton kernel
+        first_grad = next(iter(all_grads.values()))
+        use_fused = _TRITON_AVAILABLE and first_grad.is_cuda and triton_fused_weight_update is not None
 
-        for name in state.weights:
-            # Pass gradients directly to avoid expensive negation (~124ms saved)
-            # The sign is handled in the weight update formula below
-            grads = all_grads[name]
+        if use_fused:
+            # Fused Triton kernel: momentum + weight update in one pass
+            # Updates weights and momentum in-place for maximum efficiency
+            new_weights: dict[str, torch.Tensor] = {}
+            new_last_momentum: dict[str, torch.Tensor] = {}
 
-            # Compute momentum - use Triton kernel if available for ~2x speedup
-            if _TRITON_AVAILABLE and grads.is_cuda:
-                # Triton kernel computes final momentum directly (no intermediate tensor)
-                final_momentum = triton_momentum_update(
+            for name in state.weights:
+                grads = all_grads[name]
+                # Clone for in-place update
+                weights_clone = state.weights[name].clone()
+                momentum_clone = state.last_momentum[name].clone()
+
+                # Fused kernel: computes momentum over T steps + weight update in one kernel
+                triton_fused_weight_update(
+                    weights_clone,
                     grads,
+                    momentum_clone,
+                    self.lr,
                     self.momentum,
-                    state.last_momentum[name],
+                    self.decay,
                 )
-            else:
-                # Fallback: parallel scan via cumsum trick
-                momentum_values = parallel_momentum(
-                    grads,
-                    self.momentum,
-                    prev_momentum=state.last_momentum[name],
-                )
-                final_momentum = momentum_values[:, -1]  # [B, *param_shape]
 
-            new_last_momentum[name] = final_momentum.detach()
+                new_weights[name] = weights_clone.detach()
+                new_last_momentum[name] = momentum_clone.detach()
+        else:
+            # Fallback: separate momentum + weight update
+            new_weights = {}
+            new_last_momentum = {}
 
-            # Apply weight update with decay
-            # Note: subtract instead of add since we removed the negation above
-            # This is equivalent to: w = decay*w + lr*(-grad) = decay*w - lr*grad
-            decay_factor = 1 - self.decay
-            updated_weights = decay_factor * state.weights[name] - self.lr * final_momentum
-            new_weights[name] = updated_weights.detach()
+            for name in state.weights:
+                grads = all_grads[name]
+
+                if _TRITON_AVAILABLE and grads.is_cuda:
+                    # Triton kernel for momentum only
+                    final_momentum = triton_momentum_update(
+                        grads,
+                        self.momentum,
+                        state.last_momentum[name],
+                    )
+                else:
+                    # Parallel scan via cumsum trick
+                    momentum_values = parallel_momentum(
+                        grads,
+                        self.momentum,
+                        prev_momentum=state.last_momentum[name],
+                    )
+                    final_momentum = momentum_values[:, -1]  # [B, *param_shape]
+
+                new_last_momentum[name] = final_momentum.detach()
+
+                # Weight update: w = decay*w - lr*momentum
+                decay_factor = 1 - self.decay
+                updated_weights = decay_factor * state.weights[name] - self.lr * final_momentum
+                new_weights[name] = updated_weights.detach()
 
         return MemoryState(
             weights=new_weights,
