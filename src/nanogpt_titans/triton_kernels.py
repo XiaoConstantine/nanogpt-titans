@@ -122,10 +122,12 @@ def triton_momentum_update(
 
 @triton.jit
 def _fused_weight_update_kernel(
-    # Pointers
-    weights_ptr,  # [B, D] - current weights (in-place update)
-    surprises_ptr,  # [B, T, D] - input surprises
-    prev_momentum_ptr,  # [B, D] - previous momentum (updated in-place)
+    # Pointers - separate input/output to avoid cloning
+    weights_in_ptr,  # [B, D] - current weights (read-only)
+    weights_out_ptr,  # [B, D] - updated weights (write-only)
+    grads_ptr,  # [B, T, D] - input gradients
+    prev_momentum_ptr,  # [B, D] - previous momentum (read-only)
+    new_momentum_ptr,  # [B, D] - updated momentum (write-only)
     # Scalars
     lr: tl.constexpr,  # learning rate
     momentum: tl.constexpr,  # momentum coefficient
@@ -137,21 +139,21 @@ def _fused_weight_update_kernel(
     # Strides
     stride_wb,
     stride_wd,
-    stride_sb,
-    stride_st,
-    stride_sd,
+    stride_gb,
+    stride_gt,
+    stride_gd,
     stride_pb,
     stride_pd,
     # Block size
     BLOCK_D: tl.constexpr,
 ):
     """
-    Fully fused weight update kernel.
+    Fully fused weight update kernel with separate input/output.
 
     Computes in one kernel:
     1. Momentum accumulation over T timesteps
-    2. Weight update with decay: w = decay_factor * w + lr * final_momentum
-    3. Stores updated momentum for next segment
+    2. Weight update with decay: w_new = decay_factor * w_old - lr * final_momentum
+    3. Outputs updated weights and momentum (no cloning needed)
     """
     pid_b = tl.program_id(0)
     pid_d = tl.program_id(1)
@@ -165,58 +167,69 @@ def _fused_weight_update_kernel(
 
     # Sequential momentum accumulation
     for t in range(T):
-        s_ptr = surprises_ptr + pid_b * stride_sb + t * stride_st + d_offs * stride_sd
-        surprise = tl.load(s_ptr, mask=d_mask, other=0.0)
-        m = momentum * m + one_minus_momentum * surprise
+        g_ptr = grads_ptr + pid_b * stride_gb + t * stride_gt + d_offs * stride_gd
+        grad = tl.load(g_ptr, mask=d_mask, other=0.0)
+        m = momentum * m + one_minus_momentum * grad
 
-    # Store updated momentum
-    tl.store(prev_ptr, m, mask=d_mask)
+    # Store updated momentum to new location
+    new_m_ptr = new_momentum_ptr + pid_b * stride_pb + d_offs * stride_pd
+    tl.store(new_m_ptr, m, mask=d_mask)
 
     # Load current weights
-    w_ptr = weights_ptr + pid_b * stride_wb + d_offs * stride_wd
-    w = tl.load(w_ptr, mask=d_mask, other=0.0)
+    w_in_ptr = weights_in_ptr + pid_b * stride_wb + d_offs * stride_wd
+    w = tl.load(w_in_ptr, mask=d_mask, other=0.0)
 
     # Update weights: w = decay_factor * w - lr * m
-    # (subtract because we pass gradients directly, not negated surprises)
     w = decay_factor * w - lr * m
 
-    # Store updated weights
-    tl.store(w_ptr, w, mask=d_mask)
+    # Store updated weights to new location
+    w_out_ptr = weights_out_ptr + pid_b * stride_wb + d_offs * stride_wd
+    tl.store(w_out_ptr, w, mask=d_mask)
 
 
 def triton_fused_weight_update(
-    weights: torch.Tensor,
-    surprises: torch.Tensor,
+    weights_in: torch.Tensor,
+    grads: torch.Tensor,
     prev_momentum: torch.Tensor,
     lr: float,
     momentum: float,
     decay: float,
-) -> None:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Fully fused weight update - modifies weights and prev_momentum in-place.
+    Fully fused weight update - returns new tensors (no cloning needed).
 
     Args:
-        weights: [B, *shape] - updated in-place
-        surprises: [B, T, *shape] - surprise values (negative gradients)
-        prev_momentum: [B, *shape] - updated in-place
+        weights_in: [B, *shape] - current weights (read-only)
+        grads: [B, T, *shape] - gradient values
+        prev_momentum: [B, *shape] - previous momentum (read-only)
         lr: learning rate
         momentum: momentum coefficient
         decay: weight decay
-    """
-    B, T = surprises.shape[:2]
-    D = surprises[0, 0].numel()
 
-    weights_flat = weights.view(B, D)
-    surprises_flat = surprises.view(B, T, D).contiguous()
+    Returns:
+        (new_weights, new_momentum) - updated tensors
+    """
+    B, T = grads.shape[:2]
+    orig_shape = grads.shape[2:]
+    D = grads[0, 0].numel()
+
+    weights_flat = weights_in.view(B, D)
+    grads_flat = grads.view(B, T, D).contiguous()
     prev_flat = prev_momentum.view(B, D)
+
+    # Allocate output tensors
+    weights_out = torch.empty_like(weights_flat)
+    momentum_out = torch.empty_like(prev_flat)
 
     BLOCK_D = min(1024, triton.next_power_of_2(D))
     grid = (B, triton.cdiv(D, BLOCK_D))
 
     _fused_weight_update_kernel[grid](
         weights_flat,
-        surprises_flat,
+        weights_out,
+        grads_flat,
         prev_flat,
+        momentum_out,
         lr,
         momentum,
         1.0 - momentum,
@@ -225,13 +238,16 @@ def triton_fused_weight_update(
         D,
         weights_flat.stride(0),
         weights_flat.stride(1),
-        surprises_flat.stride(0),
-        surprises_flat.stride(1),
-        surprises_flat.stride(2),
+        grads_flat.stride(0),
+        grads_flat.stride(1),
+        grads_flat.stride(2),
         prev_flat.stride(0),
         prev_flat.stride(1),
         BLOCK_D=BLOCK_D,
     )
+
+    # Reshape back to original shape
+    return weights_out.view(B, *orig_shape), momentum_out.view(B, *orig_shape)
 
 
 # Test function
@@ -270,33 +286,29 @@ def test_fused_weight_update():
     decay = 0.001
 
     grads = torch.randn(B, T, D, device="cuda", dtype=torch.float32)
-    weights_ref = torch.randn(B, D, device="cuda", dtype=torch.float32)
-    prev_momentum_ref = torch.randn(B, D, device="cuda", dtype=torch.float32)
-
-    # Clone for fused version
-    weights_fused = weights_ref.clone()
-    prev_momentum_fused = prev_momentum_ref.clone()
+    weights_in = torch.randn(B, D, device="cuda", dtype=torch.float32)
+    prev_momentum = torch.randn(B, D, device="cuda", dtype=torch.float32)
 
     # PyTorch reference (sequential momentum + weight update)
-    m = prev_momentum_ref.clone()
+    m = prev_momentum.clone()
     for t in range(T):
         m = momentum_coef * m + (1 - momentum_coef) * grads[:, t]
     # Weight update: w = decay_factor * w - lr * m
     decay_factor = 1 - decay
-    weights_ref_result = decay_factor * weights_ref - lr * m
+    weights_ref = decay_factor * weights_in - lr * m
 
-    # Fused Triton
-    triton_fused_weight_update(
-        weights_fused, grads, prev_momentum_fused, lr, momentum_coef, decay
+    # Fused Triton (returns new tensors)
+    weights_out, momentum_out = triton_fused_weight_update(
+        weights_in, grads, prev_momentum, lr, momentum_coef, decay
     )
 
     # Compare weights
-    weight_diff = (weights_ref_result - weights_fused).abs().max().item()
+    weight_diff = (weights_ref - weights_out).abs().max().item()
     print(f"Weight max difference: {weight_diff:.2e}")
     assert weight_diff < 1e-5, f"Weight mismatch: {weight_diff}"
 
     # Compare momentum
-    momentum_diff = (m - prev_momentum_fused).abs().max().item()
+    momentum_diff = (m - momentum_out).abs().max().item()
     print(f"Momentum max difference: {momentum_diff:.2e}")
     assert momentum_diff < 1e-5, f"Momentum mismatch: {momentum_diff}"
 

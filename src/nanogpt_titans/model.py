@@ -488,28 +488,26 @@ class NeuralMemory(nn.Module):
 
         if use_fused:
             # Fused Triton kernel: momentum + weight update in one pass
-            # Updates weights and momentum in-place for maximum efficiency
+            # Returns new tensors directly (no cloning needed)
             new_weights: dict[str, torch.Tensor] = {}
             new_last_momentum: dict[str, torch.Tensor] = {}
 
             for name in state.weights:
                 grads = all_grads[name]
-                # Clone for in-place update
-                weights_clone = state.weights[name].clone()
-                momentum_clone = state.last_momentum[name].clone()
 
                 # Fused kernel: computes momentum over T steps + weight update in one kernel
-                triton_fused_weight_update(
-                    weights_clone,
+                # Returns (new_weights, new_momentum) - no clone overhead
+                updated_weights, updated_momentum = triton_fused_weight_update(
+                    state.weights[name],
                     grads,
-                    momentum_clone,
+                    state.last_momentum[name],
                     self.lr,
                     self.momentum,
                     self.decay,
                 )
 
-                new_weights[name] = weights_clone.detach()
-                new_last_momentum[name] = momentum_clone.detach()
+                new_weights[name] = updated_weights.detach()
+                new_last_momentum[name] = updated_momentum.detach()
         else:
             # Fallback: separate momentum + weight update
             new_weights = {}
