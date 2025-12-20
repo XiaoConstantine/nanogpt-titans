@@ -41,8 +41,10 @@ except ImportError:
 _TRITON_AVAILABLE = False
 triton_momentum_update = None  # type: ignore[assignment]
 triton_fused_weight_update = None  # type: ignore[assignment]
+triton_cross_entropy = None  # type: ignore[assignment]
 try:
     from nanogpt_titans.triton_kernels import (
+        triton_cross_entropy,
         triton_fused_weight_update,
         triton_momentum_update,
     )
@@ -1037,11 +1039,19 @@ class TitansGPT(nn.Module):
         # Compute loss if targets provided
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(
-                final_logits.view(-1, final_logits.size(-1)),
-                targets.view(-1),
-                ignore_index=-1,
-            )
+            # Use fused Triton cross-entropy when available (CUDA only)
+            if _TRITON_AVAILABLE and triton_cross_entropy is not None and final_logits.is_cuda:
+                # triton_cross_entropy handles ignore_index=-1 internally
+                loss = triton_cross_entropy(
+                    final_logits.view(-1, final_logits.size(-1)),
+                    targets.view(-1),
+                )
+            else:
+                loss = F.cross_entropy(
+                    final_logits.view(-1, final_logits.size(-1)),
+                    targets.view(-1),
+                    ignore_index=-1,
+                )
 
         return final_logits, loss, memory_states
 

@@ -11,11 +11,10 @@ import pytest
 import torch
 
 from nanogpt_titans.model import (
-    TitansConfig,
     NeuralMemory,
+    TitansConfig,
     parallel_momentum,
 )
-
 
 # Check if CUDA and Triton are available
 CUDA_AVAILABLE = torch.cuda.is_available()
@@ -414,6 +413,254 @@ class TestSegmentLength:
 
         memory_layer_idx = config.n_layer // 2
         assert states[memory_layer_idx].step == 2  # 256/128 = 2 segments
+
+
+# --- Cross-Entropy Kernel Tests ---
+
+triton_cross_entropy = None
+triton_layer_norm = None
+triton_linear_silu = None
+triton_mse_grad = None
+
+if CUDA_AVAILABLE:
+    try:
+        from nanogpt_titans.triton_kernels import (
+            triton_cross_entropy,
+            triton_layer_norm,
+            triton_linear_silu,
+            triton_mse_grad,
+        )
+    except ImportError:
+        pass
+
+
+@pytest.mark.skipif(not TRITON_AVAILABLE or triton_cross_entropy is None, reason="Triton not available")
+class TestTritonCrossEntropy:
+    """Tests for the Triton fused cross-entropy kernel."""
+
+    def test_matches_pytorch_basic(self):
+        """Triton cross-entropy should match PyTorch F.cross_entropy."""
+        torch.manual_seed(42)
+
+        N, V = 128, 1000  # batch size, vocab size
+        logits = torch.randn(N, V, device="cuda", dtype=torch.float32, requires_grad=True)
+        targets = torch.randint(0, V, (N,), device="cuda")
+
+        # PyTorch reference
+        logits_ref = logits.clone().detach().requires_grad_(True)
+        loss_ref = torch.nn.functional.cross_entropy(logits_ref, targets)
+
+        # Triton
+        loss_triton = triton_cross_entropy(logits, targets)
+
+        # Forward should match
+        torch.testing.assert_close(loss_ref, loss_triton, rtol=1e-3, atol=1e-3)
+
+        # Backward should match
+        loss_ref.backward()
+        loss_triton.backward()
+        torch.testing.assert_close(logits_ref.grad, logits.grad, rtol=1e-3, atol=1e-3)
+
+    def test_ignore_index(self):
+        """Test that ignore_index=-1 is handled correctly."""
+        torch.manual_seed(42)
+
+        N, V = 64, 500
+        logits = torch.randn(N, V, device="cuda", dtype=torch.float32)
+        targets = torch.randint(0, V, (N,), device="cuda")
+
+        # Set some targets to -1 (ignore)
+        targets[::3] = -1
+
+        # PyTorch reference
+        loss_ref = torch.nn.functional.cross_entropy(logits, targets, ignore_index=-1)
+
+        # Triton
+        loss_triton = triton_cross_entropy(logits, targets)
+
+        torch.testing.assert_close(loss_ref, loss_triton, rtol=1e-3, atol=1e-3)
+
+    def test_3d_input(self):
+        """Test with 3D logits input (flattened internally)."""
+        torch.manual_seed(42)
+
+        B, T, V = 4, 64, 256
+        logits = torch.randn(B, T, V, device="cuda", dtype=torch.float32)
+        targets = torch.randint(0, V, (B, T), device="cuda")
+
+        # PyTorch reference (need to flatten)
+        loss_ref = torch.nn.functional.cross_entropy(
+            logits.view(-1, V), targets.view(-1)
+        )
+
+        # Triton (handles flattening internally)
+        loss_triton = triton_cross_entropy(logits, targets)
+
+        torch.testing.assert_close(loss_ref, loss_triton, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.skipif(not TRITON_AVAILABLE or triton_layer_norm is None, reason="Triton not available")
+class TestTritonLayerNorm:
+    """Tests for the Triton fused layer norm kernel."""
+
+    def test_matches_pytorch(self):
+        """Triton layer norm should match PyTorch."""
+        torch.manual_seed(42)
+
+        B, T, C = 4, 64, 384
+        x = torch.randn(B, T, C, device="cuda", dtype=torch.float32)
+        weight = torch.randn(C, device="cuda", dtype=torch.float32)
+        bias = torch.randn(C, device="cuda", dtype=torch.float32)
+
+        # PyTorch reference
+        y_ref = torch.nn.functional.layer_norm(x, (C,), weight, bias)
+
+        # Triton
+        y_triton = triton_layer_norm(x, weight, bias)
+
+        torch.testing.assert_close(y_ref, y_triton, rtol=1e-4, atol=1e-4)
+
+    def test_without_bias(self):
+        """Test layer norm without bias."""
+        torch.manual_seed(42)
+
+        B, T, C = 4, 64, 256
+        x = torch.randn(B, T, C, device="cuda", dtype=torch.float32)
+        weight = torch.randn(C, device="cuda", dtype=torch.float32)
+
+        # PyTorch reference
+        y_ref = torch.nn.functional.layer_norm(x, (C,), weight, None)
+
+        # Triton
+        y_triton = triton_layer_norm(x, weight, None)
+
+        torch.testing.assert_close(y_ref, y_triton, rtol=1e-4, atol=1e-4)
+
+    def test_2d_input(self):
+        """Test with 2D input."""
+        torch.manual_seed(42)
+
+        N, C = 128, 512
+        x = torch.randn(N, C, device="cuda", dtype=torch.float32)
+        weight = torch.randn(C, device="cuda", dtype=torch.float32)
+        bias = torch.randn(C, device="cuda", dtype=torch.float32)
+
+        # PyTorch reference
+        y_ref = torch.nn.functional.layer_norm(x, (C,), weight, bias)
+
+        # Triton
+        y_triton = triton_layer_norm(x, weight, bias)
+
+        torch.testing.assert_close(y_ref, y_triton, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(not TRITON_AVAILABLE or triton_linear_silu is None, reason="Triton not available")
+class TestTritonLinearSiLU:
+    """Tests for the Triton fused linear + SiLU kernel."""
+
+    def test_matches_pytorch(self):
+        """Triton linear + SiLU should match PyTorch."""
+        torch.manual_seed(42)
+
+        B, T, K, N = 4, 32, 256, 512
+        x = torch.randn(B, T, K, device="cuda", dtype=torch.float16)
+        weight = torch.randn(N, K, device="cuda", dtype=torch.float16)
+        bias = torch.randn(N, device="cuda", dtype=torch.float16)
+
+        # PyTorch reference
+        y_ref = torch.nn.functional.silu(torch.nn.functional.linear(x, weight, bias))
+
+        # Triton
+        y_triton = triton_linear_silu(x, weight, bias)
+
+        # Use looser tolerance for fp16
+        torch.testing.assert_close(y_ref, y_triton, rtol=1e-2, atol=1e-2)
+
+    def test_without_bias(self):
+        """Test linear + SiLU without bias."""
+        torch.manual_seed(42)
+
+        B, T, K, N = 4, 32, 128, 256
+        x = torch.randn(B, T, K, device="cuda", dtype=torch.float16)
+        weight = torch.randn(N, K, device="cuda", dtype=torch.float16)
+
+        # PyTorch reference
+        y_ref = torch.nn.functional.silu(torch.nn.functional.linear(x, weight, None))
+
+        # Triton
+        y_triton = triton_linear_silu(x, weight, None)
+
+        torch.testing.assert_close(y_ref, y_triton, rtol=1e-2, atol=1e-2)
+
+    def test_2d_input(self):
+        """Test with 2D input."""
+        torch.manual_seed(42)
+
+        N, K, M = 128, 256, 512
+        x = torch.randn(N, K, device="cuda", dtype=torch.float16)
+        weight = torch.randn(M, K, device="cuda", dtype=torch.float16)
+        bias = torch.randn(M, device="cuda", dtype=torch.float16)
+
+        # PyTorch reference
+        y_ref = torch.nn.functional.silu(torch.nn.functional.linear(x, weight, bias))
+
+        # Triton
+        y_triton = triton_linear_silu(x, weight, bias)
+
+        torch.testing.assert_close(y_ref, y_triton, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not TRITON_AVAILABLE or triton_mse_grad is None, reason="Triton not available")
+class TestTritonMSEGrad:
+    """Tests for the Triton MSE gradient kernel."""
+
+    def test_matches_pytorch(self):
+        """Triton MSE gradient should match PyTorch."""
+        torch.manual_seed(42)
+
+        B, T, C = 4, 64, 256
+        pred = torch.randn(B, T, C, device="cuda", dtype=torch.float32, requires_grad=True)
+        target = torch.randn(B, T, C, device="cuda", dtype=torch.float32)
+
+        # PyTorch reference: grad of MSE = 2 * (pred - target) / n
+        pred_ref = pred.clone().detach().requires_grad_(True)
+        loss = torch.nn.functional.mse_loss(pred_ref, target)
+        loss.backward()
+        grad_ref = pred_ref.grad
+
+        # Triton
+        grad_triton = triton_mse_grad(pred.detach(), target)
+
+        torch.testing.assert_close(grad_ref, grad_triton, rtol=1e-4, atol=1e-4)
+
+    def test_various_shapes(self):
+        """Test with various tensor shapes."""
+        torch.manual_seed(42)
+
+        shapes = [
+            (128,),
+            (64, 128),
+            (4, 32, 64),
+            (2, 8, 16, 32),
+        ]
+
+        for shape in shapes:
+            pred = torch.randn(shape, device="cuda", dtype=torch.float32, requires_grad=True)
+            target = torch.randn(shape, device="cuda", dtype=torch.float32)
+
+            # PyTorch reference
+            pred_ref = pred.clone().detach().requires_grad_(True)
+            loss = torch.nn.functional.mse_loss(pred_ref, target)
+            loss.backward()
+            grad_ref = pred_ref.grad
+
+            # Triton
+            grad_triton = triton_mse_grad(pred.detach(), target)
+
+            torch.testing.assert_close(
+                grad_ref, grad_triton, rtol=1e-4, atol=1e-4,
+                msg=f"Shape {shape} failed"
+            )
 
 
 if __name__ == "__main__":
