@@ -194,7 +194,6 @@ def train(config: TrainConfig) -> None:
 
     # Setup packed data loaders if enabled
     packed_train_loader = None
-    packed_val_loader = None
     if config.use_packing:
         from nanogpt_titans.packed_data import PackedDataLoader
 
@@ -206,7 +205,7 @@ def train(config: TrainConfig) -> None:
             device=device,
             shuffle=True,
         )
-        packed_val_loader = PackedDataLoader(
+        _packed_val_loader = PackedDataLoader(
             data_path=data_dir / "val.bin",
             block_size=config.block_size,
             batch_size=config.batch_size,

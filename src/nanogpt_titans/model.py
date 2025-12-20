@@ -56,7 +56,7 @@ except ImportError:
 # --- FlexAttention mask functions ---
 
 
-def causal_mask(b, h, q_idx, kv_idx):
+def causal_mask(_b, _h, q_idx, kv_idx):
     """Standard causal mask: each position can only attend to previous positions."""
     return q_idx >= kv_idx
 
@@ -69,7 +69,7 @@ def prefix_lm_mask(prefix_len: int):
     Suffix tokens (prefix_len:) can attend to prefix + causally to suffix.
     """
 
-    def mask_fn(b, h, q_idx, kv_idx):
+    def mask_fn(_b, _h, q_idx, kv_idx):
         # If query is in prefix, it can attend to all prefix tokens
         in_prefix = q_idx < prefix_len
         # If key is in prefix, it can always be attended to
@@ -97,7 +97,7 @@ def document_causal_mask(document_ids: torch.Tensor):
         document_ids: [seq_len] tensor where document_ids[i] = doc index for token i
     """
 
-    def mask_fn(b, h, q_idx, kv_idx):
+    def mask_fn(_b, _h, q_idx, kv_idx):
         same_doc = document_ids[q_idx] == document_ids[kv_idx]
         causal = q_idx >= kv_idx
         return same_doc & causal
@@ -406,7 +406,7 @@ class NeuralMemory(nn.Module):
 
         # vmap over batch dimension
         if self._batched_mlp_forward is None:
-            params_in_dims = {name: 0 for name in state.weights}
+            params_in_dims = dict.fromkeys(state.weights, 0)
             self._batched_mlp_forward = torch.func.vmap(
                 single_batch_forward, in_dims=(params_in_dims, 0)
             )
@@ -465,7 +465,7 @@ class NeuralMemory(nn.Module):
                 return F.mse_loss(pred, v)
 
             grad_fn = torch.func.grad(single_token_loss)
-            params_in_dims = {name: 0 for name in state.weights}
+            params_in_dims = dict.fromkeys(state.weights, 0)
 
             # First vmap over time (tokens), then over batch
             self._batched_grad_fn = torch.func.vmap(
@@ -860,10 +860,7 @@ class TitansBlock(nn.Module):
         x = x + self.mlp(self.ln_2(x))
 
         # 7. Update memory based on this segment (stores x for next segment's retrieval)
-        if self.update_memory:
-            new_state = self.memory.update(x, memory_state)
-        else:
-            new_state = memory_state  # Skip expensive update
+        new_state = self.memory.update(x, memory_state) if self.update_memory else memory_state
 
         return x, new_state
 

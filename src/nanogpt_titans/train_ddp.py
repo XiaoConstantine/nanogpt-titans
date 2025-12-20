@@ -380,7 +380,7 @@ def train(config: TrainConfig) -> None:
 
     if master_process:
         print(f"Starting training for {config.max_iters} iterations")
-        print(f"Using contiguous sequences (Titans paper style)")
+        print("Using contiguous sequences (Titans paper style)")
         print(f"DDP: {ddp}, World size: {ddp_world_size}")
         print(f"Tokens per iter: {config.tokens_per_iter * ddp_world_size:,} (across all GPUs)")
 

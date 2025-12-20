@@ -16,10 +16,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 
 @dataclass
@@ -139,7 +142,6 @@ class PackedDataset:
 
             if remaining_space[best_row] >= doc_len:
                 # Add document to this row
-                start_pos = len(packed_ids[best_row])
                 packed_ids[best_row].extend(doc_tokens)
                 # Position IDs reset for each document
                 packed_positions[best_row].extend(range(doc_len))
@@ -379,7 +381,6 @@ class PackedDataLoader:
 
             if remaining[best_row] >= doc_len:
                 tokens = self.data[start:end].astype(np.int64).tolist()
-                cur_pos = len(packed_ids[best_row])
                 packed_ids[best_row].extend(tokens)
                 packed_positions[best_row].extend(range(doc_len))
                 seq_lengths[best_row].append(doc_len)
@@ -446,7 +447,7 @@ class PackedDataLoader:
 
 
 def get_packed_batch(
-    split: str,
+    _split: str,
     loader: PackedDataLoader,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
