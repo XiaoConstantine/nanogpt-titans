@@ -425,9 +425,9 @@ class NeuralMemory(nn.Module):
         # MSE gradient
         d_pred = pred - values  # [B, T, C]
 
-        # Backprop through output layer - outer product via broadcasting
+        # Backprop through output layer using einsum (memory-efficient)
         # dW1[b,t,c,h] = d_pred[b,t,c] * h1[b,t,h]
-        dW1 = d_pred.unsqueeze(-1) * h1.unsqueeze(-2)  # [B, T, C, H]
+        dW1 = torch.einsum('btc,bth->btch', d_pred, h1)  # [B, T, C, H]
 
         # dh1 = d_pred @ W1 = [B, T, C] @ [B, C, H] = [B, T, H]
         dh1 = torch.bmm(d_pred, W1)
@@ -436,9 +436,9 @@ class NeuralMemory(nn.Module):
         silu_grad = sig_h1 * (1 + h1_pre * (1 - sig_h1))
         dh1_pre = dh1 * silu_grad  # [B, T, H]
 
-        # Backprop through input layer - outer product via broadcasting
+        # Backprop through input layer using einsum (memory-efficient)
         # dW0[b,t,h,c] = dh1_pre[b,t,h] * keys[b,t,c]
-        dW0 = dh1_pre.unsqueeze(-1) * keys.unsqueeze(-2)  # [B, T, H, C]
+        dW0 = torch.einsum('bth,btc->bthc', dh1_pre, keys)  # [B, T, H, C]
 
         # Build result dict
         result = {
