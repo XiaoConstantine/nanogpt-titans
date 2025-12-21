@@ -125,6 +125,66 @@ def get_batch(
     return x, y
 
 
+def estimate_flops_per_iter(config: TrainConfig, num_params: int) -> float:
+    """
+    Estimate FLOPS per training iteration for Titans model.
+
+    Standard transformer: ~6 * N * tokens (2N forward, 4N backward)
+    Titans adds memory overhead from:
+    - Memory retrieval (MLP forward): ~2 * hidden * embd per token
+    - Gradient computation (einsum): ~4 * hidden * embd per token
+    - Momentum updates: negligible
+
+    Args:
+        config: Training configuration
+        num_params: Number of model parameters
+
+    Returns:
+        Estimated FLOPS per iteration
+    """
+    tokens = config.tokens_per_iter
+
+    # Standard transformer FLOPS (forward + backward)
+    transformer_flops = 6 * num_params * tokens
+
+    # Titans memory overhead (only on memory layer, per segment)
+    num_segments = config.block_size // config.segment_len
+    hidden_dim = config.n_embd * 2  # memory_expansion default
+    memory_flops_per_token = 6 * hidden_dim * config.n_embd  # MLP forward + gradient
+
+    # Memory overhead: applied once per segment per batch
+    # tokens_per_segment = segment_len, so total memory ops = tokens / segment_len * segment_len = tokens
+    memory_flops = memory_flops_per_token * tokens
+
+    return transformer_flops + memory_flops
+
+
+def get_peak_tflops(device_type: str, dtype: str) -> float:
+    """Get theoretical peak TFLOPS for common GPUs."""
+    # BF16/FP16 tensor core peaks (approximate)
+    gpu_peaks = {
+        "L4": 242,      # NVIDIA L4
+        "T4": 65,       # NVIDIA T4
+        "A100": 312,    # NVIDIA A100 (BF16)
+        "H100": 990,    # NVIDIA H100 (BF16)
+        "RTX4090": 330, # RTX 4090
+    }
+
+    if device_type != "cuda":
+        return 100.0  # Placeholder for non-CUDA
+
+    # Try to detect GPU
+    import torch
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        for key, peak in gpu_peaks.items():
+            if key in gpu_name:
+                return peak
+
+    # Default to L4 if unknown
+    return 242.0
+
+
 def get_lr(it: int, config: TrainConfig) -> float:
     """Learning rate scheduler with warmup and cosine decay."""
     # Linear warmup
@@ -293,8 +353,14 @@ def train(config: TrainConfig) -> None:
     local_iter_num = 0
     running_mfu = -1.0
 
+    # Pre-compute FLOPS estimation for MFU calculation
+    num_params = model.get_num_params() if hasattr(model, "get_num_params") else sum(p.numel() for p in model.parameters())
+    flops_per_iter = estimate_flops_per_iter(config, num_params)
+    peak_tflops = get_peak_tflops(device_type, config.dtype)
+
     print(f"Starting training for {config.max_iters} iterations")
     print(f"Tokens per iteration: {config.tokens_per_iter:,}")
+    print(f"Estimated TFLOPS/iter: {flops_per_iter / 1e12:.2f}, Peak GPU: {peak_tflops:.0f} TFLOPS")
     if config.use_packing:
         print("Padding-free packing enabled - maximizing GPU utilization")
 
@@ -390,7 +456,9 @@ def train(config: TrainConfig) -> None:
         if iter_num % config.log_interval == 0:
             lossf = loss.item() * config.gradient_accumulation_steps
             if local_iter_num >= 5:
-                mfu = model.get_num_params() * config.tokens_per_iter / (dt * 1e12)
+                # MFU = achieved TFLOPS / peak TFLOPS
+                achieved_tflops = flops_per_iter / dt / 1e12
+                mfu = achieved_tflops / peak_tflops
                 running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
             utilization = ""
             if config.use_packing:
