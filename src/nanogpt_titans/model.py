@@ -368,7 +368,7 @@ class NeuralMemory(nn.Module):
         keys: torch.Tensor,
         values: torch.Tensor,
         weights: dict[str, torch.Tensor],
-    ) -> dict[str, torch.Tensor]:
+    ) -> dict[str, torch.Tensor] | None:
         """
         Compute per-token MSE gradients using batched matrix operations.
 
@@ -386,27 +386,39 @@ class NeuralMemory(nn.Module):
             weights: Per-batch MLP weights {name: [B, *param_shape]}
 
         Returns:
-            Gradients {name: [B, T, *param_shape]}
+            Gradients {name: [B, T, *param_shape]} or None if keys don't match expected structure
         """
+        # Check for expected 2-layer MLP structure (with or without bias)
+        required_keys = {'layers.0.weight', 'layers.1.weight'}
+        if not required_keys.issubset(weights.keys()):
+            return None  # Fall back to vmap
+
         B, T, C = keys.shape
         H = self.hidden_dim
 
         # Extract weights (PyTorch Linear: weight is [out, in])
         W0 = weights['layers.0.weight']  # [B, H, C]
-        b0 = weights['layers.0.bias']    # [B, H]
         W1 = weights['layers.1.weight']  # [B, C, H]
-        b1 = weights['layers.1.bias']    # [B, C]
+
+        # Bias is optional
+        has_bias = 'layers.0.bias' in weights
+        b0 = weights.get('layers.0.bias')  # [B, H] or None
+        b1 = weights.get('layers.1.bias')  # [B, C] or None
 
         # Forward pass (batched over all tokens)
         # h1_pre = keys @ W0.T + b0 = einsum('btc,bhc->bth', keys, W0) + b0
-        h1_pre = torch.einsum('btc,bhc->bth', keys, W0) + b0.unsqueeze(1)  # [B, T, H]
+        h1_pre = torch.einsum('btc,bhc->bth', keys, W0)  # [B, T, H]
+        if b0 is not None:
+            h1_pre = h1_pre + b0.unsqueeze(1)
 
         # SiLU activation: silu(x) = x * sigmoid(x)
         sig_h1 = torch.sigmoid(h1_pre)
         h1 = h1_pre * sig_h1  # [B, T, H]
 
         # Output layer: pred = h1 @ W1.T + b1
-        pred = torch.einsum('bth,bch->btc', h1, W1) + b1.unsqueeze(1)  # [B, T, C]
+        pred = torch.einsum('bth,bch->btc', h1, W1)  # [B, T, C]
+        if b1 is not None:
+            pred = pred + b1.unsqueeze(1)
 
         # MSE gradient: d_pred = 2 * (pred - values) / C
         # We absorb the 2/C factor into the learning rate for efficiency
@@ -415,7 +427,6 @@ class NeuralMemory(nn.Module):
         # Backprop through output layer
         # dW1[b,t,c,h] = d_pred[b,t,c] * h1[b,t,h] (outer product per token)
         dW1 = torch.einsum('btc,bth->btch', d_pred, h1)  # [B, T, C, H]
-        db1 = d_pred  # [B, T, C]
 
         # dh1 = d_pred @ W1
         dh1 = torch.einsum('btc,bch->bth', d_pred, W1)  # [B, T, H]
@@ -429,14 +440,17 @@ class NeuralMemory(nn.Module):
         # Backprop through input layer
         # dW0[b,t,h,c] = dh1_pre[b,t,h] * keys[b,t,c] (outer product per token)
         dW0 = torch.einsum('bth,btc->bthc', dh1_pre, keys)  # [B, T, H, C]
-        db0 = dh1_pre  # [B, T, H]
 
-        return {
+        # Build result dict
+        result = {
             'layers.0.weight': dW0,
-            'layers.0.bias': db0,
             'layers.1.weight': dW1,
-            'layers.1.bias': db1,
         }
+        if has_bias:
+            result['layers.0.bias'] = dh1_pre  # [B, T, H]
+            result['layers.1.bias'] = d_pred   # [B, T, C]
+
+        return result
 
     def _forward_with_weights(
         self,
@@ -547,12 +561,14 @@ class NeuralMemory(nn.Module):
         values = self.value_proj(x_detached).contiguous()  # [B, T, C]
 
         # Use batched matmul (fast) or vmap (fallback)
+        all_grads = None
         if self._use_batched_matmul and self.config.memory_depth == 2:
             # Fast path: analytical gradient computation using batched matmul
             # This replaces O(B*T) small vmap operations with O(1) large einsum operations
             all_grads = self._compute_gradients_batched(keys, values, state.weights)
-        else:
-            # Fallback: vmap for non-standard MLP depths
+
+        if all_grads is None:
+            # Fallback: vmap for non-standard MLP depths or unexpected weight structure
             if self._batched_grad_fn is None:
                 def single_token_loss(
                     params: dict[str, torch.Tensor], k: torch.Tensor, v: torch.Tensor
