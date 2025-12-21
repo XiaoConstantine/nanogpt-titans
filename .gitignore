@@ -31,7 +31,6 @@ ENV/
 env/
 
 # uv
-.python-version
 uv.lock
 
 # PyTorch checkpoints and outputs
