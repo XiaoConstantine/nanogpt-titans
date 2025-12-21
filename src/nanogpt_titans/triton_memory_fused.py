@@ -46,7 +46,7 @@ def chunked_gradient_memory_update(
     Returns:
         (new_weights, new_momentum)
     """
-    B, T, C = keys.shape
+    _B, T, C = keys.shape
 
     W0 = weights['layers.0.weight']  # [B, H, C]
     W1 = weights['layers.1.weight']  # [B, C, H]
@@ -117,22 +117,31 @@ def chunked_gradient_memory_update(
     new_W0 = decay_factor * W0 - lr * new_mom_W0
     new_W1 = decay_factor * W1 - lr * new_mom_W1
 
-    new_weights = {
-        'layers.0.weight': new_W0,
-        'layers.1.weight': new_W1,
-    }
-    new_momentum_dict = {
-        'layers.0.weight': new_mom_W0,
-        'layers.1.weight': new_mom_W1,
-    }
-
+    # Build dicts in named_parameters() order: weight, bias, weight, bias
     if has_bias:
         new_b0 = decay_factor * b0 - lr * new_mom_b0
         new_b1 = decay_factor * b1 - lr * new_mom_b1
-        new_weights['layers.0.bias'] = new_b0
-        new_weights['layers.1.bias'] = new_b1
-        new_momentum_dict['layers.0.bias'] = new_mom_b0
-        new_momentum_dict['layers.1.bias'] = new_mom_b1
+        new_weights = {
+            'layers.0.weight': new_W0,
+            'layers.0.bias': new_b0,
+            'layers.1.weight': new_W1,
+            'layers.1.bias': new_b1,
+        }
+        new_momentum_dict = {
+            'layers.0.weight': new_mom_W0,
+            'layers.0.bias': new_mom_b0,
+            'layers.1.weight': new_mom_W1,
+            'layers.1.bias': new_mom_b1,
+        }
+    else:
+        new_weights = {
+            'layers.0.weight': new_W0,
+            'layers.1.weight': new_W1,
+        }
+        new_momentum_dict = {
+            'layers.0.weight': new_mom_W0,
+            'layers.1.weight': new_mom_W1,
+        }
 
     return new_weights, new_momentum_dict
 
@@ -177,7 +186,7 @@ def aggregated_gradient_memory_update(
     Returns:
         (new_weights, new_momentum)
     """
-    B, T, C = keys.shape
+    _B, T, C = keys.shape
 
     W0 = weights['layers.0.weight']  # [B, H, C]
     W1 = weights['layers.1.weight']  # [B, C, H]
@@ -260,15 +269,7 @@ def aggregated_gradient_memory_update(
         new_W0 = decay_factor * W0 - lr * new_mom_W0
         new_W1 = decay_factor * W1 - lr * new_mom_W1
 
-    new_weights = {
-        'layers.0.weight': new_W0.detach(),
-        'layers.1.weight': new_W1.detach(),
-    }
-    new_momentum_dict = {
-        'layers.0.weight': new_mom_W0.detach(),
-        'layers.1.weight': new_mom_W1.detach(),
-    }
-
+    # Build dicts in named_parameters() order: weight, bias, weight, bias
     if has_bias:
         if isinstance(decay_factor, torch.Tensor) or isinstance(lr, torch.Tensor):
             decay_factor_bias = decay_factor.squeeze(-1) if isinstance(decay_factor, torch.Tensor) else decay_factor
@@ -278,9 +279,26 @@ def aggregated_gradient_memory_update(
         else:
             new_b0 = decay_factor * b0 - lr * new_mom_b0
             new_b1 = decay_factor * b1 - lr * new_mom_b1
-        new_weights['layers.0.bias'] = new_b0.detach()
-        new_weights['layers.1.bias'] = new_b1.detach()
-        new_momentum_dict['layers.0.bias'] = new_mom_b0.detach()
-        new_momentum_dict['layers.1.bias'] = new_mom_b1.detach()
+        new_weights = {
+            'layers.0.weight': new_W0.detach(),
+            'layers.0.bias': new_b0.detach(),
+            'layers.1.weight': new_W1.detach(),
+            'layers.1.bias': new_b1.detach(),
+        }
+        new_momentum_dict = {
+            'layers.0.weight': new_mom_W0.detach(),
+            'layers.0.bias': new_mom_b0.detach(),
+            'layers.1.weight': new_mom_W1.detach(),
+            'layers.1.bias': new_mom_b1.detach(),
+        }
+    else:
+        new_weights = {
+            'layers.0.weight': new_W0.detach(),
+            'layers.1.weight': new_W1.detach(),
+        }
+        new_momentum_dict = {
+            'layers.0.weight': new_mom_W0.detach(),
+            'layers.1.weight': new_mom_W1.detach(),
+        }
 
     return new_weights, new_momentum_dict

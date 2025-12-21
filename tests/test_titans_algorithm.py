@@ -230,8 +230,9 @@ class TestWeightUpdateWithDecay:
     def test_learning_rate_scales_update(self, config):
         """Verify learning rate scales the surprise contribution."""
         # Create two memories with different learning rates
-        config1 = TitansConfig(**{**vars(config), 'memory_lr': 0.01})
-        config2 = TitansConfig(**{**vars(config), 'memory_lr': 0.1})
+        # Disable adaptive_memory to test fixed memory_lr
+        config1 = TitansConfig(**{**vars(config), 'memory_lr': 0.01, 'adaptive_memory': False})
+        config2 = TitansConfig(**{**vars(config), 'memory_lr': 0.1, 'adaptive_memory': False})
 
         memory1 = NeuralMemory(config1)
         memory2 = NeuralMemory(config2)
