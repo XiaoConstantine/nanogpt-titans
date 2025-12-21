@@ -422,8 +422,8 @@ class NeuralMemory(nn.Module):
         if b1 is not None:
             pred = pred + b1.unsqueeze(1)
 
-        # MSE gradient
-        d_pred = pred - values  # [B, T, C]
+        # MSE gradient: d/d_pred of mean((pred - values)^2) = 2 * (pred - values) / C
+        d_pred = (2.0 / C) * (pred - values)  # [B, T, C]
 
         # Backprop through output layer using einsum (memory-efficient)
         # dW1[b,t,c,h] = d_pred[b,t,c] * h1[b,t,h]
