@@ -58,6 +58,7 @@ class TrainConfig:
     memory_lr: float = 0.01
     memory_momentum: float = 0.9
     memory_decay: float = 0.001
+    adaptive_memory: bool = True
     dropout: float = 0.0
     bias: bool = False
 
@@ -273,32 +274,39 @@ def train(config: TrainConfig) -> None:
         )
 
     # Model
-    model_config = TitansConfig(
-        block_size=config.block_size,
-        vocab_size=50304,  # GPT-2 vocab
-        n_layer=config.n_layer,
-        n_head=config.n_head,
-        n_embd=config.n_embd,
-        dropout=config.dropout,
-        bias=config.bias,
-        segment_len=config.segment_len,
-        num_persist_mem=config.num_persist_mem,
-        num_longterm_mem=config.num_longterm_mem,
-        memory_lr=config.memory_lr,
-        memory_momentum=config.memory_momentum,
-        memory_decay=config.memory_decay,
-    )
-
     iter_num = 0
     best_val_loss = 1e9
 
     if config.init_from == "scratch":
+        model_config = TitansConfig(
+            block_size=config.block_size,
+            vocab_size=50304,  # GPT-2 vocab
+            n_layer=config.n_layer,
+            n_head=config.n_head,
+            n_embd=config.n_embd,
+            dropout=config.dropout,
+            bias=config.bias,
+            segment_len=config.segment_len,
+            num_persist_mem=config.num_persist_mem,
+            num_longterm_mem=config.num_longterm_mem,
+            memory_lr=config.memory_lr,
+            memory_momentum=config.memory_momentum,
+            memory_decay=config.memory_decay,
+            adaptive_memory=config.adaptive_memory,
+        )
         print("Initializing model from scratch")
         model = TitansGPT(model_config)
     elif config.init_from == "resume":
         print(f"Resuming from {config.out_dir}")
         ckpt_path = Path(config.out_dir) / "ckpt.pt"
         checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+        # Use saved model config to ensure architecture matches
+        model_config = checkpoint["model_config"]
+        print(f"  Restored model config: n_layer={model_config.n_layer}, n_embd={model_config.n_embd}")
+        # Handle old checkpoints that don't have adaptive_memory
+        if not hasattr(model_config, "adaptive_memory"):
+            model_config.adaptive_memory = False
+            print("  Note: Checkpoint predates adaptive memory, using adaptive_memory=False")
         model = TitansGPT(model_config)
         state_dict = checkpoint["model"]
         # Fix state dict if compiled
@@ -309,6 +317,7 @@ def train(config: TrainConfig) -> None:
         model.load_state_dict(state_dict)
         iter_num = checkpoint["iter_num"]
         best_val_loss = checkpoint["best_val_loss"]
+        print(f"  Resuming from iteration {iter_num}, best_val_loss={best_val_loss:.4f}")
     else:
         msg = f"Unknown init_from: {config.init_from}"
         raise ValueError(msg)
@@ -505,6 +514,10 @@ def main() -> None:
     parser.add_argument("--memory_lr", type=float, default=0.01)
     parser.add_argument("--memory_momentum", type=float, default=0.9)
     parser.add_argument("--memory_decay", type=float, default=0.001)
+    parser.add_argument("--adaptive_memory", action="store_true", default=True,
+                        help="Use learned per-token lr/momentum/decay (default: True)")
+    parser.add_argument("--no_adaptive_memory", action="store_false", dest="adaptive_memory",
+                        help="Disable adaptive memory, use fixed lr/momentum/decay")
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--bias", action="store_true")
     parser.add_argument("--learning_rate", type=float, default=6e-4)
