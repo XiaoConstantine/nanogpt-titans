@@ -184,10 +184,7 @@ class _TritonCrossEntropy(torch.autograd.Function):
         # Compute per-sample grad_output (1/n for mean reduction)
         valid_mask = (targets >= 0) & (targets < n_cols)
         n_valid = valid_mask.sum()
-        if n_valid > 0:
-            grad_per_sample = grad_output / n_valid
-        else:
-            grad_per_sample = grad_output
+        grad_per_sample = grad_output / n_valid if n_valid > 0 else grad_output
 
         grad_output_expanded = torch.full(
             (n_rows,), grad_per_sample.item(), device=logits.device, dtype=logits.dtype

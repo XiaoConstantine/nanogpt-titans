@@ -395,8 +395,7 @@ class NeuralMemory(nn.Module):
         if not required_keys.issubset(weights.keys()):
             return None  # Fall back to vmap
 
-        B, T, C = keys.shape
-        H = self.hidden_dim
+        _B, _T, C = keys.shape
 
         # Extract weights (PyTorch Linear: weight is [out, in])
         W0 = weights['layers.0.weight']  # [B, H, C]

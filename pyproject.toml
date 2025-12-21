@@ -72,6 +72,22 @@ line-ending = "auto"
 [tool.ty.environment]
 python-version = "3.13"
 
+[tool.ty.rules]
+# Triton is optional and may not be installed
+unresolved-import = "ignore"
+# Runtime guards (if _TRITON_AVAILABLE) aren't understood by static analysis
+call-non-callable = "ignore"
+# nn.Module dynamic attributes
+unresolved-attribute = "ignore"
+# torch.compile wrapper reassignment
+invalid-assignment = "ignore"
+# autograd.Function backward signature
+invalid-method-override = "ignore"
+# Optional types with runtime guards
+invalid-argument-type = "ignore"
+invalid-return-type = "ignore"
+possibly-missing-attribute = "ignore"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]

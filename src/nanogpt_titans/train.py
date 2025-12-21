@@ -148,7 +148,6 @@ def estimate_flops_per_iter(config: TrainConfig, num_params: int) -> float:
     transformer_flops = 6 * num_params * tokens
 
     # Titans memory overhead (only on memory layer, per segment)
-    num_segments = config.block_size // config.segment_len
     hidden_dim = config.n_embd * 2  # memory_expansion default
     memory_flops_per_token = 6 * hidden_dim * config.n_embd  # MLP forward + gradient
 
@@ -159,7 +158,7 @@ def estimate_flops_per_iter(config: TrainConfig, num_params: int) -> float:
     return transformer_flops + memory_flops
 
 
-def get_peak_tflops(device_type: str, dtype: str) -> float:
+def get_peak_tflops(device_type: str, _dtype: str) -> float:
     """Get theoretical peak TFLOPS for common GPUs."""
     # BF16/FP16 tensor core peaks (approximate)
     gpu_peaks = {
