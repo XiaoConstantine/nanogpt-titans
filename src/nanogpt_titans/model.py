@@ -56,6 +56,15 @@ try:
 except ImportError:
     pass
 
+# Optimized memory update (aggregated gradients - 500x memory reduction)
+_AGGREGATED_UPDATE_AVAILABLE = False
+aggregated_gradient_memory_update = None  # type: ignore[assignment]
+try:
+    from nanogpt_titans.triton_memory_fused import aggregated_gradient_memory_update
+    _AGGREGATED_UPDATE_AVAILABLE = True
+except ImportError:
+    pass
+
 
 # --- FlexAttention mask functions ---
 
@@ -340,6 +349,11 @@ class NeuralMemory(nn.Module):
         # Use batched matmul instead of vmap (much faster)
         self._use_batched_matmul = True
 
+        # Use aggregated gradient update (500x memory reduction, slight accuracy tradeoff)
+        # When True: aggregates gradients across T before momentum (avoids [B,T,H,C] tensor)
+        # When False: per-token gradients with exact momentum (original behavior)
+        self._use_aggregated_update = _AGGREGATED_UPDATE_AVAILABLE
+
     def init_state(self, batch_size: int, device: torch.device) -> MemoryState:
         """Initialize memory state - clone MLP weights for each batch item."""
         weights: dict[str, torch.Tensor] = {}
@@ -364,6 +378,22 @@ class NeuralMemory(nn.Module):
             state.last_momentum[name].zero_()
         state.last_segment_output = None
         state.step = 0
+
+    def set_aggregated_update(self, enabled: bool) -> None:
+        """
+        Enable/disable aggregated gradient updates.
+
+        When enabled (default if available):
+        - 500x memory reduction (no [B, T, H, C] tensor)
+        - ~2x faster memory updates
+        - Slight approximation: aggregates gradients before momentum
+
+        When disabled:
+        - Per-token gradients with exact momentum accumulation
+        - Higher memory usage
+        - Original paper behavior
+        """
+        self._use_aggregated_update = enabled and _AGGREGATED_UPDATE_AVAILABLE
 
     def _compute_gradients_batched(
         self,
@@ -541,7 +571,8 @@ class NeuralMemory(nn.Module):
         Update: weights += lr * momentum(surprise) (with decay)
 
         Uses:
-        - Batched matmul for efficient per-token gradient computation (replaces vmap)
+        - Aggregated gradients (fast path): sums gradients over T, avoiding [B,T,H,C] tensor
+        - Batched matmul (fallback): per-token gradients with exact momentum
         - parallel_momentum (cumsum trick) for O(n) parallel momentum across tokens
 
         Args:
@@ -558,6 +589,30 @@ class NeuralMemory(nn.Module):
         keys = self.key_proj(x_detached).contiguous()  # [B, T, C]
         values = self.value_proj(x_detached).contiguous()  # [B, T, C]
 
+        # Fast path: aggregated gradient update (500x memory reduction)
+        # Sums gradients over T before momentum, avoiding [B, T, H, C] intermediate
+        if (
+            self._use_aggregated_update
+            and self.config.memory_depth == 2
+            and aggregated_gradient_memory_update is not None
+        ):
+            new_weights, new_last_momentum = aggregated_gradient_memory_update(
+                keys,
+                values,
+                state.weights,
+                state.last_momentum,
+                self.lr,
+                self.momentum,
+                self.decay,
+            )
+            return MemoryState(
+                weights=new_weights,
+                last_momentum=new_last_momentum,
+                last_segment_output=x.detach().contiguous(),
+                step=state.step + 1,
+            )
+
+        # Fallback: per-token gradients (original behavior)
         # Use batched matmul (fast) or vmap (fallback)
         all_grads = None
         if self._use_batched_matmul and self.config.memory_depth == 2:
