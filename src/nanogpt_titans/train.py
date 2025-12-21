@@ -276,6 +276,7 @@ def train(config: TrainConfig) -> None:
     # Model
     iter_num = 0
     best_val_loss = 1e9
+    upgraded_model = False  # Track if model architecture changed (optimizer state incompatible)
 
     if config.init_from == "scratch":
         model_config = TitansConfig(
@@ -339,6 +340,7 @@ def train(config: TrainConfig) -> None:
         iter_num = checkpoint["iter_num"]
         best_val_loss = checkpoint["best_val_loss"]
         print(f"  Resuming from iteration {iter_num}, best_val_loss={best_val_loss:.4f}")
+        upgraded_model = upgrade_to_adaptive
     else:
         msg = f"Unknown init_from: {config.init_from}"
         raise ValueError(msg)
@@ -354,8 +356,11 @@ def train(config: TrainConfig) -> None:
         device_type=device_type,
     )
 
-    if config.init_from == "resume" and "optimizer" in checkpoint:
+    if config.init_from == "resume" and "optimizer" in checkpoint and not upgraded_model:
         optimizer.load_state_dict(checkpoint["optimizer"])
+    elif upgraded_model:
+        print("  Skipping optimizer state (incompatible due to model upgrade)")
+        print("  Optimizer will start fresh for new parameters")
 
     # Compile
     if config.compile:
