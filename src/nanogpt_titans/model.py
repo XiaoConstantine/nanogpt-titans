@@ -240,10 +240,13 @@ class TitansConfig:
     memory_expansion: int = 2  # hidden dim multiplier (2 = n_embd*2, reduced from 4 for memory)
     num_persist_mem: int = 4  # persistent memory tokens
     num_longterm_mem: int = 16  # long-term memory tokens retrieved
-    memory_lr: float = 0.01  # learning rate for surprise-based updates
-    memory_momentum: float = 0.9  # momentum for past surprise
-    memory_decay: float = 0.001  # forgetting/decay factor
+    memory_lr: float = 0.01  # learning rate for surprise-based updates (used when adaptive=False)
+    memory_momentum: float = 0.9  # momentum for past surprise (used when adaptive=False)
+    memory_decay: float = 0.001  # forgetting/decay factor (used when adaptive=False)
     memory_layer: int = -1  # which layer has memory (-1 = middle layer, -2 = all layers)
+    # Adaptive memory parameters (paper approach)
+    adaptive_memory: bool = True  # use learned lr/momentum/decay per token
+    memory_lr_max: float = 0.01  # max learning rate for adaptive mode (sigmoid scaled)
 
 
 class LayerNorm(nn.Module):
@@ -337,10 +340,38 @@ class NeuralMemory(nn.Module):
         # Learned initial query for first segment (when no previous output exists)
         self.init_query = nn.Parameter(torch.randn(1, 1, config.n_embd) * 0.02)
 
-        # Hyperparameters for test-time learning
+        # Hyperparameters for test-time learning (used when adaptive=False)
         self.lr = config.memory_lr  # type: ignore[assignment]
         self.momentum = config.memory_momentum  # type: ignore[assignment]
         self.decay = config.memory_decay  # type: ignore[assignment]
+
+        # Adaptive memory parameters (paper approach)
+        # When enabled, lr/momentum/decay are predicted per-token from input
+        self.adaptive = config.adaptive_memory  # type: ignore[assignment]
+        self.lr_max = config.memory_lr_max  # type: ignore[assignment]
+
+        if self.adaptive:
+            # Projections to predict adaptive parameters from input
+            # Each outputs a scalar per token, passed through sigmoid
+            # to_lr: sigmoid(proj(x)) * lr_max -> per-token learning rate
+            # to_momentum: sigmoid(proj(x)) -> per-token momentum (0-1)
+            # to_decay: sigmoid(proj(x)) -> per-token decay/forgetting (0-1)
+            self.to_lr = nn.Linear(config.n_embd, 1, bias=config.bias)
+            self.to_momentum = nn.Linear(config.n_embd, 1, bias=config.bias)
+            self.to_decay = nn.Linear(config.n_embd, 1, bias=config.bias)
+
+            # Initialize with small weights for stable training
+            # Bias initialized so sigmoid outputs reasonable defaults
+            nn.init.zeros_(self.to_lr.weight)
+            nn.init.zeros_(self.to_momentum.weight)
+            nn.init.zeros_(self.to_decay.weight)
+            if config.bias:
+                # sigmoid(0) = 0.5, so lr starts at 0.5 * lr_max
+                nn.init.zeros_(self.to_lr.bias)
+                # sigmoid(2) ≈ 0.88, good default for momentum
+                nn.init.constant_(self.to_momentum.bias, 2.0)
+                # sigmoid(-4) ≈ 0.018, good default for decay
+                nn.init.constant_(self.to_decay.bias, -4.0)
 
         # Cache vmapped functions for performance (fallback only)
         self._batched_mlp_forward: callable | None = None  # type: ignore[valid-type]
@@ -394,6 +425,26 @@ class NeuralMemory(nn.Module):
         - Original paper behavior
         """
         self._use_aggregated_update = enabled and _AGGREGATED_UPDATE_AVAILABLE
+
+    def set_adaptive(self, enabled: bool) -> None:
+        """
+        Enable/disable adaptive memory parameters.
+
+        When enabled (default):
+        - Learning rate, momentum, decay are predicted per-token from input
+        - Model learns when to remember vs forget
+        - Matches paper approach (lucidrains implementation)
+
+        When disabled:
+        - Uses fixed hyperparameters (memory_lr, memory_momentum, memory_decay)
+        - Simpler, may be more stable for debugging
+        """
+        if enabled and not hasattr(self, 'to_lr'):
+            raise ValueError(
+                "Adaptive mode requires projection layers. "
+                "Set adaptive_memory=True in config when creating the model."
+            )
+        self.adaptive = enabled
 
     def _compute_gradients_batched(
         self,
@@ -589,6 +640,21 @@ class NeuralMemory(nn.Module):
         keys = self.key_proj(x_detached).contiguous()  # [B, T, C]
         values = self.value_proj(x_detached).contiguous()  # [B, T, C]
 
+        # Compute adaptive parameters if enabled
+        if self.adaptive:
+            # Per-token adaptive parameters via learned projections
+            # Each projection outputs [B, T, 1], passed through sigmoid
+            adaptive_lr = torch.sigmoid(self.to_lr(x_detached)) * self.lr_max  # [B, T, 1]
+            adaptive_momentum = torch.sigmoid(self.to_momentum(x_detached))     # [B, T, 1]
+            adaptive_decay = torch.sigmoid(self.to_decay(x_detached))           # [B, T, 1]
+            lr_param = adaptive_lr
+            mom_param = adaptive_momentum
+            decay_param = adaptive_decay
+        else:
+            lr_param = self.lr
+            mom_param = self.momentum
+            decay_param = self.decay
+
         # Fast path: aggregated gradient update (500x memory reduction)
         # Sums gradients over T before momentum, avoiding [B, T, H, C] intermediate
         if (
@@ -601,9 +667,9 @@ class NeuralMemory(nn.Module):
                 values,
                 state.weights,
                 state.last_momentum,
-                self.lr,
-                self.momentum,
-                self.decay,
+                lr_param,
+                mom_param,
+                decay_param,
             )
             return MemoryState(
                 weights=new_weights,
@@ -1109,12 +1175,23 @@ class TitansGPT(nn.Module):
         )
 
     def _init_weights(self, module: nn.Module) -> None:
-        if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        match module:
+            case NeuralMemory() if module.adaptive:
+                # Re-initialize adaptive projection biases after general init
+                # These need specific values for reasonable default behavior
+                nn.init.zeros_(module.to_lr.weight)
+                nn.init.zeros_(module.to_momentum.weight)
+                nn.init.zeros_(module.to_decay.weight)
+                if module.to_lr.bias is not None:
+                    nn.init.zeros_(module.to_lr.bias)  # sigmoid(0)=0.5 -> lr starts at 0.5*lr_max
+                    nn.init.constant_(module.to_momentum.bias, 2.0)  # sigmoid(2)≈0.88
+                    nn.init.constant_(module.to_decay.bias, -4.0)    # sigmoid(-4)≈0.018
+            case nn.Linear():
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            case nn.Embedding():
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def get_num_params(self, *, non_embedding: bool = True) -> int:
         """Return the number of parameters in the model."""

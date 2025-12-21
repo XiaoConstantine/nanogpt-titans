@@ -142,9 +142,9 @@ def aggregated_gradient_memory_update(
     values: torch.Tensor,         # [B, T, C]
     weights: dict[str, torch.Tensor],
     momentum: dict[str, torch.Tensor],
-    lr: float,
-    mom_coef: float,
-    decay: float,
+    lr: float | torch.Tensor,
+    mom_coef: float | torch.Tensor,
+    decay: float | torch.Tensor,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     """
     Memory update with aggregated gradients (no per-token storage).
@@ -170,9 +170,9 @@ def aggregated_gradient_memory_update(
         values: [B, T, C] target values
         weights: Current MLP weights {name: [B, *shape]}
         momentum: Current momentum state {name: [B, *shape]}
-        lr: Learning rate for memory update
-        mom_coef: Momentum coefficient (e.g., 0.9)
-        decay: Weight decay coefficient
+        lr: Learning rate - float or [B, T, 1] adaptive tensor
+        mom_coef: Momentum coefficient - float or [B, T, 1] adaptive tensor
+        decay: Weight decay - float or [B, T, 1] adaptive tensor
 
     Returns:
         (new_weights, new_momentum)
@@ -217,22 +217,48 @@ def aggregated_gradient_memory_update(
         db0_agg = dh1_pre.sum(dim=1)  # [B, H]
         db1_agg = d_pred.sum(dim=1)   # [B, C]
 
+    # Handle adaptive parameters (tensors) vs fixed (floats)
+    # For adaptive: use mean across T for the aggregated path
+    if isinstance(lr, torch.Tensor):
+        # lr is [B, T, 1], take mean -> [B, 1, 1] for broadcasting
+        lr = lr.mean(dim=1, keepdim=True)  # [B, 1, 1]
+    if isinstance(mom_coef, torch.Tensor):
+        mom_coef = mom_coef.mean(dim=1, keepdim=True)  # [B, 1, 1]
+    if isinstance(decay, torch.Tensor):
+        decay = decay.mean(dim=1, keepdim=True)  # [B, 1, 1]
+
     # Momentum update with aggregated gradient
     # Scale by 1/T to get mean gradient
     one_minus_mom = 1.0 - mom_coef
     decay_factor = 1.0 - decay
     scale = 1.0 / T
 
-    new_mom_W0 = mom_coef * momentum['layers.0.weight'] + one_minus_mom * dW0_agg * scale
-    new_mom_W1 = mom_coef * momentum['layers.1.weight'] + one_minus_mom * dW1_agg * scale
+    # For tensor params, need to reshape for broadcasting with [B, H, C] weights
+    if isinstance(mom_coef, torch.Tensor):
+        # mom_coef is [B, 1, 1], works with [B, H, C]
+        new_mom_W0 = mom_coef * momentum['layers.0.weight'] + one_minus_mom * dW0_agg * scale
+        new_mom_W1 = mom_coef * momentum['layers.1.weight'] + one_minus_mom * dW1_agg * scale
+    else:
+        new_mom_W0 = mom_coef * momentum['layers.0.weight'] + one_minus_mom * dW0_agg * scale
+        new_mom_W1 = mom_coef * momentum['layers.1.weight'] + one_minus_mom * dW1_agg * scale
 
     if has_bias:
-        new_mom_b0 = mom_coef * momentum['layers.0.bias'] + one_minus_mom * db0_agg * scale
-        new_mom_b1 = mom_coef * momentum['layers.1.bias'] + one_minus_mom * db1_agg * scale
+        if isinstance(mom_coef, torch.Tensor):
+            mom_coef_bias = mom_coef.squeeze(-1)  # [B, 1] for [B, H] bias
+            one_minus_mom_bias = 1.0 - mom_coef_bias
+            new_mom_b0 = mom_coef_bias * momentum['layers.0.bias'] + one_minus_mom_bias * db0_agg * scale
+            new_mom_b1 = mom_coef_bias * momentum['layers.1.bias'] + one_minus_mom_bias * db1_agg * scale
+        else:
+            new_mom_b0 = mom_coef * momentum['layers.0.bias'] + one_minus_mom * db0_agg * scale
+            new_mom_b1 = mom_coef * momentum['layers.1.bias'] + one_minus_mom * db1_agg * scale
 
     # Weight update
-    new_W0 = decay_factor * W0 - lr * new_mom_W0
-    new_W1 = decay_factor * W1 - lr * new_mom_W1
+    if isinstance(decay_factor, torch.Tensor) or isinstance(lr, torch.Tensor):
+        new_W0 = decay_factor * W0 - lr * new_mom_W0
+        new_W1 = decay_factor * W1 - lr * new_mom_W1
+    else:
+        new_W0 = decay_factor * W0 - lr * new_mom_W0
+        new_W1 = decay_factor * W1 - lr * new_mom_W1
 
     new_weights = {
         'layers.0.weight': new_W0.detach(),
@@ -244,8 +270,14 @@ def aggregated_gradient_memory_update(
     }
 
     if has_bias:
-        new_b0 = decay_factor * b0 - lr * new_mom_b0
-        new_b1 = decay_factor * b1 - lr * new_mom_b1
+        if isinstance(decay_factor, torch.Tensor) or isinstance(lr, torch.Tensor):
+            decay_factor_bias = decay_factor.squeeze(-1) if isinstance(decay_factor, torch.Tensor) else decay_factor
+            lr_bias = lr.squeeze(-1) if isinstance(lr, torch.Tensor) else lr
+            new_b0 = decay_factor_bias * b0 - lr_bias * new_mom_b0
+            new_b1 = decay_factor_bias * b1 - lr_bias * new_mom_b1
+        else:
+            new_b0 = decay_factor * b0 - lr * new_mom_b0
+            new_b1 = decay_factor * b1 - lr * new_mom_b1
         new_weights['layers.0.bias'] = new_b0.detach()
         new_weights['layers.1.bias'] = new_b1.detach()
         new_momentum_dict['layers.0.bias'] = new_mom_b0.detach()
