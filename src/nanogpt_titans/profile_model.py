@@ -215,20 +215,21 @@ def profile_with_torch_profiler(
     }
 
     for e in prof.key_averages():
-        cuda_time = getattr(e, "cuda_time_total", 0) or 0
+        # Use self_cuda_time_total (actual kernel time, not including child calls)
+        cuda_time = e.self_cuda_time_total
         if cuda_time <= 0:
             continue
 
         key = e.key.lower()
-        if "attention" in key or "softmax" in key or "flash" in key:
+        if "attention" in key or "softmax" in key or "flash" in key or "sdpa" in key:
             categories["attention"] += cuda_time
-        elif "gemm" in key or "matmul" in key or "mm" in key or "addmm" in key:
+        elif "gemm" in key or "matmul" in key or "aten::mm" in key or "addmm" in key:
             categories["matmul/gemm"] += cuda_time
-        elif "_fused_weight_update" in key or "_momentum_update" in key or "_cross_entropy" in key:
+        elif "triton" in key or "_cross_entropy" in key or "_fused" in key:
             categories["triton_custom"] += cuda_time
         elif "copy" in key or "cat" in key or "memcpy" in key or "memset" in key:
             categories["memory_ops"] += cuda_time
-        elif "elementwise" in key or "add" in key or "mul" in key:
+        elif "elementwise" in key or "aten::add" in key or "aten::mul" in key or "foreach" in key:
             categories["elementwise"] += cuda_time
         else:
             categories["other"] += cuda_time
