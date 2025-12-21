@@ -210,38 +210,32 @@ def profile_with_torch_profiler(
         "matmul/gemm": 0.0,
         "memory_ops": 0.0,
         "elementwise": 0.0,
-        "triton_custom": 0.0,
+        "triton/fused": 0.0,
+        "optimizer": 0.0,
         "other": 0.0,
     }
 
-    # Debug: print first few events to see attribute structure
-    events = list(prof.key_averages())
-    if events:
-        e0 = events[0]
-        print(f"\nDebug - Event attributes: cuda_time_total={getattr(e0, 'cuda_time_total', 'N/A')}, "
-              f"self_cuda_time_total={getattr(e0, 'self_cuda_time_total', 'N/A')}, "
-              f"device_time_total={getattr(e0, 'device_time_total', 'N/A')}")
-
-    for e in events:
-        # Get CUDA time - try device_time_total first (newer PyTorch), then cuda_time_total
+    for e in prof.key_averages():
+        # Get device time (works across PyTorch versions)
         cuda_time = getattr(e, "device_time_total", 0) or 0
         if cuda_time <= 0:
             cuda_time = getattr(e, "cuda_time_total", 0) or 0
         if cuda_time <= 0:
-            cuda_time = getattr(e, "self_cuda_time_total", 0) or 0
-        if cuda_time <= 0:
             continue
 
         key = e.key.lower()
-        if "attention" in key or "softmax" in key or "flash" in key or "sdpa" in key:
+        # Categorize by operation type
+        if "attention" in key or "softmax" in key or "flash" in key or "sdpa" in key or "flex" in key:
             categories["attention"] += cuda_time
-        elif "gemm" in key or "matmul" in key or "mm" in key or "addmm" in key:
+        elif "gemm" in key or "matmul" in key or "::mm" in key or "addmm" in key or "bmm" in key:
             categories["matmul/gemm"] += cuda_time
-        elif "triton" in key or "cross_entropy" in key or "fused_adamw" in key:
-            categories["triton_custom"] += cuda_time
-        elif "copy" in key or "cat" in key or "memcpy" in key or "memset" in key:
+        elif "adamw" in key or "adam" in key or "optimizer" in key:
+            categories["optimizer"] += cuda_time
+        elif "triton" in key or "cross_entropy" in key:
+            categories["triton/fused"] += cuda_time
+        elif "copy" in key or "memcpy" in key or "memset" in key or "to_copy" in key:
             categories["memory_ops"] += cuda_time
-        elif "elementwise" in key or "add_" in key or "mul_" in key or "foreach" in key:
+        elif "elementwise" in key or "add_" in key or "mul_" in key or "foreach" in key or "vectorized" in key:
             categories["elementwise"] += cuda_time
         else:
             categories["other"] += cuda_time
