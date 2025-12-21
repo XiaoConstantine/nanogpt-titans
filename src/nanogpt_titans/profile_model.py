@@ -214,6 +214,7 @@ def profile_with_torch_profiler(
         "optimizer": 0.0,
         "other": 0.0,
     }
+    other_ops: list[tuple[str, float]] = []  # Track what goes into "other"
 
     for e in prof.key_averages():
         # Get device time (works across PyTorch versions)
@@ -239,6 +240,7 @@ def profile_with_torch_profiler(
             categories["elementwise"] += cuda_time
         else:
             categories["other"] += cuda_time
+            other_ops.append((e.key, cuda_time))
 
     total = sum(categories.values())
     print(f"\n{'Category':<20} {'Time (ms)':<12} {'%':<8}")
@@ -249,6 +251,13 @@ def profile_with_torch_profiler(
         print(f"{cat:<20} {time_ms:<12.2f} {pct:<8.1f}")
     print("-" * 40)
     print(f"{'Total':<20} {total / 1000:<12.2f}")
+
+    # Show top operations in "other" category
+    if other_ops:
+        print("\nTop operations in 'other' category:")
+        other_ops.sort(key=lambda x: -x[1])
+        for op_name, op_time in other_ops[:10]:  # Top 10
+            print(f"  {op_time/1000:>8.2f} ms  {op_name[:60]}")
 
 
 def main() -> None:
