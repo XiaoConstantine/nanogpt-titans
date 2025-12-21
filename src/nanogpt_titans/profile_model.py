@@ -215,8 +215,10 @@ def profile_with_torch_profiler(
     }
 
     for e in prof.key_averages():
-        # Use self_cuda_time_total (actual kernel time, not including child calls)
-        cuda_time = e.self_cuda_time_total
+        # Get CUDA time - try different attribute names for compatibility
+        cuda_time = getattr(e, "self_cuda_time_total", None)
+        if cuda_time is None:
+            cuda_time = getattr(e, "cuda_time_total", 0)
         if cuda_time <= 0:
             continue
 
