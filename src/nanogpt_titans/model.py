@@ -41,9 +41,11 @@ except ImportError:
 _TRITON_AVAILABLE = False
 triton_momentum_update = None  # type: ignore[assignment]
 triton_fused_weight_update = None  # type: ignore[assignment]
+triton_batched_weight_update = None  # type: ignore[assignment]
 triton_cross_entropy = None  # type: ignore[assignment]
 try:
     from nanogpt_titans.triton_kernels import (
+        triton_batched_weight_update,
         triton_cross_entropy,
         triton_fused_weight_update,
         triton_momentum_update,
@@ -405,9 +407,9 @@ class NeuralMemory(nn.Module):
         b0 = weights.get('layers.0.bias')  # [B, H] or None
         b1 = weights.get('layers.1.bias')  # [B, C] or None
 
-        # Forward pass (batched over all tokens)
-        # h1_pre = keys @ W0.T + b0 = einsum('btc,bhc->bth', keys, W0) + b0
-        h1_pre = torch.einsum('btc,bhc->bth', keys, W0)  # [B, T, H]
+        # Forward pass using bmm (faster than einsum)
+        # h1_pre = keys @ W0.T = [B, T, C] @ [B, C, H] = [B, T, H]
+        h1_pre = torch.bmm(keys, W0.transpose(-1, -2))
         if b0 is not None:
             h1_pre = h1_pre + b0.unsqueeze(1)
 
@@ -415,31 +417,28 @@ class NeuralMemory(nn.Module):
         sig_h1 = torch.sigmoid(h1_pre)
         h1 = h1_pre * sig_h1  # [B, T, H]
 
-        # Output layer: pred = h1 @ W1.T + b1
-        pred = torch.einsum('bth,bch->btc', h1, W1)  # [B, T, C]
+        # Output layer: pred = h1 @ W1.T = [B, T, H] @ [B, H, C] = [B, T, C]
+        pred = torch.bmm(h1, W1.transpose(-1, -2))
         if b1 is not None:
             pred = pred + b1.unsqueeze(1)
 
-        # MSE gradient: d_pred = 2 * (pred - values) / C
-        # We absorb the 2/C factor into the learning rate for efficiency
+        # MSE gradient
         d_pred = pred - values  # [B, T, C]
 
-        # Backprop through output layer
-        # dW1[b,t,c,h] = d_pred[b,t,c] * h1[b,t,h] (outer product per token)
-        dW1 = torch.einsum('btc,bth->btch', d_pred, h1)  # [B, T, C, H]
+        # Backprop through output layer - outer product via broadcasting
+        # dW1[b,t,c,h] = d_pred[b,t,c] * h1[b,t,h]
+        dW1 = d_pred.unsqueeze(-1) * h1.unsqueeze(-2)  # [B, T, C, H]
 
-        # dh1 = d_pred @ W1
-        dh1 = torch.einsum('btc,bch->bth', d_pred, W1)  # [B, T, H]
+        # dh1 = d_pred @ W1 = [B, T, C] @ [B, C, H] = [B, T, H]
+        dh1 = torch.bmm(d_pred, W1)
 
         # Backprop through SiLU
-        # silu'(x) = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
-        #          = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
         silu_grad = sig_h1 * (1 + h1_pre * (1 - sig_h1))
         dh1_pre = dh1 * silu_grad  # [B, T, H]
 
-        # Backprop through input layer
-        # dW0[b,t,h,c] = dh1_pre[b,t,h] * keys[b,t,c] (outer product per token)
-        dW0 = torch.einsum('bth,btc->bthc', dh1_pre, keys)  # [B, T, H, C]
+        # Backprop through input layer - outer product via broadcasting
+        # dW0[b,t,h,c] = dh1_pre[b,t,h] * keys[b,t,c]
+        dW0 = dh1_pre.unsqueeze(-1) * keys.unsqueeze(-2)  # [B, T, H, C]
 
         # Build result dict
         result = {
@@ -593,21 +592,37 @@ class NeuralMemory(nn.Module):
                 all_grads = self._batched_grad_fn(params_for_grad, keys, values)
 
         # Apply updates with parallel momentum
-        # Check if we can use the fused Triton kernel
+        # Check if we can use the batched Triton kernel (single kernel for all params)
         first_grad = next(iter(all_grads.values()))
-        use_fused = (
+        use_batched = (
             _TRITON_AVAILABLE
             and first_grad.is_cuda
-            and triton_fused_weight_update is not None
+            and triton_batched_weight_update is not None
         )
 
-        if use_fused:
-            # Fused Triton kernel: momentum + weight update per parameter
-            new_weights: dict[str, torch.Tensor] = {}
-            new_last_momentum: dict[str, torch.Tensor] = {}
+        if use_batched:
+            # Single kernel launch for ALL parameters - most efficient
+            grads_contig = {name: g.contiguous() for name, g in all_grads.items()}
+            weights_contig = {name: w.contiguous() for name, w in state.weights.items()}
+            momentum_contig = {name: m.contiguous() for name, m in state.last_momentum.items()}
+
+            new_weights, new_last_momentum = triton_batched_weight_update(
+                weights_contig,
+                grads_contig,
+                momentum_contig,
+                self.lr,
+                self.momentum,
+                self.decay,
+            )
+            # Detach outputs
+            new_weights = {name: w.detach() for name, w in new_weights.items()}
+            new_last_momentum = {name: m.detach() for name, m in new_last_momentum.items()}
+        elif _TRITON_AVAILABLE and first_grad.is_cuda and triton_fused_weight_update is not None:
+            # Fallback: per-parameter Triton kernel
+            new_weights = {}
+            new_last_momentum = {}
 
             for name in state.weights:
-                # Ensure contiguous inputs for Triton kernel
                 grads = all_grads[name].contiguous()
                 weights_in = state.weights[name].contiguous()
                 momentum_in = state.last_momentum[name].contiguous()
