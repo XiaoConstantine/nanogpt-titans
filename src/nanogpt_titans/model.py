@@ -305,6 +305,7 @@ class NeuralMemory(nn.Module):
         # Template MLP - its weights are cloned per-sequence as initial memory
         # Use smaller hidden_dim for memory efficiency
         hidden_dim = config.n_embd * config.memory_expansion
+        self.hidden_dim = hidden_dim  # Cache for batched gradient computation
         self.memory_mlp = MemoryMLP(
             dim=config.n_embd,
             hidden_dim=hidden_dim,
@@ -330,9 +331,12 @@ class NeuralMemory(nn.Module):
         self.momentum = config.memory_momentum  # type: ignore[assignment]
         self.decay = config.memory_decay  # type: ignore[assignment]
 
-        # Cache vmapped functions for performance
+        # Cache vmapped functions for performance (fallback only)
         self._batched_mlp_forward: callable | None = None  # type: ignore[valid-type]
         self._batched_grad_fn: callable | None = None  # type: ignore[valid-type]
+
+        # Use batched matmul instead of vmap (much faster)
+        self._use_batched_matmul = True
 
     def init_state(self, batch_size: int, device: torch.device) -> MemoryState:
         """Initialize memory state - clone MLP weights for each batch item."""
@@ -358,6 +362,81 @@ class NeuralMemory(nn.Module):
             state.last_momentum[name].zero_()
         state.last_segment_output = None
         state.step = 0
+
+    def _compute_gradients_batched(
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        weights: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """
+        Compute per-token MSE gradients using batched matrix operations.
+
+        This replaces vmap with efficient einsum operations, reducing
+        O(B*T) small kernel launches to O(1) large matrix operations.
+
+        For 2-layer MLP with SiLU activation:
+            h1 = silu(keys @ W0.T + b0)
+            pred = h1 @ W1.T + b1
+            loss = MSE(pred, values)
+
+        Args:
+            keys: Input keys [B, T, C]
+            values: Target values [B, T, C]
+            weights: Per-batch MLP weights {name: [B, *param_shape]}
+
+        Returns:
+            Gradients {name: [B, T, *param_shape]}
+        """
+        B, T, C = keys.shape
+        H = self.hidden_dim
+
+        # Extract weights (PyTorch Linear: weight is [out, in])
+        W0 = weights['layers.0.weight']  # [B, H, C]
+        b0 = weights['layers.0.bias']    # [B, H]
+        W1 = weights['layers.1.weight']  # [B, C, H]
+        b1 = weights['layers.1.bias']    # [B, C]
+
+        # Forward pass (batched over all tokens)
+        # h1_pre = keys @ W0.T + b0 = einsum('btc,bhc->bth', keys, W0) + b0
+        h1_pre = torch.einsum('btc,bhc->bth', keys, W0) + b0.unsqueeze(1)  # [B, T, H]
+
+        # SiLU activation: silu(x) = x * sigmoid(x)
+        sig_h1 = torch.sigmoid(h1_pre)
+        h1 = h1_pre * sig_h1  # [B, T, H]
+
+        # Output layer: pred = h1 @ W1.T + b1
+        pred = torch.einsum('bth,bch->btc', h1, W1) + b1.unsqueeze(1)  # [B, T, C]
+
+        # MSE gradient: d_pred = 2 * (pred - values) / C
+        # We absorb the 2/C factor into the learning rate for efficiency
+        d_pred = pred - values  # [B, T, C]
+
+        # Backprop through output layer
+        # dW1[b,t,c,h] = d_pred[b,t,c] * h1[b,t,h] (outer product per token)
+        dW1 = torch.einsum('btc,bth->btch', d_pred, h1)  # [B, T, C, H]
+        db1 = d_pred  # [B, T, C]
+
+        # dh1 = d_pred @ W1
+        dh1 = torch.einsum('btc,bch->bth', d_pred, W1)  # [B, T, H]
+
+        # Backprop through SiLU
+        # silu'(x) = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
+        #          = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+        silu_grad = sig_h1 * (1 + h1_pre * (1 - sig_h1))
+        dh1_pre = dh1 * silu_grad  # [B, T, H]
+
+        # Backprop through input layer
+        # dW0[b,t,h,c] = dh1_pre[b,t,h] * keys[b,t,c] (outer product per token)
+        dW0 = torch.einsum('bth,btc->bthc', dh1_pre, keys)  # [B, T, H, C]
+        db0 = dh1_pre  # [B, T, H]
+
+        return {
+            'layers.0.weight': dW0,
+            'layers.0.bias': db0,
+            'layers.1.weight': dW1,
+            'layers.1.bias': db1,
+        }
 
     def _forward_with_weights(
         self,
@@ -417,13 +496,22 @@ class NeuralMemory(nn.Module):
         weights_contig = {k: v.contiguous() for k, v in state.weights.items()}
         retrieved = self._batched_mlp_forward(weights_contig, queries)  # [B, T_prev, C]
 
-        # Pool to num_longterm_mem tokens - use reshape to avoid transpose
+        # Pool to num_longterm_mem tokens
         B, T_prev, C = retrieved.shape
         if T_prev != self.num_longterm_mem:
-            # Reshape: [B, T_prev, C] -> [B, C, T_prev] -> pool -> [B, C, mem] -> [B, mem, C]
-            retrieved = F.adaptive_avg_pool1d(
-                retrieved.transpose(1, 2).contiguous(), self.num_longterm_mem
-            ).transpose(1, 2)
+            # Use chunk-based pooling instead of adaptive_avg_pool1d (MPS compatible)
+            # Divide T_prev into num_longterm_mem chunks and average each
+            if T_prev > self.num_longterm_mem:
+                # Truncate to divisible size, then reshape and mean
+                chunk_size = T_prev // self.num_longterm_mem
+                usable_len = chunk_size * self.num_longterm_mem
+                retrieved = retrieved[:, :usable_len, :]  # [B, usable_len, C]
+                retrieved = retrieved.view(B, self.num_longterm_mem, chunk_size, C).mean(dim=2)
+            else:
+                # Pad and reshape (rare case: T_prev < num_longterm_mem)
+                pad_len = self.num_longterm_mem - T_prev
+                padding = retrieved[:, -1:, :].expand(B, pad_len, C)
+                retrieved = torch.cat([retrieved, padding], dim=1)
         # else: T_prev == num_longterm_mem, no pooling needed
 
         return self.out_proj(retrieved)
@@ -441,7 +529,7 @@ class NeuralMemory(nn.Module):
         Update: weights += lr * momentum(surprise) (with decay)
 
         Uses:
-        - vmap for efficient vectorized per-sample gradient computation
+        - Batched matmul for efficient per-token gradient computation (replaces vmap)
         - parallel_momentum (cumsum trick) for O(n) parallel momentum across tokens
 
         Args:
@@ -458,36 +546,35 @@ class NeuralMemory(nn.Module):
         keys = self.key_proj(x_detached).contiguous()  # [B, T, C]
         values = self.value_proj(x_detached).contiguous()  # [B, T, C]
 
-        # Cache the batched gradient function (created once, reused)
-        if self._batched_grad_fn is None:
-            # Define loss function for a single token (no batch or time dim)
-            def single_token_loss(
-                params: dict[str, torch.Tensor], k: torch.Tensor, v: torch.Tensor
-            ) -> torch.Tensor:
-                # k, v: [C]
-                k = k.unsqueeze(0).unsqueeze(0)  # [1, 1, C]
-                v = v.unsqueeze(0).unsqueeze(0)  # [1, 1, C]
-                pred = torch.func.functional_call(self.memory_mlp, params, (k,))
-                return F.mse_loss(pred, v)
+        # Use batched matmul (fast) or vmap (fallback)
+        if self._use_batched_matmul and self.config.memory_depth == 2:
+            # Fast path: analytical gradient computation using batched matmul
+            # This replaces O(B*T) small vmap operations with O(1) large einsum operations
+            all_grads = self._compute_gradients_batched(keys, values, state.weights)
+        else:
+            # Fallback: vmap for non-standard MLP depths
+            if self._batched_grad_fn is None:
+                def single_token_loss(
+                    params: dict[str, torch.Tensor], k: torch.Tensor, v: torch.Tensor
+                ) -> torch.Tensor:
+                    k = k.unsqueeze(0).unsqueeze(0)
+                    v = v.unsqueeze(0).unsqueeze(0)
+                    pred = torch.func.functional_call(self.memory_mlp, params, (k,))
+                    return F.mse_loss(pred, v)
 
-            grad_fn = torch.func.grad(single_token_loss)
-            params_in_dims = dict.fromkeys(state.weights, 0)
+                grad_fn = torch.func.grad(single_token_loss)
+                params_in_dims = dict.fromkeys(state.weights, 0)
+                self._batched_grad_fn = torch.func.vmap(
+                    torch.func.vmap(grad_fn, in_dims=(None, 0, 0)),
+                    in_dims=(params_in_dims, 0, 0),
+                )
 
-            # First vmap over time (tokens), then over batch
-            self._batched_grad_fn = torch.func.vmap(
-                torch.func.vmap(grad_fn, in_dims=(None, 0, 0)),  # Over T tokens
-                in_dims=(params_in_dims, 0, 0),  # Over B batches
-            )
-
-        # Compute all per-token gradients in one vectorized call
-        # Result: {name: [B, T, *param_shape]} for each parameter
-        # Make weights contiguous and clone for grad tracking
-        with torch.enable_grad():
-            params_for_grad = {
-                name: w.contiguous().clone().requires_grad_(True)
-                for name, w in state.weights.items()
-            }
-            all_grads = self._batched_grad_fn(params_for_grad, keys, values)
+            with torch.enable_grad():
+                params_for_grad = {
+                    name: w.contiguous().clone().requires_grad_(True)
+                    for name, w in state.weights.items()
+                }
+                all_grads = self._batched_grad_fn(params_for_grad, keys, values)
 
         # Apply updates with parallel momentum
         # Check if we can use the fused Triton kernel
