@@ -47,8 +47,9 @@ def profile_training_iteration(
     )
     scaler = torch.amp.GradScaler(enabled=(dtype == torch.float16))
 
-    # Simple optimizer for profiling
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    # Simple optimizer for profiling (fused=True uses single CUDA kernel)
+    use_fused = device_type == "cuda"
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, fused=use_fused)
 
     model.train()  # Training mode, not eval!
 
@@ -141,7 +142,8 @@ def profile_with_torch_profiler(
         else torch.amp.autocast(device_type=device_type, dtype=dtype)
     )
     scaler = torch.amp.GradScaler(enabled=(dtype == torch.float16))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    use_fused = device_type == "cuda"
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, fused=use_fused)
 
     model.train()
 
