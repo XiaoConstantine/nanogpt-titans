@@ -214,24 +214,34 @@ def profile_with_torch_profiler(
         "other": 0.0,
     }
 
-    for e in prof.key_averages():
-        # Get CUDA time - try different attribute names for compatibility
-        cuda_time = getattr(e, "self_cuda_time_total", None)
-        if cuda_time is None:
-            cuda_time = getattr(e, "cuda_time_total", 0)
+    # Debug: print first few events to see attribute structure
+    events = list(prof.key_averages())
+    if events:
+        e0 = events[0]
+        print(f"\nDebug - Event attributes: cuda_time_total={getattr(e0, 'cuda_time_total', 'N/A')}, "
+              f"self_cuda_time_total={getattr(e0, 'self_cuda_time_total', 'N/A')}, "
+              f"device_time_total={getattr(e0, 'device_time_total', 'N/A')}")
+
+    for e in events:
+        # Get CUDA time - try device_time_total first (newer PyTorch), then cuda_time_total
+        cuda_time = getattr(e, "device_time_total", 0) or 0
+        if cuda_time <= 0:
+            cuda_time = getattr(e, "cuda_time_total", 0) or 0
+        if cuda_time <= 0:
+            cuda_time = getattr(e, "self_cuda_time_total", 0) or 0
         if cuda_time <= 0:
             continue
 
         key = e.key.lower()
         if "attention" in key or "softmax" in key or "flash" in key or "sdpa" in key:
             categories["attention"] += cuda_time
-        elif "gemm" in key or "matmul" in key or "aten::mm" in key or "addmm" in key:
+        elif "gemm" in key or "matmul" in key or "mm" in key or "addmm" in key:
             categories["matmul/gemm"] += cuda_time
-        elif "triton" in key or "_cross_entropy" in key or "_fused" in key:
+        elif "triton" in key or "cross_entropy" in key or "fused_adamw" in key:
             categories["triton_custom"] += cuda_time
         elif "copy" in key or "cat" in key or "memcpy" in key or "memset" in key:
             categories["memory_ops"] += cuda_time
-        elif "elementwise" in key or "aten::add" in key or "aten::mul" in key or "foreach" in key:
+        elif "elementwise" in key or "add_" in key or "mul_" in key or "foreach" in key:
             categories["elementwise"] += cuda_time
         else:
             categories["other"] += cuda_time
