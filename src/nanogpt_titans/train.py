@@ -304,25 +304,29 @@ def train(config: TrainConfig) -> None:
         model_config = checkpoint["model_config"]
         print(f"  Restored model config: n_layer={model_config.n_layer}, n_embd={model_config.n_embd}")
 
-        # Handle adaptive memory upgrade
-        ckpt_has_adaptive = getattr(model_config, "adaptive_memory", False)
-        upgrade_to_adaptive = config.adaptive_memory and not ckpt_has_adaptive
-
-        if upgrade_to_adaptive:
-            print("  Upgrading to adaptive memory (new projections will be randomly initialized)")
-            model_config.adaptive_memory = True
-        elif not hasattr(model_config, "adaptive_memory"):
-            model_config.adaptive_memory = False
-            print("  Note: Checkpoint predates adaptive memory, using adaptive_memory=False")
-            print("  Tip: Use --adaptive_memory to upgrade and enable learned lr/momentum/decay")
-
-        model = TitansGPT(model_config)
         state_dict = checkpoint["model"]
         # Fix state dict if compiled
         unwanted_prefix = "_orig_mod."
         for k in list(state_dict.keys()):
             if k.startswith(unwanted_prefix):
                 state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
+
+        # Check if checkpoint actually has adaptive memory weights (source of truth)
+        ckpt_has_adaptive = any("to_lr" in k or "to_momentum" in k or "to_decay" in k for k in state_dict)
+        upgrade_to_adaptive = config.adaptive_memory and not ckpt_has_adaptive
+
+        if upgrade_to_adaptive:
+            print("  Upgrading to adaptive memory (new projections will be randomly initialized)")
+            model_config.adaptive_memory = True
+        elif not ckpt_has_adaptive:
+            model_config.adaptive_memory = False
+            print("  Note: Checkpoint predates adaptive memory, using adaptive_memory=False")
+            print("  Tip: Use --adaptive_memory to upgrade and enable learned lr/momentum/decay")
+        else:
+            # Checkpoint has adaptive memory, preserve the setting
+            model_config.adaptive_memory = True
+
+        model = TitansGPT(model_config)
 
         # Load with strict=False if upgrading (allows missing adaptive projection keys)
         if upgrade_to_adaptive:
