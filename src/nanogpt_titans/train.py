@@ -300,13 +300,22 @@ def train(config: TrainConfig) -> None:
         print(f"Resuming from {config.out_dir}")
         ckpt_path = Path(config.out_dir) / "ckpt.pt"
         checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
-        # Use saved model config to ensure architecture matches
+        # Use saved model config as base
         model_config = checkpoint["model_config"]
         print(f"  Restored model config: n_layer={model_config.n_layer}, n_embd={model_config.n_embd}")
-        # Handle old checkpoints that don't have adaptive_memory
-        if not hasattr(model_config, "adaptive_memory"):
+
+        # Handle adaptive memory upgrade
+        ckpt_has_adaptive = getattr(model_config, "adaptive_memory", False)
+        upgrade_to_adaptive = config.adaptive_memory and not ckpt_has_adaptive
+
+        if upgrade_to_adaptive:
+            print("  Upgrading to adaptive memory (new projections will be randomly initialized)")
+            model_config.adaptive_memory = True
+        elif not hasattr(model_config, "adaptive_memory"):
             model_config.adaptive_memory = False
             print("  Note: Checkpoint predates adaptive memory, using adaptive_memory=False")
+            print("  Tip: Use --adaptive_memory to upgrade and enable learned lr/momentum/decay")
+
         model = TitansGPT(model_config)
         state_dict = checkpoint["model"]
         # Fix state dict if compiled
@@ -314,7 +323,15 @@ def train(config: TrainConfig) -> None:
         for k in list(state_dict.keys()):
             if k.startswith(unwanted_prefix):
                 state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
-        model.load_state_dict(state_dict)
+
+        # Load with strict=False if upgrading (allows missing adaptive projection keys)
+        if upgrade_to_adaptive:
+            missing, _unexpected = model.load_state_dict(state_dict, strict=False)
+            if missing:
+                print(f"  New parameters (randomly initialized): {len(missing)} keys")
+        else:
+            model.load_state_dict(state_dict)
+
         iter_num = checkpoint["iter_num"]
         best_val_loss = checkpoint["best_val_loss"]
         print(f"  Resuming from iteration {iter_num}, best_val_loss={best_val_loss:.4f}")
