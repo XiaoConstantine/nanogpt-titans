@@ -567,7 +567,50 @@ class NeuralMemory(nn.Module):
         # Use functional_call to apply MLP with these weights
         return torch.func.functional_call(self.memory_mlp, params, (x,))
 
-    @torch.compiler.disable  # Memory retrieval uses vmap + dict - incompatible with compile
+    def _batched_forward_bmm(
+        self,
+        x: torch.Tensor,
+        weights: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Batched forward pass using bmm (compile-compatible, no vmap).
+
+        This replaces vmap with explicit batched matrix multiplications.
+        For a 2-layer MLP: output = W1 @ silu(W0 @ x + b0) + b1
+
+        Args:
+            x: Input tensor [B, T, C]
+            weights: Per-batch weights {name: [B, *shape]}
+
+        Returns:
+            output: [B, T, C]
+        """
+        W0 = weights['layers.0.weight']  # [B, H, C]
+        W1 = weights['layers.1.weight']  # [B, C, H]
+
+        has_bias = 'layers.0.bias' in weights
+        b0 = weights.get('layers.0.bias')  # [B, H] or None
+        b1 = weights.get('layers.1.bias')  # [B, C] or None
+
+        # Layer 0: h1 = silu(x @ W0.T + b0)
+        # x: [B, T, C], W0: [B, H, C] -> W0.T: [B, C, H]
+        # bmm(x, W0.T) -> [B, T, H]
+        h1_pre = torch.bmm(x, W0.transpose(-1, -2))  # [B, T, H]
+        if b0 is not None:
+            h1_pre = h1_pre + b0.unsqueeze(1)  # [B, T, H] + [B, 1, H]
+
+        # SiLU activation: silu(x) = x * sigmoid(x)
+        h1 = torch.nn.functional.silu(h1_pre)  # [B, T, H]
+
+        # Layer 1: output = h1 @ W1.T + b1
+        # h1: [B, T, H], W1: [B, C, H] -> W1.T: [B, H, C]
+        # bmm(h1, W1.T) -> [B, T, C]
+        output = torch.bmm(h1, W1.transpose(-1, -2))  # [B, T, C]
+        if b1 is not None:
+            output = output + b1.unsqueeze(1)  # [B, T, C] + [B, 1, C]
+
+        return output
+
     def forward(
         self,
         x: torch.Tensor,
@@ -575,6 +618,8 @@ class NeuralMemory(nn.Module):
     ) -> torch.Tensor:
         """
         Retrieve from memory using PREVIOUS segment's output (causal).
+
+        Uses batched bmm for compile-compatibility (no vmap).
 
         Args:
             x: Input tensor [B, T, C] - current segment (NOT used for retrieval to maintain causality)
@@ -593,25 +638,11 @@ class NeuralMemory(nn.Module):
             # First segment: use learned initial query expanded for batch
             query_source = self.init_query.expand(b, -1, -1)  # [B, 1, C]
 
-        # Project to queries - ensure contiguous for vmap
-        queries = self.query_proj(query_source).contiguous()  # [B, T_prev, C] or [B, 1, C]
+        # Project to queries
+        queries = self.query_proj(query_source)  # [B, T_prev, C] or [B, 1, C]
 
-        # Retrieve by passing queries through per-sequence MLP (vectorized with vmap)
-        def single_batch_forward(params: dict[str, torch.Tensor], q: torch.Tensor) -> torch.Tensor:
-            # q: [T, C], params: {name: [*param_shape]}
-            q = q.unsqueeze(0)  # [1, T, C]
-            return torch.func.functional_call(self.memory_mlp, params, (q,)).squeeze(0)  # [T, C]
-
-        # vmap over batch dimension
-        if self._batched_mlp_forward is None:
-            params_in_dims = dict.fromkeys(state.weights, 0)
-            self._batched_mlp_forward = torch.func.vmap(
-                single_batch_forward, in_dims=(params_in_dims, 0)
-            )
-
-        # Ensure weights are contiguous for vmap
-        weights_contig = {k: v.contiguous() for k, v in state.weights.items()}
-        retrieved = self._batched_mlp_forward(weights_contig, queries)  # [B, T_prev, C]
+        # Retrieve using batched bmm (compile-compatible, no vmap)
+        retrieved = self._batched_forward_bmm(queries, state.weights)  # [B, T_prev, C]
 
         # Pool to num_longterm_mem tokens
         B, T_prev, C = retrieved.shape
