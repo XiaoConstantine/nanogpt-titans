@@ -20,6 +20,14 @@ from torch.profiler import ProfilerActivity, profile
 
 from nanogpt_titans.model import TitansConfig, TitansGPT
 
+# Optional 8-bit optimizer
+_BITSANDBYTES_AVAILABLE = False
+try:
+    from bitsandbytes.optim import AdamW8bit
+    _BITSANDBYTES_AVAILABLE = True
+except ImportError:
+    AdamW8bit = None  # type: ignore[misc, assignment]
+
 
 def profile_training_iteration(
     model: TitansGPT,
@@ -29,6 +37,7 @@ def profile_training_iteration(
     dtype: torch.dtype,
     num_iters: int = 10,
     warmup_iters: int = 3,
+    use_8bit: bool = False,
 ) -> dict[str, float]:
     """
     Profile a complete training iteration (forward + backward + optimizer step).
@@ -47,9 +56,15 @@ def profile_training_iteration(
     )
     scaler = torch.amp.GradScaler(enabled=(dtype == torch.float16))
 
-    # Simple optimizer for profiling (fused=True uses single CUDA kernel)
-    use_fused = device_type == "cuda"
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, fused=use_fused)
+    # Optimizer selection
+    if use_8bit:
+        if not _BITSANDBYTES_AVAILABLE:
+            raise ImportError("8-bit AdamW requires bitsandbytes: pip install bitsandbytes")
+        print("Using 8-bit AdamW (bitsandbytes)")
+        optimizer = AdamW8bit(model.parameters(), lr=1e-4)
+    else:
+        use_fused = device_type == "cuda"
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, fused=use_fused)
 
     model.train()  # Training mode, not eval!
 
@@ -128,6 +143,7 @@ def profile_with_torch_profiler(
     dtype: torch.dtype,
     num_iters: int = 3,
     export_trace: bool = False,
+    use_8bit: bool = False,
 ) -> None:
     """
     Profile using torch.profiler for detailed CUDA kernel analysis.
@@ -142,8 +158,16 @@ def profile_with_torch_profiler(
         else torch.amp.autocast(device_type=device_type, dtype=dtype)
     )
     scaler = torch.amp.GradScaler(enabled=(dtype == torch.float16))
-    use_fused = device_type == "cuda"
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, fused=use_fused)
+
+    # Optimizer selection
+    if use_8bit:
+        if not _BITSANDBYTES_AVAILABLE:
+            raise ImportError("8-bit AdamW requires bitsandbytes: pip install bitsandbytes")
+        print("Using 8-bit AdamW (bitsandbytes)")
+        optimizer = AdamW8bit(model.parameters(), lr=1e-4)
+    else:
+        use_fused = device_type == "cuda"
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, fused=use_fused)
 
     model.train()
 
@@ -284,6 +308,7 @@ def main() -> None:
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16", "float16"])
     parser.add_argument("--compile", action="store_true", help="Use torch.compile()")
+    parser.add_argument("--8bit", dest="use_8bit", action="store_true", help="Use 8-bit AdamW (requires bitsandbytes)")
 
     args = parser.parse_args()
 
@@ -297,6 +322,7 @@ def main() -> None:
     print(f"Device: {device}")
     print(f"Dtype: {args.dtype}")
     print(f"Compile: {args.compile}")
+    print(f"8-bit optimizer: {args.use_8bit}")
     print()
 
     # Model config
@@ -340,11 +366,13 @@ def main() -> None:
             model, x, targets, device, dtype,
             num_iters=args.num_iters,
             export_trace=args.export_trace,
+            use_8bit=args.use_8bit,
         )
     else:
         results = profile_training_iteration(
             model, x, targets, device, dtype,
             num_iters=args.num_iters,
+            use_8bit=args.use_8bit,
         )
 
         print("\n" + "=" * 70)

@@ -86,6 +86,15 @@ try:
 except ImportError:
     pass
 
+# 8-bit AdamW optimizer (bitsandbytes) - reduces optimizer memory bandwidth
+_BITSANDBYTES_AVAILABLE = False
+bnb_AdamW8bit = None  # type: ignore[assignment]
+try:
+    from bitsandbytes.optim import AdamW8bit as bnb_AdamW8bit
+    _BITSANDBYTES_AVAILABLE = True
+except ImportError:
+    pass
+
 
 # --- FlexAttention mask functions ---
 
@@ -1409,8 +1418,22 @@ class TitansGPT(nn.Module):
         learning_rate: float,
         betas: tuple[float, float],
         device_type: str,
-    ) -> torch.optim.AdamW:
-        """Configure optimizer with weight decay."""
+        use_8bit: bool = False,
+    ) -> torch.optim.Optimizer:
+        """
+        Configure optimizer with weight decay.
+
+        Args:
+            weight_decay: Weight decay coefficient
+            learning_rate: Learning rate
+            betas: Adam beta coefficients
+            device_type: Device type ("cuda" or "cpu")
+            use_8bit: Use 8-bit AdamW (requires bitsandbytes). Reduces memory
+                      bandwidth for optimizer step by ~4x.
+
+        Returns:
+            Configured optimizer (AdamW or AdamW8bit)
+        """
         decay: set[str] = set()
         no_decay: set[str] = set()
         whitelist_weight_modules = (nn.Linear,)
@@ -1449,6 +1472,16 @@ class TitansGPT(nn.Module):
             {"params": [param_dict[pn] for pn in sorted(no_decay)], "weight_decay": 0.0},
         ]
 
+        # Use 8-bit AdamW if requested and available
+        if use_8bit:
+            if not _BITSANDBYTES_AVAILABLE:
+                raise ImportError(
+                    "8-bit AdamW requires bitsandbytes. Install with: pip install bitsandbytes"
+                )
+            print("Using 8-bit AdamW (bitsandbytes)")
+            return bnb_AdamW8bit(optim_groups, lr=learning_rate, betas=betas)
+
+        # Standard fused AdamW for CUDA
         use_fused = device_type == "cuda"
         return torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=use_fused)
 

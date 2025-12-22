@@ -26,6 +26,7 @@ dev = [
 train = [
     "wandb>=0.18.0",
     "datasets>=3.0.0",
+    "bitsandbytes>=0.44.0",  # 8-bit AdamW optimizer
 ]
 
 [build-system]

@@ -69,6 +69,7 @@ class TrainConfig:
     beta1: float = 0.9
     beta2: float = 0.95
     grad_clip: float = 1.0
+    use_8bit_optimizer: bool = False  # Use 8-bit AdamW (requires bitsandbytes)
 
     # learning rate schedule
     decay_lr: bool = True
@@ -354,6 +355,7 @@ def train(config: TrainConfig) -> None:
         learning_rate=config.learning_rate,
         betas=(config.beta1, config.beta2),
         device_type=device_type,
+        use_8bit=config.use_8bit_optimizer,
     )
 
     if config.init_from == "resume" and "optimizer" in checkpoint and not upgraded_model:
