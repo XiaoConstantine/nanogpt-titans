@@ -217,11 +217,10 @@ def profile_with_torch_profiler(
     other_ops: list[tuple[str, float]] = []  # Track what goes into "other"
 
     for e in prof.key_averages():
-        # Use SELF time to avoid double-counting (parent ops include child time in "total")
-        # self_device_time = time in this op only, not children
-        cuda_time = getattr(e, "self_device_time_total", 0) or 0
+        # Get device time (works across PyTorch versions)
+        cuda_time = getattr(e, "device_time_total", 0) or 0
         if cuda_time <= 0:
-            cuda_time = getattr(e, "self_cuda_time_total", 0) or 0
+            cuda_time = getattr(e, "cuda_time_total", 0) or 0
         if cuda_time <= 0:
             continue
 
