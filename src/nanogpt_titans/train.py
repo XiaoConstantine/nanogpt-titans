@@ -554,6 +554,7 @@ def main() -> None:
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.95)
     parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--use_8bit_optimizer", action="store_true", help="Use 8-bit AdamW (requires bitsandbytes)")
     parser.add_argument("--decay_lr", action="store_true", default=True)
     parser.add_argument("--no_decay_lr", action="store_false", dest="decay_lr")
     parser.add_argument("--warmup_iters", type=int, default=100)
