@@ -183,12 +183,11 @@ class _TritonCrossEntropy(torch.autograd.Function):
 
         # Compute per-sample grad_output (1/n for mean reduction)
         valid_mask = (targets >= 0) & (targets < n_cols)
-        n_valid = valid_mask.sum()
-        grad_per_sample = grad_output / n_valid if n_valid > 0 else grad_output
+        n_valid = valid_mask.sum().clamp(min=1)
+        grad_per_sample = grad_output / n_valid
 
-        grad_output_expanded = torch.full(
-            (n_rows,), grad_per_sample.item(), device=logits.device, dtype=logits.dtype
-        )
+        # Use expand instead of full+.item() to avoid graph break
+        grad_output_expanded = grad_per_sample.expand(n_rows).contiguous()
 
         _cross_entropy_bwd_kernel[(n_rows,)](
             logits,
@@ -223,6 +222,175 @@ def triton_cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.T
         targets = targets.view(-1)
 
     return _TritonCrossEntropy.apply(logits, targets)
+
+
+# =============================================================================
+# Fused Linear Cross-Entropy (Liger-Kernel inspired)
+# =============================================================================
+
+
+class _FusedLinearCrossEntropy(torch.autograd.Function):
+    """
+    Fused linear projection + cross-entropy loss.
+
+    Inspired by Liger-Kernel: processes in chunks to avoid materializing
+    the full [B*T, V] logits tensor.
+
+    Memory: O(chunk_size * V) instead of O(B*T*V)
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        hidden: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        targets: torch.Tensor,
+        chunk_size: int = 1024,
+    ) -> torch.Tensor:
+        """
+        Forward pass: compute loss without storing full logits.
+
+        Args:
+            hidden: [N, H] hidden states
+            weight: [V, H] linear weight
+            bias: [V] linear bias (optional)
+            targets: [N] target indices
+            chunk_size: number of rows to process at once
+        """
+        N, _H = hidden.shape
+        V = weight.shape[0]
+
+        # Count valid samples ONCE before the loop (avoids per-chunk indexing)
+        # Use clamp instead of .item() to avoid graph break
+        n_valid = ((targets >= 0) & (targets < V)).sum().clamp(min=1)
+
+        # Process in chunks to limit peak memory
+        total_loss = torch.tensor(0.0, device=hidden.device, dtype=hidden.dtype)
+
+        for start in range(0, N, chunk_size):
+            end = min(start + chunk_size, N)
+            chunk_hidden = hidden[start:end]
+            chunk_targets = targets[start:end]
+
+            # Compute logits for this chunk: [chunk, V]
+            chunk_logits = chunk_hidden @ weight.T
+            if bias is not None:
+                chunk_logits = chunk_logits + bias
+
+            # Compute cross-entropy for this chunk using Triton kernel
+            chunk_n = chunk_logits.shape[0]
+            chunk_losses = torch.empty(chunk_n, device=hidden.device, dtype=hidden.dtype)
+
+            BLOCK_SIZE = min(triton.next_power_of_2(V), 1024)
+            _cross_entropy_fwd_kernel[(chunk_n,)](
+                chunk_logits,
+                chunk_targets,
+                chunk_losses,
+                V,
+                chunk_logits.stride(0),
+                BLOCK_SIZE=BLOCK_SIZE,
+            )
+
+            # Accumulate - Triton kernel already sets loss=0 for invalid targets
+            total_loss = total_loss + chunk_losses.sum()
+
+        # Save for backward
+        ctx.save_for_backward(hidden, weight, bias, targets)
+        ctx.chunk_size = chunk_size
+        ctx.n_valid = n_valid
+
+        # Return mean loss
+        return total_loss / n_valid
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """
+        Backward pass: recompute logits in chunks, compute gradients.
+        """
+        hidden, weight, bias, targets = ctx.saved_tensors
+        chunk_size = ctx.chunk_size
+        n_valid = ctx.n_valid
+
+        N, _H = hidden.shape
+        V = weight.shape[0]
+
+        grad_scale = grad_output / n_valid
+
+        # Initialize gradient accumulators
+        grad_hidden = torch.zeros_like(hidden)
+        grad_weight = torch.zeros_like(weight)
+        grad_bias = torch.zeros(V, device=hidden.device, dtype=hidden.dtype) if bias is not None else None
+
+        for start in range(0, N, chunk_size):
+            end = min(start + chunk_size, N)
+            chunk_hidden = hidden[start:end]
+            chunk_targets = targets[start:end]
+            chunk_n = end - start
+
+            # Recompute logits for this chunk
+            chunk_logits = chunk_hidden @ weight.T
+            if bias is not None:
+                chunk_logits = chunk_logits + bias
+
+            # Compute softmax gradients using Triton kernel
+            chunk_grad_logits = torch.empty_like(chunk_logits)
+            # Use expand instead of full+.item() to avoid graph break
+            grad_output_expanded = grad_scale.expand(chunk_n).contiguous()
+
+            BLOCK_SIZE = min(triton.next_power_of_2(V), 1024)
+            _cross_entropy_bwd_kernel[(chunk_n,)](
+                chunk_logits,
+                chunk_targets,
+                grad_output_expanded,
+                chunk_grad_logits,
+                V,
+                chunk_logits.stride(0),
+                BLOCK_SIZE=BLOCK_SIZE,
+            )
+
+            # Backprop through linear: grad_hidden = grad_logits @ weight
+            grad_hidden[start:end] = chunk_grad_logits @ weight
+
+            # Accumulate weight gradient: grad_weight += grad_logits.T @ hidden
+            grad_weight += chunk_grad_logits.T @ chunk_hidden
+
+            # Accumulate bias gradient
+            if grad_bias is not None:
+                grad_bias += chunk_grad_logits.sum(dim=0)
+
+        return grad_hidden, grad_weight, grad_bias, None, None
+
+
+def fused_linear_cross_entropy(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    targets: torch.Tensor,
+    chunk_size: int = 1024,
+) -> torch.Tensor:
+    """
+    Fused linear projection + cross-entropy loss.
+
+    Avoids materializing full [B*T, V] logits tensor by processing in chunks.
+    Inspired by Liger-Kernel's approach.
+
+    Args:
+        hidden: [N, H] or [B, T, H] hidden states from transformer
+        weight: [V, H] lm_head weight matrix
+        bias: [V] lm_head bias (optional)
+        targets: [N] or [B, T] target token indices
+
+    Returns:
+        Scalar loss (mean over valid samples)
+    """
+    # Flatten to 2D
+    orig_shape = hidden.shape
+    if hidden.ndim == 3:
+        hidden = hidden.view(-1, orig_shape[-1])
+        targets = targets.view(-1)
+
+    return _FusedLinearCrossEntropy.apply(hidden, weight, bias, targets, chunk_size)
 
 
 # =============================================================================

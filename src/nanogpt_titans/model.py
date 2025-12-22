@@ -17,10 +17,29 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from functools import lru_cache
+from typing import NamedTuple
 
 import torch
 from torch import nn
 from torch.nn import functional as F
+
+
+# =============================================================================
+# Compile-friendly Memory State (NamedTuples instead of dicts)
+# =============================================================================
+
+
+class MemoryWeights(NamedTuple):
+    """
+    Memory MLP weights as a NamedTuple (compile-friendly).
+
+    Using NamedTuple instead of dict avoids graph breaks in torch.compile.
+    Supports 2-layer MLP with optional bias.
+    """
+    w0: torch.Tensor  # [B, H, C] - layer 0 weight
+    b0: torch.Tensor | None  # [B, H] - layer 0 bias (optional)
+    w1: torch.Tensor  # [B, C, H] - layer 1 weight
+    b1: torch.Tensor | None  # [B, C] - layer 1 bias (optional)
 
 # FlexAttention imports (available in PyTorch 2.5+)
 # Works on L4, A100, H100. Fails on T4 (Triton register limit).
@@ -43,8 +62,10 @@ triton_momentum_update = None  # type: ignore[assignment]
 triton_fused_weight_update = None  # type: ignore[assignment]
 triton_batched_weight_update = None  # type: ignore[assignment]
 triton_cross_entropy = None  # type: ignore[assignment]
+fused_linear_cross_entropy = None  # type: ignore[assignment]
 try:
     from nanogpt_titans.triton_kernels import (
+        fused_linear_cross_entropy,
         triton_batched_weight_update,
         triton_cross_entropy,
         triton_fused_weight_update,
@@ -385,6 +406,7 @@ class NeuralMemory(nn.Module):
         # When False: per-token gradients with exact momentum (original behavior)
         self._use_aggregated_update = _AGGREGATED_UPDATE_AVAILABLE
 
+    @torch.compiler.disable  # State initialization creates dicts - incompatible with compile
     def init_state(self, batch_size: int, device: torch.device) -> MemoryState:
         """Initialize memory state - clone MLP weights for each batch item."""
         weights: dict[str, torch.Tensor] = {}
@@ -401,6 +423,7 @@ class NeuralMemory(nn.Module):
             weights=weights, last_momentum=last_momentum, last_segment_output=None, step=0
         )
 
+    @torch.compiler.disable  # State reset modifies dicts - incompatible with compile
     def reset_state(self, state: MemoryState) -> None:
         """Reset memory state in-place - avoids reallocation."""
         for name, param in self.memory_mlp.named_parameters():
@@ -544,6 +567,7 @@ class NeuralMemory(nn.Module):
         # Use functional_call to apply MLP with these weights
         return torch.func.functional_call(self.memory_mlp, params, (x,))
 
+    @torch.compiler.disable  # Memory retrieval uses vmap + dict - incompatible with compile
     def forward(
         self,
         x: torch.Tensor,
@@ -609,6 +633,7 @@ class NeuralMemory(nn.Module):
 
         return self.out_proj(retrieved)
 
+    @torch.compiler.disable  # Memory update uses detach + dict + conditionals - incompatible with compile
     def update(
         self,
         x: torch.Tensor,
@@ -1200,10 +1225,12 @@ class TitansGPT(nn.Module):
             n_params -= self.transformer["wpe"].weight.numel()  # type: ignore[call-non-callable]
         return n_params
 
+    @torch.compiler.disable  # Memory state list creation - incompatible with compile
     def init_memory_states(self, batch_size: int, device: torch.device) -> list[MemoryState | None]:
         """Initialize memory states for all layers (None for layers without memory)."""
         return [block.init_state(batch_size, device) for block in self.transformer["h"]]  # type: ignore[not-iterable]
 
+    @torch.compiler.disable  # Memory state reset - incompatible with compile
     def reset_memory_states(self, states: list[MemoryState | None]) -> None:
         """Reset memory states in-place - avoids reallocation."""
         for block, state in zip(self.transformer["h"], states):  # type: ignore[not-iterable]
@@ -1253,7 +1280,19 @@ class TitansGPT(nn.Module):
 
         # Process in segments
         num_segments = (t + segment_len - 1) // segment_len
-        all_logits: list[torch.Tensor] = []
+
+        # Decide whether to use fused linear cross-entropy
+        # FLCE avoids materializing full [B, T, V] logits tensor - significant memory savings
+        use_fused_ce = (
+            targets is not None
+            and _TRITON_AVAILABLE
+            and fused_linear_cross_entropy is not None
+            and idx.is_cuda
+        )
+
+        # Collect either hidden states (for FLCE) or logits
+        all_hidden: list[torch.Tensor] = [] if use_fused_ce else []
+        all_logits: list[torch.Tensor] = [] if not use_fused_ce else []
 
         for seg_idx in range(num_segments):
             start = seg_idx * segment_len
@@ -1288,29 +1327,48 @@ class TitansGPT(nn.Module):
             # Final layer norm
             x = self.transformer["ln_f"](x)
 
-            # Project to vocabulary
-            logits = self.lm_head(x)
-            all_logits.append(logits)
-
-        # Concatenate all segment logits
-        final_logits = torch.cat(all_logits, dim=1)
-
-        # Compute loss if targets provided
-        loss = None
-        if targets is not None:
-            # Use fused Triton cross-entropy when available (CUDA only)
-            if _TRITON_AVAILABLE and triton_cross_entropy is not None and final_logits.is_cuda:
-                # triton_cross_entropy handles ignore_index=-1 internally
-                loss = triton_cross_entropy(
-                    final_logits.view(-1, final_logits.size(-1)),
-                    targets.view(-1),
-                )
+            if use_fused_ce:
+                # Collect hidden states for fused cross-entropy (smaller than logits)
+                all_hidden.append(x)
             else:
-                loss = F.cross_entropy(
-                    final_logits.view(-1, final_logits.size(-1)),
-                    targets.view(-1),
-                    ignore_index=-1,
-                )
+                # Project to vocabulary
+                logits = self.lm_head(x)
+                all_logits.append(logits)
+
+        # Compute loss and logits
+        loss = None
+        if use_fused_ce:
+            # Fused linear cross-entropy: avoids materializing full [B, T, V] logits
+            final_hidden = torch.cat(all_hidden, dim=1)
+            loss = fused_linear_cross_entropy(
+                final_hidden,
+                self.lm_head.weight,
+                self.lm_head.bias,
+                targets,
+                chunk_size=1024,
+            )
+            # Compute logits for return value (without torch.no_grad to avoid graph break)
+            # Loss is already computed via fused CE, so this doesn't affect training
+            final_logits = self.lm_head(final_hidden)
+        else:
+            # Concatenate all segment logits
+            final_logits = torch.cat(all_logits, dim=1)
+
+            # Compute loss if targets provided
+            if targets is not None:
+                # Use fused Triton cross-entropy when available (CUDA only)
+                if _TRITON_AVAILABLE and triton_cross_entropy is not None and final_logits.is_cuda:
+                    # triton_cross_entropy handles ignore_index=-1 internally
+                    loss = triton_cross_entropy(
+                        final_logits.view(-1, final_logits.size(-1)),
+                        targets.view(-1),
+                    )
+                else:
+                    loss = F.cross_entropy(
+                        final_logits.view(-1, final_logits.size(-1)),
+                        targets.view(-1),
+                        ignore_index=-1,
+                    )
 
         return final_logits, loss, memory_states
 
