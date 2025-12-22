@@ -359,7 +359,18 @@ def train(config: TrainConfig) -> None:
     )
 
     if config.init_from == "resume" and "optimizer" in checkpoint and not upgraded_model:
-        optimizer.load_state_dict(checkpoint["optimizer"])
+        # Check for optimizer type mismatch (e.g., resuming with 8-bit when saved with 32-bit)
+        saved_8bit = checkpoint.get("use_8bit_optimizer", False)
+        if saved_8bit != config.use_8bit_optimizer:
+            print(f"  Skipping optimizer state (type mismatch: saved={'8-bit' if saved_8bit else '32-bit'}, "
+                  f"current={'8-bit' if config.use_8bit_optimizer else '32-bit'})")
+            print("  Optimizer will start fresh")
+        else:
+            try:
+                optimizer.load_state_dict(checkpoint["optimizer"])
+            except (KeyError, ValueError) as e:
+                print(f"  Warning: Could not load optimizer state: {e}")
+                print("  Optimizer will start fresh")
     elif upgraded_model:
         print("  Skipping optimizer state (incompatible due to model upgrade)")
         print("  Optimizer will start fresh for new parameters")
@@ -434,6 +445,7 @@ def train(config: TrainConfig) -> None:
                         "iter_num": iter_num,
                         "best_val_loss": best_val_loss,
                         "config": config,
+                        "use_8bit_optimizer": config.use_8bit_optimizer,
                     }
                     print(f"Saving checkpoint to {config.out_dir}")
                     torch.save(checkpoint, Path(config.out_dir) / "ckpt.pt")
