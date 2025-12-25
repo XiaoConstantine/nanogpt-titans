@@ -151,13 +151,27 @@ def evaluate_perplexity_by_position(
         ppl = math.exp(avg_loss)
         by_segment[seg_idx] = {"loss": avg_loss, "perplexity": ppl}
 
-        # Categorize by position
-        if seg_idx < num_segments // 3:
-            position_ppls["early"].append(ppl)
-        elif seg_idx < 2 * num_segments // 3:
-            position_ppls["middle"].append(ppl)
+        # Categorize by position (handle small segment counts)
+        if num_segments <= 2:
+            # With 1-2 segments, just use early/late
+            if seg_idx == 0:
+                position_ppls["early"].append(ppl)
+            else:
+                position_ppls["late"].append(ppl)
+        elif num_segments <= 4:
+            # With 3-4 segments, split evenly
+            if seg_idx < num_segments // 2:
+                position_ppls["early"].append(ppl)
+            else:
+                position_ppls["late"].append(ppl)
         else:
-            position_ppls["late"].append(ppl)
+            # Standard thirds for 5+ segments
+            if seg_idx < num_segments // 3:
+                position_ppls["early"].append(ppl)
+            elif seg_idx < 2 * num_segments // 3:
+                position_ppls["middle"].append(ppl)
+            else:
+                position_ppls["late"].append(ppl)
 
     # Average by position
     by_position: dict[str, float] = {}
@@ -189,8 +203,13 @@ def print_results(results: dict[str, Any], model_name: str = "Model") -> None:
     print(f"  Middle segments: {results['by_position']['middle']:.2f}")
     print(f"  Late segments:   {results['by_position']['late']:.2f}")
 
-    improvement = (results['by_position']['early'] - results['by_position']['late']) / results['by_position']['early'] * 100
-    print(f"\n  Improvement (early->late): {improvement:.1f}%")
+    early_ppl = results['by_position']['early']
+    late_ppl = results['by_position']['late']
+    if early_ppl > 0:
+        improvement = (early_ppl - late_ppl) / early_ppl * 100
+        print(f"\n  Improvement (early->late): {improvement:.1f}%")
+    else:
+        print("\n  Improvement: N/A (no early segment data)")
 
     print("\nPerplexity by Segment:")
     for seg_idx, data in results["by_segment"].items():
