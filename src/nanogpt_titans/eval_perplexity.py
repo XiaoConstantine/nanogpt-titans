@@ -127,10 +127,10 @@ def evaluate_perplexity_by_position(
 
                 # Compute per-token loss for this segment
                 loss = torch.nn.functional.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    seg_y.view(-1),
+                    logits.reshape(-1, logits.size(-1)),
+                    seg_y.reshape(-1),
                     reduction='none'
-                ).view(batch_size, segment_len)
+                ).reshape(batch_size, segment_len)
 
                 segment_losses[seg_idx].append(loss.mean().item())
                 all_losses.append(loss)
