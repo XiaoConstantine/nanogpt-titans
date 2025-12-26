@@ -28,6 +28,11 @@ train = [
     "datasets>=3.0.0",
     "bitsandbytes>=0.44.0",  # 8-bit AdamW optimizer
 ]
+qwen = [
+    "transformers>=4.40.0",
+    "datasets>=3.0.0",
+    "accelerate>=0.30.0",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -93,3 +98,8 @@ possibly-missing-attribute = "ignore"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-v --tb=short"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
