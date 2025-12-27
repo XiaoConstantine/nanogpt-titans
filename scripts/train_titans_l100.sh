@@ -72,17 +72,10 @@ uv run python -m nanogpt_titans.train_qwen_titans \
     --warmup_steps 200 \
     --eval_interval 200 \
     --save_interval 500 \
-    --use_cms \
     --num_cms_levels 3 \
-    --use_self_mod_proj \
-    --use_self_mod_gate \
-    --use_internal_loss \
     --internal_loss_weight 0.001 \
     --dataset_name "wikitext" \
-    --dataset_config "wikitext-103-raw-v1" \
-    --wandb_log \
-    --wandb_project "titans-validation" \
-    --wandb_run_name "l100-8k-3layers"
+    --dataset_config "wikitext-103-raw-v1"
 
 # =============================================================================
 # STEP 3: Evaluate trained Titans
