@@ -1,12 +1,16 @@
 """
-Profile TitansGPT training loop to identify performance bottlenecks.
+Profile TitansGPT or Qwen-Titans training loop to identify performance bottlenecks.
 
 This profiler closely matches the actual training loop for accurate measurements.
 
 Usage:
+    # Profile TitansGPT (nanoGPT-based)
     uv run python -m nanogpt_titans.profile_model
-    uv run python -m nanogpt_titans.profile_model --compile
     uv run python -m nanogpt_titans.profile_model --compile --n_layer 12 --n_embd 768
+
+    # Profile Qwen-Titans (HuggingFace-based)
+    uv run python -m nanogpt_titans.profile_model --qwen
+    uv run python -m nanogpt_titans.profile_model --qwen --model_name Qwen/Qwen2-0.5B
 """
 
 from __future__ import annotations
@@ -27,6 +31,22 @@ try:
     _BITSANDBYTES_AVAILABLE = True
 except ImportError:
     AdamW8bit = None  # type: ignore[misc, assignment]
+
+# Optional Qwen/HuggingFace support
+_TRANSFORMERS_AVAILABLE = False
+try:
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from nanogpt_titans.qwen_titans import (
+        TitansQwenConfig,
+        patch_qwen_with_titans,
+        freeze_base_model,
+        get_titans_layers,
+        get_gate_statistics,
+        get_internal_losses,
+    )
+    _TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    pass
 
 
 def profile_training_iteration(
@@ -284,18 +304,213 @@ def profile_with_torch_profiler(
             print(f"  {op_time/1000:>8.2f} ms  {op_name[:60]}")
 
 
+# =============================================================================
+# Qwen-Titans Profiling
+# =============================================================================
+
+
+def profile_qwen_training(
+    model_name: str = "Qwen/Qwen2-0.5B",
+    memory_layers: list[int] | None = None,
+    segment_len: int = 256,
+    batch_size: int = 2,
+    seq_len: int = 512,
+    num_iters: int = 10,
+    warmup_iters: int = 3,
+    device: str = "cuda",
+    dtype_str: str = "bfloat16",
+    detailed: bool = False,
+) -> dict[str, float]:
+    """
+    Profile Qwen-Titans training iteration.
+    """
+    if not _TRANSFORMERS_AVAILABLE:
+        raise ImportError("Qwen profiling requires: pip install transformers accelerate")
+
+    dtype_map = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
+    dtype = dtype_map[dtype_str]
+    device = torch.device(device if torch.cuda.is_available() else "cpu")
+
+    print("=" * 70)
+    print("QWEN-TITANS TRAINING PROFILER")
+    print("=" * 70)
+    print(f"Model: {model_name}")
+    print(f"Device: {device}")
+    print(f"Dtype: {dtype_str}")
+    print()
+
+    # Load model
+    print(f"Loading {model_name}...")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=dtype,
+        device_map=device,
+    )
+
+    # Get model config
+    qwen_config = model.config
+    n_layer = qwen_config.num_hidden_layers
+    if memory_layers is None:
+        memory_layers = [n_layer // 2]  # Middle layer
+
+    print(f"Model layers: {n_layer}")
+    print(f"Memory layers: {memory_layers}")
+
+    # Create Titans config and patch
+    titans_config = TitansQwenConfig.from_qwen_config(
+        qwen_config,
+        segment_len=segment_len,
+        memory_layers=memory_layers,
+    )
+
+    print("\nPatching model with HOPE-Titans memory...")
+    model = patch_qwen_with_titans(model, titans_config)
+    freeze_base_model(model)
+
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total params: {total_params / 1e6:.1f}M")
+    print(f"Trainable params: {trainable_params / 1e6:.1f}M ({100*trainable_params/total_params:.2f}%)")
+
+    # Setup optimizer
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=1e-4,
+    )
+
+    # Setup autocast
+    device_type = "cuda" if device.type == "cuda" else "cpu"
+    ctx = (
+        nullcontext()
+        if device_type == "cpu"
+        else torch.amp.autocast(device_type=device_type, dtype=dtype)
+    )
+    scaler = torch.amp.GradScaler(enabled=(dtype == torch.float16))
+
+    model.train()
+
+    # Create dummy input
+    input_ids = torch.randint(0, qwen_config.vocab_size, (batch_size, seq_len), device=device)
+    labels = input_ids.clone()
+
+    print(f"\nInput shape: {input_ids.shape}")
+    print(f"Tokens per iteration: {batch_size * seq_len:,}")
+    print()
+
+    # Warmup
+    print(f"Warming up ({warmup_iters} iterations)...")
+    for _ in range(warmup_iters):
+        optimizer.zero_grad(set_to_none=True)
+        with ctx:
+            outputs = model(input_ids, labels=labels)
+            loss = outputs.loss
+            # Add internal loss
+            for int_loss in get_internal_losses(model):
+                if int_loss is not None:
+                    loss = loss + 0.01 * int_loss
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    # Timed runs
+    print(f"Profiling ({num_iters} iterations)...")
+    timings = {"forward": [], "backward": [], "optimizer": [], "total": []}
+
+    for i in range(num_iters):
+        optimizer.zero_grad(set_to_none=True)
+
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
+        # Forward
+        with ctx:
+            outputs = model(input_ids, labels=labels)
+            loss = outputs.loss
+            for int_loss in get_internal_losses(model):
+                if int_loss is not None:
+                    loss = loss + 0.01 * int_loss
+
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        timings["forward"].append(t1 - t0)
+
+        # Backward
+        scaler.scale(loss).backward()
+
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t2 = time.perf_counter()
+        timings["backward"].append(t2 - t1)
+
+        # Optimizer
+        scaler.step(optimizer)
+        scaler.update()
+
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t3 = time.perf_counter()
+        timings["optimizer"].append(t3 - t2)
+        timings["total"].append(t3 - t0)
+
+    # Compute results
+    results = {}
+    for name, times in timings.items():
+        results[f"{name}_ms"] = 1000 * sum(times) / len(times)
+    results["tokens_per_sec"] = batch_size * seq_len / (results["total_ms"] / 1000)
+
+    # Print results
+    print("\n" + "=" * 70)
+    print("TRAINING ITERATION TIMING")
+    print("=" * 70)
+    print(f"{'Phase':<20} {'Time (ms)':<12}")
+    print("-" * 32)
+    print(f"{'Forward':<20} {results['forward_ms']:<12.2f}")
+    print(f"{'Backward':<20} {results['backward_ms']:<12.2f}")
+    print(f"{'Optimizer':<20} {results['optimizer_ms']:<12.2f}")
+    print("-" * 32)
+    print(f"{'Total':<20} {results['total_ms']:<12.2f}")
+    print()
+    print(f"Throughput: {results['tokens_per_sec']:,.0f} tokens/sec")
+
+    # Gate statistics
+    print("\n" + "=" * 70)
+    print("GATE STATISTICS")
+    print("=" * 70)
+    for stats in get_gate_statistics(model):
+        print(f"  Gate mean: {stats.get('mean_gate', 'N/A'):.4f}")
+
+    # Memory info
+    if device.type == "cuda":
+        mem_allocated = torch.cuda.max_memory_allocated() / 1e9
+        mem_reserved = torch.cuda.max_memory_reserved() / 1e9
+        print(f"\nPeak GPU memory: {mem_allocated:.2f} GB allocated, {mem_reserved:.2f} GB reserved")
+
+    return results
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Profile TitansGPT training iteration",
+        description="Profile TitansGPT or Qwen-Titans training iteration",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+
+    # Model selection
+    parser.add_argument("--qwen", action="store_true", help="Profile Qwen-Titans instead of TitansGPT")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2-0.5B", help="Qwen model name (for --qwen)")
+    parser.add_argument("--memory_layers", type=str, default=None, help="Memory layer indices, comma-separated (for --qwen)")
 
     # Profiling options
     parser.add_argument("--detailed", action="store_true", help="Use torch.profiler for kernel analysis")
     parser.add_argument("--export-trace", action="store_true", help="Export Chrome trace file")
     parser.add_argument("--num-iters", type=int, default=10, help="Number of iterations to profile")
 
-    # Model config (match your training setup)
+    # Model config (for TitansGPT)
     parser.add_argument("--n_layer", type=int, default=6, help="Number of layers")
     parser.add_argument("--n_head", type=int, default=6, help="Number of attention heads")
     parser.add_argument("--n_embd", type=int, default=384, help="Embedding dimension")
@@ -306,12 +521,34 @@ def main() -> None:
 
     # Training config
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
+    parser.add_argument("--seq_len", type=int, default=512, help="Sequence length (for --qwen)")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16", "float16"])
     parser.add_argument("--compile", action="store_true", help="Use torch.compile()")
     parser.add_argument("--8bit", dest="use_8bit", action="store_true", help="Use 8-bit AdamW (requires bitsandbytes)")
 
     args = parser.parse_args()
 
+    # Parse memory_layers if provided
+    memory_layers = None
+    if args.memory_layers:
+        memory_layers = [int(x.strip()) for x in args.memory_layers.split(",")]
+
+    # Qwen-Titans profiling
+    if args.qwen:
+        profile_qwen_training(
+            model_name=args.model_name,
+            memory_layers=memory_layers,
+            segment_len=args.segment_len,
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+            num_iters=args.num_iters,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            dtype_str=args.dtype,
+            detailed=args.detailed,
+        )
+        return
+
+    # TitansGPT profiling (original behavior)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype_map = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
     dtype = dtype_map[args.dtype]
