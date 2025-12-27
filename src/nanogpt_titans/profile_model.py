@@ -320,12 +320,19 @@ def profile_qwen_training(
     device: str = "cuda",
     dtype_str: str = "bfloat16",
     detailed: bool = False,
+    use_segments: bool = True,
 ) -> dict[str, float]:
     """
     Profile Qwen-Titans training iteration.
+    
+    Args:
+        use_segments: If True, profile segment-by-segment processing (matches actual training).
+                     If False, profile single forward pass (faster but less accurate).
     """
     if not _TRANSFORMERS_AVAILABLE:
         raise ImportError("Qwen profiling requires: pip install transformers accelerate")
+
+    from nanogpt_titans.qwen_titans import TitansStateManager
 
     dtype_map = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
     dtype = dtype_map[dtype_str]
@@ -337,6 +344,7 @@ def profile_qwen_training(
     print(f"Model: {model_name}")
     print(f"Device: {device}")
     print(f"Dtype: {dtype_str}")
+    print(f"Segment-by-segment: {use_segments}")
     print()
 
     # Load model
@@ -345,6 +353,7 @@ def profile_qwen_training(
         model_name,
         torch_dtype=dtype,
         device_map=device,
+        attn_implementation="eager",
     )
 
     # Get model config
@@ -355,6 +364,8 @@ def profile_qwen_training(
 
     print(f"Model layers: {n_layer}")
     print(f"Memory layers: {memory_layers}")
+    print(f"Segment length: {segment_len}")
+    print(f"Sequence length: {seq_len} ({seq_len // segment_len} segments)")
 
     # Create Titans config and patch
     titans_config = TitansQwenConfig.from_qwen_config(
@@ -379,6 +390,9 @@ def profile_qwen_training(
         lr=1e-4,
     )
 
+    # Setup state manager for segment processing
+    state_manager = TitansStateManager(model)
+
     # Setup autocast
     device_type = "cuda" if device.type == "cuda" else "cpu"
     ctx = (
@@ -398,85 +412,266 @@ def profile_qwen_training(
     print(f"Tokens per iteration: {batch_size * seq_len:,}")
     print()
 
-    # Warmup
+    # Warmup with segment processing
     print(f"Warming up ({warmup_iters} iterations)...")
     for _ in range(warmup_iters):
         optimizer.zero_grad(set_to_none=True)
-        with ctx:
-            outputs = model(input_ids, labels=labels)
-            loss = outputs.loss
-            # Add internal loss
-            for int_loss in get_internal_losses(model):
-                if int_loss is not None:
-                    loss = loss + 0.01 * int_loss
-        scaler.scale(loss).backward()
+        state_manager.reset()
+        state_manager.init_states(batch_size, device)
+        
+        if use_segments:
+            for start in range(0, seq_len, segment_len):
+                end = min(start + segment_len, seq_len)
+                seg_input = input_ids[:, start:end]
+                seg_labels = labels[:, start:end]
+                
+                state_manager.sync_to_layers()
+                with ctx:
+                    outputs = model(seg_input, labels=seg_labels, use_cache=False)
+                    loss = outputs.loss
+                    for int_loss in get_internal_losses(model):
+                        if int_loss is not None:
+                            loss = loss + 0.01 * int_loss
+                scaler.scale(loss).backward()
+                state_manager.sync_from_layers()
+        else:
+            with ctx:
+                outputs = model(input_ids, labels=labels)
+                loss = outputs.loss
+                for int_loss in get_internal_losses(model):
+                    if int_loss is not None:
+                        loss = loss + 0.01 * int_loss
+            scaler.scale(loss).backward()
+        
         scaler.step(optimizer)
         scaler.update()
 
     if device.type == "cuda":
         torch.cuda.synchronize()
 
-    # Timed runs
+    # Timed runs with detailed segment breakdown
     print(f"Profiling ({num_iters} iterations)...")
-    timings = {"forward": [], "backward": [], "optimizer": [], "total": []}
+    
+    if use_segments:
+        # Detailed segment-by-segment profiling
+        timings = {
+            "state_init": [], "sync_to": [], "forward": [], 
+            "backward": [], "sync_from": [], "optimizer": [], "total": []
+        }
+        segment_times: list[list[dict]] = []  # Per-iteration segment breakdown
+        
+        num_segments = seq_len // segment_len
+        
+        for i in range(num_iters):
+            optimizer.zero_grad(set_to_none=True)
+            iter_segment_times = []
+            
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t_start = time.perf_counter()
+            
+            # State init
+            t0 = time.perf_counter()
+            state_manager.reset()
+            state_manager.init_states(batch_size, device)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            timings["state_init"].append(time.perf_counter() - t0)
+            
+            # Process segments
+            total_sync_to = 0.0
+            total_forward = 0.0
+            total_backward = 0.0
+            total_sync_from = 0.0
+            
+            for seg_idx, start in enumerate(range(0, seq_len, segment_len)):
+                end = min(start + segment_len, seq_len)
+                seg_input = input_ids[:, start:end]
+                seg_labels = labels[:, start:end]
+                
+                # Sync to layers
+                t0 = time.perf_counter()
+                state_manager.sync_to_layers()
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                t_sync_to = time.perf_counter() - t0
+                total_sync_to += t_sync_to
+                
+                # Forward
+                t0 = time.perf_counter()
+                with ctx:
+                    outputs = model(seg_input, labels=seg_labels, use_cache=False)
+                    loss = outputs.loss
+                    for int_loss in get_internal_losses(model):
+                        if int_loss is not None:
+                            loss = loss + 0.01 * int_loss
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                t_fwd = time.perf_counter() - t0
+                total_forward += t_fwd
+                
+                # Backward
+                t0 = time.perf_counter()
+                scaler.scale(loss).backward()
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                t_bwd = time.perf_counter() - t0
+                total_backward += t_bwd
+                
+                # Sync from layers
+                t0 = time.perf_counter()
+                state_manager.sync_from_layers()
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                t_sync_from = time.perf_counter() - t0
+                total_sync_from += t_sync_from
+                
+                iter_segment_times.append({
+                    "seg": seg_idx,
+                    "sync_to": t_sync_to * 1000,
+                    "forward": t_fwd * 1000,
+                    "backward": t_bwd * 1000,
+                    "sync_from": t_sync_from * 1000,
+                })
+            
+            timings["sync_to"].append(total_sync_to)
+            timings["forward"].append(total_forward)
+            timings["backward"].append(total_backward)
+            timings["sync_from"].append(total_sync_from)
+            
+            # Optimizer
+            t0 = time.perf_counter()
+            scaler.step(optimizer)
+            scaler.update()
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            timings["optimizer"].append(time.perf_counter() - t0)
+            
+            timings["total"].append(time.perf_counter() - t_start)
+            segment_times.append(iter_segment_times)
+        
+        # Compute results
+        results = {}
+        for name, times in timings.items():
+            results[f"{name}_ms"] = 1000 * sum(times) / len(times)
+        results["tokens_per_sec"] = batch_size * seq_len / (results["total_ms"] / 1000)
+        results["num_segments"] = num_segments
+        
+        # Print results
+        print("\n" + "=" * 70)
+        print("TRAINING ITERATION TIMING (segment-by-segment)")
+        print("=" * 70)
+        print(f"{'Phase':<20} {'Time (ms)':<12} {'%':<8}")
+        print("-" * 40)
+        total_ms = results["total_ms"]
+        for phase in ["state_init", "sync_to", "forward", "backward", "sync_from", "optimizer"]:
+            ms = results[f"{phase}_ms"]
+            pct = 100 * ms / total_ms
+            print(f"{phase:<20} {ms:<12.2f} {pct:<8.1f}")
+        print("-" * 40)
+        print(f"{'Total':<20} {total_ms:<12.2f} {'100.0':<8}")
+        print()
+        print(f"Throughput: {results['tokens_per_sec']:,.0f} tokens/sec")
+        print(f"Segments per sequence: {num_segments}")
+        print(f"Avg time per segment: {(results['forward_ms'] + results['backward_ms']) / num_segments:.2f} ms")
+        
+        # Per-segment breakdown (last iteration)
+        if segment_times:
+            print("\n" + "=" * 70)
+            print("PER-SEGMENT TIMING (last iteration, ms)")
+            print("=" * 70)
+            print(f"{'Seg':<5} {'sync_to':<10} {'forward':<10} {'backward':<10} {'sync_from':<10}")
+            print("-" * 45)
+            last_iter = segment_times[-1]
+            for st in last_iter[:5]:  # First 5
+                print(f"{st['seg']:<5} {st['sync_to']:<10.2f} {st['forward']:<10.2f} {st['backward']:<10.2f} {st['sync_from']:<10.2f}")
+            if len(last_iter) > 5:
+                print("...")
+                st = last_iter[-1]
+                print(f"{st['seg']:<5} {st['sync_to']:<10.2f} {st['forward']:<10.2f} {st['backward']:<10.2f} {st['sync_from']:<10.2f}")
+            
+            # Bottleneck analysis
+            avg_fwd = sum(s['forward'] for s in last_iter) / len(last_iter)
+            avg_bwd = sum(s['backward'] for s in last_iter) / len(last_iter)
+            avg_sync = sum(s['sync_to'] + s['sync_from'] for s in last_iter) / len(last_iter)
+            
+            print("\n" + "=" * 70)
+            print("BOTTLENECK ANALYSIS")
+            print("=" * 70)
+            print(f"Avg forward/segment:  {avg_fwd:.2f} ms")
+            print(f"Avg backward/segment: {avg_bwd:.2f} ms")
+            print(f"Avg sync/segment:     {avg_sync:.2f} ms")
+            
+            if avg_fwd > avg_bwd and avg_fwd > avg_sync:
+                print(f"\n→ FORWARD is the bottleneck")
+                print("  Consider: larger segment_len, fewer memory layers, flash attention")
+            elif avg_bwd > avg_fwd and avg_bwd > avg_sync:
+                print(f"\n→ BACKWARD is the bottleneck")
+                print("  Consider: gradient checkpointing, reduce memory layers")
+            else:
+                print(f"\n→ SYNC overhead is significant")
+                print("  Consider: batch state updates, reduce memory layers")
+    else:
+        # Original non-segment profiling
+        timings = {"forward": [], "backward": [], "optimizer": [], "total": []}
+        
+        for i in range(num_iters):
+            optimizer.zero_grad(set_to_none=True)
 
-    for i in range(num_iters):
-        optimizer.zero_grad(set_to_none=True)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
 
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        t0 = time.perf_counter()
+            # Forward
+            with ctx:
+                outputs = model(input_ids, labels=labels)
+                loss = outputs.loss
+                for int_loss in get_internal_losses(model):
+                    if int_loss is not None:
+                        loss = loss + 0.01 * int_loss
 
-        # Forward
-        with ctx:
-            outputs = model(input_ids, labels=labels)
-            loss = outputs.loss
-            for int_loss in get_internal_losses(model):
-                if int_loss is not None:
-                    loss = loss + 0.01 * int_loss
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            timings["forward"].append(t1 - t0)
 
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        timings["forward"].append(t1 - t0)
+            # Backward
+            scaler.scale(loss).backward()
 
-        # Backward
-        scaler.scale(loss).backward()
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t2 = time.perf_counter()
+            timings["backward"].append(t2 - t1)
 
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        t2 = time.perf_counter()
-        timings["backward"].append(t2 - t1)
+            # Optimizer
+            scaler.step(optimizer)
+            scaler.update()
 
-        # Optimizer
-        scaler.step(optimizer)
-        scaler.update()
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t3 = time.perf_counter()
+            timings["optimizer"].append(t3 - t2)
+            timings["total"].append(t3 - t0)
 
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        t3 = time.perf_counter()
-        timings["optimizer"].append(t3 - t2)
-        timings["total"].append(t3 - t0)
+        # Compute results
+        results = {}
+        for name, times in timings.items():
+            results[f"{name}_ms"] = 1000 * sum(times) / len(times)
+        results["tokens_per_sec"] = batch_size * seq_len / (results["total_ms"] / 1000)
 
-    # Compute results
-    results = {}
-    for name, times in timings.items():
-        results[f"{name}_ms"] = 1000 * sum(times) / len(times)
-    results["tokens_per_sec"] = batch_size * seq_len / (results["total_ms"] / 1000)
-
-    # Print results
-    print("\n" + "=" * 70)
-    print("TRAINING ITERATION TIMING")
-    print("=" * 70)
-    print(f"{'Phase':<20} {'Time (ms)':<12}")
-    print("-" * 32)
-    print(f"{'Forward':<20} {results['forward_ms']:<12.2f}")
-    print(f"{'Backward':<20} {results['backward_ms']:<12.2f}")
-    print(f"{'Optimizer':<20} {results['optimizer_ms']:<12.2f}")
-    print("-" * 32)
-    print(f"{'Total':<20} {results['total_ms']:<12.2f}")
-    print()
-    print(f"Throughput: {results['tokens_per_sec']:,.0f} tokens/sec")
+        # Print results
+        print("\n" + "=" * 70)
+        print("TRAINING ITERATION TIMING")
+        print("=" * 70)
+        print(f"{'Phase':<20} {'Time (ms)':<12}")
+        print("-" * 32)
+        print(f"{'Forward':<20} {results['forward_ms']:<12.2f}")
+        print(f"{'Backward':<20} {results['backward_ms']:<12.2f}")
+        print(f"{'Optimizer':<20} {results['optimizer_ms']:<12.2f}")
+        print("-" * 32)
+        print(f"{'Total':<20} {results['total_ms']:<12.2f}")
+        print()
+        print(f"Throughput: {results['tokens_per_sec']:,.0f} tokens/sec")
 
     # Gate statistics
     print("\n" + "=" * 70)
@@ -525,6 +720,8 @@ def main() -> None:
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16", "float16"])
     parser.add_argument("--compile", action="store_true", help="Use torch.compile()")
     parser.add_argument("--8bit", dest="use_8bit", action="store_true", help="Use 8-bit AdamW (requires bitsandbytes)")
+    parser.add_argument("--no-segments", dest="use_segments", action="store_false", 
+                        help="Profile single forward pass instead of segment-by-segment (faster but less accurate)")
 
     args = parser.parse_args()
 
@@ -545,6 +742,7 @@ def main() -> None:
             device="cuda" if torch.cuda.is_available() else "cpu",
             dtype_str=args.dtype,
             detailed=args.detailed,
+            use_segments=args.use_segments,
         )
         return
 
