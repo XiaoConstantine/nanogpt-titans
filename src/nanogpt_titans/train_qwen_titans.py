@@ -76,7 +76,7 @@ class QwenTitansTrainConfig:
     use_self_mod_gate: bool = True
     use_warm_start: bool = False  # Start without for simplicity
     use_internal_loss: bool = True
-    internal_loss_weight: float = 0.1
+    internal_loss_weight: float = 0.01  # Reduced: raw loss is 100s-1000s
 
     # Training
     learning_rate: float = 1e-4
@@ -661,7 +661,7 @@ def main() -> None:
     parser.add_argument("--use_warm_start", action="store_true", default=False)
     parser.add_argument("--use_internal_loss", action="store_true", default=True)
     parser.add_argument("--no_internal_loss", action="store_true")
-    parser.add_argument("--internal_loss_weight", type=float, default=0.1)
+    parser.add_argument("--internal_loss_weight", type=float, default=0.01)
 
     # I/O arguments
     parser.add_argument("--output_dir", type=str, default="out-qwen-titans")

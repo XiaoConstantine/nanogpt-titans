@@ -84,8 +84,9 @@ class TitansQwenConfig:
     warm_start_layers: int = 2  # Transformer layers in warm start encoder
 
     # Internal loss (self-supervised signal for memory)
+    # Uses memory's own prediction error: ||M(k) - v||^2
     use_internal_loss: bool = True
-    internal_loss_weight: float = 0.1
+    internal_loss_weight: float = 0.01  # Reduced: raw loss is 100s-1000s
 
     @classmethod
     def from_qwen_config(

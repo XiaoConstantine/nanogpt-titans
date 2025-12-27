@@ -234,12 +234,11 @@ class TitansQwenDecoderLayer(nn.Module):
             gate_value = self.gate(attn_output)  # [B, T, 1]
             output = attn_output + gate_value * mem_projected
 
-        # 5. Compute internal loss (self-supervised signal for memory)
+        # 5. Compute internal loss (memory's own prediction error)
+        # This is the Titans paper approach: ||M(k) - v||^2
+        # Memory predicts its own stored values, NOT transformer output
         if self.config.use_internal_loss and self.training:
-            with torch.no_grad():
-                target = attn_output.detach()
-            prediction = mem_projected
-            self._internal_loss = ((prediction - target) ** 2).mean()
+            self._internal_loss = self._compute_memory_surprise(hidden_states)
 
         # 6. Update memory with segment output
         if self.update_memory:
@@ -280,3 +279,41 @@ class TitansQwenDecoderLayer(nn.Module):
             }
         else:
             return {"gate_bias": self.gate[0].bias.item()}
+
+    def _compute_memory_surprise(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Compute memory's own prediction error: ||M(k) - v||^2
+
+        This is the correct internal loss from Titans paper.
+        Memory predicts what IT would store, not what the transformer computes.
+
+        Args:
+            hidden_states: Input to memory [B, T, C]
+
+        Returns:
+            Scalar loss tensor
+        """
+        import torch.nn.functional as F
+
+        # Get the underlying NeuralMemory (handle CMS case)
+        if self._use_cms:
+            # For CMS, compute surprise for first (fastest) memory level
+            mem = self.memory.memories[0].memory
+        else:
+            mem = self.memory.memory
+
+        # Detach input - we don't want LM gradients flowing through this
+        x = hidden_states.detach()
+
+        # Project to keys and values (what memory would store)
+        keys = mem.key_proj(x)      # [B, T, C]
+        values = mem.value_proj(x)  # [B, T, C]
+
+        # Get memory's prediction for these keys
+        # Note: memory_mlp expects [B, T, C] and outputs [B, T, C]
+        predictions = mem.memory_mlp(keys)  # [B, T, C]
+
+        # Compute MSE loss - this is what memory CAN learn to minimize
+        surprise_loss = F.mse_loss(predictions, values)
+
+        return surprise_loss
