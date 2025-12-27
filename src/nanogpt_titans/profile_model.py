@@ -677,8 +677,15 @@ def profile_qwen_training(
     print("\n" + "=" * 70)
     print("GATE STATISTICS")
     print("=" * 70)
-    for stats in get_gate_statistics(model):
-        print(f"  Gate mean: {stats.get('mean_gate', 'N/A'):.4f}")
+    gate_stats = get_gate_statistics(model)
+    if isinstance(gate_stats, dict):
+        for layer_idx, stats in gate_stats.items():
+            if isinstance(stats, dict):
+                print(f"  Layer {layer_idx}: gate mean = {stats.get('mean_gate', 'N/A'):.4f}")
+            else:
+                print(f"  Layer {layer_idx}: {stats}")
+    else:
+        print(f"  Gate stats: {gate_stats}")
 
     # Memory info
     if device.type == "cuda":
