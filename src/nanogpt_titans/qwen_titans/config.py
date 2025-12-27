@@ -76,7 +76,7 @@ class TitansQwenConfig:
     use_self_mod_proj: bool = True  # Self-modifying projection
     use_self_mod_gate: bool = True  # Self-modifying gate
     self_mod_lr: float = 0.001  # Learning rate for delta rule updates
-    gate_init_bias: float = -2.0  # sigmoid(-2) ~ 0.12, conservative start
+    gate_init_bias: float = -0.5  # sigmoid(-0.5) ~ 0.38, more aggressive start
 
     # Warm start (initialize memory from input instead of random)
     use_warm_start: bool = True
