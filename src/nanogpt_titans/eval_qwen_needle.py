@@ -439,7 +439,7 @@ def main() -> None:
         args.model_name,
         torch_dtype=dtype,
         trust_remote_code=True,
-        attn_implementation="eager",  # Use eager attention for Titans compatibility
+        attn_implementation="sdpa" if torch.cuda.is_available() else "eager",
     )
 
     # Patch with Titans if requested

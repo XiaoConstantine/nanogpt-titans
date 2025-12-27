@@ -241,12 +241,16 @@ def train(config: QwenTitansTrainConfig) -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # SDPA is faster than eager attention and works with Titans
+    # (Titans uses gated residual, doesn't modify attention masks)
+    attn_impl = "sdpa" if torch.cuda.is_available() else "eager"
     model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
         torch_dtype=dtype,
         trust_remote_code=True,
-        attn_implementation="eager",  # Use eager attention for Titans compatibility
+        attn_implementation=attn_impl,
     )
+    print(f"Using attention implementation: {attn_impl}")
 
     # Create Titans config with HOPE features
     titans_config = TitansQwenConfig.from_qwen_config(

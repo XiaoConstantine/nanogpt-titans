@@ -347,14 +347,16 @@ def profile_qwen_training(
     print(f"Segment-by-segment: {use_segments}")
     print()
 
-    # Load model
+    # Load model - use SDPA for faster attention
     print(f"Loading {model_name}...")
+    attn_impl = "sdpa" if device.type == "cuda" else "eager"
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=dtype,
         device_map=device,
-        attn_implementation="eager",
+        attn_implementation=attn_impl,
     )
+    print(f"Using attention implementation: {attn_impl}")
 
     # Get model config
     qwen_config = model.config

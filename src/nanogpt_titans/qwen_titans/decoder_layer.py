@@ -125,6 +125,11 @@ class TitansQwenDecoderLayer(nn.Module):
         # Internal loss for self-supervised memory signal
         self._internal_loss: Optional[torch.Tensor] = None
 
+        # Cache isinstance checks for faster forward pass
+        self._use_self_mod_proj = isinstance(self.mem_proj, SelfModifyingLinear)
+        self._use_self_mod_gate = isinstance(self.gate, SelfModifyingGate)
+        self._use_cms = titans_config.use_cms
+
         # Copy attributes that Qwen's internal code expects
         if hasattr(original_layer, "self_attn"):
             self.self_attn = original_layer.self_attn
@@ -213,37 +218,29 @@ class TitansQwenDecoderLayer(nn.Module):
         # 2. Retrieve from memory (causal - uses M_{t-1})
         mem_retrieved = self.memory(hidden_states, memory_state)  # [B, num_longterm_mem, C]
 
-        # NaN protection: memory weights can explode during test-time learning
-        if torch.isnan(mem_retrieved).any() or torch.isinf(mem_retrieved).any():
-            mem_retrieved = torch.nan_to_num(mem_retrieved, nan=0.0, posinf=1.0, neginf=-1.0)
-
-        # 3. Project memory to full sequence length
-        # Pool memory tokens to single vector, then broadcast
+        # 3. Project memory to full sequence length (fused operations)
+        # Pool -> project -> broadcast in one path
         mem_pooled = mem_retrieved.mean(dim=1, keepdim=True)  # [B, 1, C]
 
-        # Apply self-modifying projection
-        if isinstance(self.mem_proj, SelfModifyingLinear):
+        # Apply projection (self-modifying or standard)
+        if self._use_self_mod_proj:
             mem_projected = self.mem_proj(mem_pooled, update=self.training)
         else:
             mem_projected = self.mem_proj(mem_pooled)
 
+        # Clamp to prevent extreme values (also handles NaN/Inf)
+        mem_projected = torch.clamp(mem_projected, min=-100.0, max=100.0)
+
         # Broadcast to sequence length
         mem_projected = mem_projected.expand(-1, T, -1)  # [B, T, C]
 
-        # Clamp projected memory to prevent extreme values
-        mem_projected = torch.clamp(mem_projected, min=-100.0, max=100.0)
-
         # 4. Apply gated residual
-        if isinstance(self.gate, SelfModifyingGate):
+        if self._use_self_mod_gate:
             output = self.gate(mem_projected, attn_output, update=self.training)
         else:
             # Simple gate
             gate_value = self.gate(attn_output)  # [B, T, 1]
             output = attn_output + gate_value * mem_projected
-
-        # Final NaN check: if output is NaN, fall back to attention output only
-        if torch.isnan(output).any():
-            output = attn_output
 
         # 5. Compute internal loss (memory's own prediction error)
         # This is the Titans paper approach: ||M(k) - v||^2

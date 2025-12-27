@@ -258,16 +258,18 @@ class ContinuumMemorySystem(nn.Module):
         Returns:
             Combined memory output [B, num_longterm_mem, C]
         """
-        # Retrieve from each level
-        level_outputs = []
         weights = F.softmax(self.level_weights, dim=0)
 
-        for i, (mem, level_state) in enumerate(zip(self.memories, state.level_states)):
-            mem_out = mem(hidden_states, level_state)  # [B, num_longterm_mem, C]
-            level_outputs.append(weights[i] * mem_out)
+        # Fused retrieval: stack outputs and apply weights in one operation
+        # This reduces Python loop overhead and enables better GPU utilization
+        level_outputs = torch.stack([
+            mem(hidden_states, level_state)
+            for mem, level_state in zip(self.memories, state.level_states)
+        ], dim=0)  # [num_levels, B, num_longterm_mem, C]
 
-        # Combine: weighted sum
-        combined = sum(level_outputs)
+        # Apply weights: [num_levels, 1, 1, 1] * [num_levels, B, T, C] -> weighted sum
+        weights_expanded = weights.view(-1, 1, 1, 1)
+        combined = (weights_expanded * level_outputs).sum(dim=0)  # [B, num_longterm_mem, C]
 
         return combined
 

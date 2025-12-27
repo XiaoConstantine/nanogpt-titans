@@ -254,11 +254,13 @@ def load_qwen_model(
 
     print(f"Loading {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    # Use SDPA for faster attention on CUDA
+    attn_impl = "sdpa" if "cuda" in device else "eager"
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=dtype,
         device_map=device,
-        attn_implementation="eager",
+        attn_implementation=attn_impl,
     )
 
     if titans_state:
