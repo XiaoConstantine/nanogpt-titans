@@ -414,11 +414,12 @@ def train(config: QwenTitansTrainConfig) -> None:
                                 loss = loss + config.internal_loss_weight * internal_loss
                                 total_internal_loss += internal_loss.item()
 
-                    # Check for NaN in main loss
+                    # Check for NaN in main loss - skip this segment if NaN
                     if torch.isnan(loss):
-                        print(f"WARNING: NaN detected in loss at step {step}, segment {start}:{end}")
-                        loss = torch.tensor(1e-5, device=device)
-                    
+                        print(f"WARNING: NaN detected in loss at step {step}, segment {start}:{end}, skipping")
+                        state_manager.sync_from_layers()
+                        continue  # Skip backward for this segment
+
                     # Scale loss ONCE for gradient accumulation across both micro-steps AND segments
                     # Total divisor: accumulation steps × segments per sequence
                     total_divisor = config.gradient_accumulation_steps * seq_segments
