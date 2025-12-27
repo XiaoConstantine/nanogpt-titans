@@ -16,8 +16,12 @@ from nanogpt_titans.model import (
     TitansGPT,
 )
 
+# Qwen integration (HOPE-Titans)
+from nanogpt_titans import qwen_titans
+
 __version__ = "0.1.0"
 __all__ = [
+    # Core Titans
     "MLP",
     "CausalSelfAttention",
     "LayerNorm",
@@ -26,4 +30,6 @@ __all__ = [
     "TitansBlock",
     "TitansConfig",
     "TitansGPT",
+    # Qwen integration
+    "qwen_titans",
 ]
