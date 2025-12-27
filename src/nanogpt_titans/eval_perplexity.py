@@ -309,13 +309,15 @@ def evaluate_qwen_perplexity_by_position(
     position_losses: dict[str, list[float]] = {"early": [], "middle": [], "late": []}
     total_losses: list[float] = []
 
+    skipped_short = 0
     for text in tqdm(texts, desc="Evaluating"):
-        # Tokenize
-        tokens = tokenizer(text, return_tensors="pt", truncation=True, max_length=4096)
+        # Tokenize - use longer max_length for proper eval
+        tokens = tokenizer(text, return_tensors="pt", truncation=True, max_length=8192)
         input_ids = tokens["input_ids"].to(device)
         seq_len = input_ids.size(1)
 
         if seq_len < segment_len * 2:
+            skipped_short += 1
             continue  # Skip short sequences
 
         num_segments = seq_len // segment_len
@@ -373,7 +375,7 @@ def evaluate_qwen_perplexity_by_position(
 
     # Compute perplexities
     if not total_losses:
-        return {"error": "No valid losses computed"}
+        return {"error": f"No valid losses computed. Skipped {skipped_short} short sequences (need >= {segment_len * 2} tokens)"}
 
     overall_loss = float(np.mean(total_losses))
     overall_ppl = math.exp(overall_loss)
@@ -457,19 +459,35 @@ def main() -> None:
 
         if args.dataset == "wikitext":
             dataset = load_dataset("wikitext", "wikitext-103-v1", split="test")
-            texts = [t for t in dataset["text"] if len(t) > 500][:args.num_samples]
+            # Concatenate texts to create long sequences
+            # WikiText articles are short, so we join them
+            all_text = "\n\n".join([t for t in dataset["text"] if t.strip()])
+            
+            # Split into chunks of ~8K tokens (~32K chars)
+            min_chars = segment_len * 8 * 4  # 8 segments worth
+            texts = []
+            for i in range(0, len(all_text), min_chars):
+                chunk = all_text[i:i + min_chars]
+                if len(chunk) > segment_len * 2 * 4:  # At least 2 segments
+                    texts.append(chunk)
+                if len(texts) >= args.num_samples:
+                    break
+            print(f"Created {len(texts)} long text chunks (~{min_chars} chars each)")
         else:
             # Fallback to local data if available
             data_dir = Path("data") / args.dataset
             val_path = data_dir / "val.bin"
             if val_path.exists():
                 data = np.memmap(val_path, dtype=np.uint16, mode="r")
-                # Convert to text (basic decode)
-                texts = [tokenizer.decode(data[i:i+2048].tolist()) for i in range(0, min(len(data), args.num_samples * 2048), 2048)]
+                # Convert to text - use longer chunks for proper eval
+                chunk_size = segment_len * 4  # 4 segments worth
+                texts = [tokenizer.decode(data[i:i+chunk_size].tolist()) 
+                         for i in range(0, min(len(data), args.num_samples * chunk_size), chunk_size)]
             else:
                 print(f"Dataset {args.dataset} not found. Using wikitext.")
                 dataset = load_dataset("wikitext", "wikitext-103-v1", split="test")
-                texts = [t for t in dataset["text"] if len(t) > 500][:args.num_samples]
+                min_chars = segment_len * 2 * 4
+                texts = [t for t in dataset["text"] if len(t) > min_chars][:args.num_samples]
 
         print(f"Evaluating on {len(texts)} samples...")
 

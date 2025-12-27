@@ -20,6 +20,9 @@ MAX_LENGTH=8192  # 8K tokens - key change!
 SEGMENT_LEN=512  # 16 segments per sequence
 MEMORY_LAYERS="8,12,16"  # Multiple layers
 
+# Create output directory
+mkdir -p "$OUTPUT_DIR"
+
 echo "=============================================="
 echo "Titans L100 Validation Training"
 echo "=============================================="
