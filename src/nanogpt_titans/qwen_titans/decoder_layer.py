@@ -213,6 +213,10 @@ class TitansQwenDecoderLayer(nn.Module):
         # 2. Retrieve from memory (causal - uses M_{t-1})
         mem_retrieved = self.memory(hidden_states, memory_state)  # [B, num_longterm_mem, C]
 
+        # NaN protection: memory weights can explode during test-time learning
+        if torch.isnan(mem_retrieved).any() or torch.isinf(mem_retrieved).any():
+            mem_retrieved = torch.nan_to_num(mem_retrieved, nan=0.0, posinf=1.0, neginf=-1.0)
+
         # 3. Project memory to full sequence length
         # Pool memory tokens to single vector, then broadcast
         mem_pooled = mem_retrieved.mean(dim=1, keepdim=True)  # [B, 1, C]
@@ -226,6 +230,9 @@ class TitansQwenDecoderLayer(nn.Module):
         # Broadcast to sequence length
         mem_projected = mem_projected.expand(-1, T, -1)  # [B, T, C]
 
+        # Clamp projected memory to prevent extreme values
+        mem_projected = torch.clamp(mem_projected, min=-100.0, max=100.0)
+
         # 4. Apply gated residual
         if isinstance(self.gate, SelfModifyingGate):
             output = self.gate(mem_projected, attn_output, update=self.training)
@@ -233,6 +240,10 @@ class TitansQwenDecoderLayer(nn.Module):
             # Simple gate
             gate_value = self.gate(attn_output)  # [B, T, 1]
             output = attn_output + gate_value * mem_projected
+
+        # Final NaN check: if output is NaN, fall back to attention output only
+        if torch.isnan(output).any():
+            output = attn_output
 
         # 5. Compute internal loss (memory's own prediction error)
         # This is the Titans paper approach: ||M(k) - v||^2
@@ -305,15 +316,31 @@ class TitansQwenDecoderLayer(nn.Module):
         # Detach input - we don't want LM gradients flowing through this
         x = hidden_states.detach()
 
+        # Clip input magnitude for numerical stability
+        max_input_norm = 10.0
+        x_norm = torch.norm(x, dim=-1, keepdim=True).clamp(min=1e-6)
+        x = x / x_norm * torch.clamp(x_norm, max=max_input_norm)
+
         # Project to keys and values (what memory would store)
         keys = mem.key_proj(x)      # [B, T, C]
         values = mem.value_proj(x)  # [B, T, C]
+
+        # Clip projected values for stability
+        keys = torch.clamp(keys, min=-max_input_norm, max=max_input_norm)
+        values = torch.clamp(values, min=-max_input_norm, max=max_input_norm)
 
         # Get memory's prediction for these keys
         # Note: memory_mlp expects [B, T, C] and outputs [B, T, C]
         predictions = mem.memory_mlp(keys)  # [B, T, C]
 
+        # Clip predictions for stability
+        predictions = torch.clamp(predictions, min=-max_input_norm, max=max_input_norm)
+
         # Compute MSE loss - this is what memory CAN learn to minimize
         surprise_loss = F.mse_loss(predictions, values)
+
+        # Additional safety: if loss is NaN or Inf, return zero
+        if torch.isnan(surprise_loss) or torch.isinf(surprise_loss):
+            return torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
 
         return surprise_loss

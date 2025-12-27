@@ -851,7 +851,16 @@ class NeuralMemory(nn.Module):
                 # Weight update: w = decay*w - lr*momentum
                 decay_factor = 1 - self.decay
                 updated_weights = decay_factor * state.weights[name] - self.lr * final_momentum
+
+                # Clamp weights to prevent explosion (numerical stability)
+                updated_weights = torch.clamp(updated_weights, min=-10.0, max=10.0)
                 new_weights[name] = updated_weights.detach().contiguous()
+
+        # Clamp all weights for numerical stability (covers all code paths)
+        new_weights = {
+            name: torch.clamp(w, min=-10.0, max=10.0)
+            for name, w in new_weights.items()
+        }
 
         return MemoryState(
             weights=new_weights,

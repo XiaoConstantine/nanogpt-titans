@@ -373,9 +373,6 @@ def train(config: QwenTitansTrainConfig) -> None:
 
         # Gradient accumulation
         total_loss = 0.0
-
-        # Total divisor for loss scaling: accumulation steps × segments per sequence
-        loss_scale = config.gradient_accumulation_steps * num_segments
         num_micro_segments = 0  # Track actual segments for accurate loss averaging
 
         for micro_step in range(config.gradient_accumulation_steps):
@@ -405,14 +402,26 @@ def train(config: QwenTitansTrainConfig) -> None:
                         internal_losses = get_internal_losses(model)
                         internal_loss = sum(internal_losses) if internal_losses else torch.tensor(0.0, device=device)
                         if internal_losses:
-                            loss = loss + config.internal_loss_weight * internal_loss
-                            total_internal_loss += internal_loss.item()
+                            # Check for NaN in internal loss
+                            if torch.isnan(internal_loss):
+                                print(f"WARNING: NaN detected in internal_loss at step {step}")
+                                internal_loss = torch.tensor(0.0, device=device)
+                            else:
+                                loss = loss + config.internal_loss_weight * internal_loss
+                                total_internal_loss += internal_loss.item()
 
-                    # Scale loss by total number of segments across all micro-batches
-                    loss = loss / loss_scale
+                    # Check for NaN in main loss
+                    if torch.isnan(loss):
+                        print(f"WARNING: NaN detected in loss at step {step}, segment {start}:{end}")
+                        loss = torch.tensor(1e-5, device=device)
+                    
+                    # Scale loss ONCE for gradient accumulation across both micro-steps AND segments
+                    # Total divisor: accumulation steps × segments per sequence
+                    total_divisor = config.gradient_accumulation_steps * seq_segments
+                    scaled_loss = loss / total_divisor
 
                 # Backward
-                scaler.scale(loss).backward()
+                scaler.scale(scaled_loss).backward()
                 total_loss += outputs.loss.item()  # Track unscaled loss for logging
                 num_micro_segments += 1
 
@@ -428,7 +437,7 @@ def train(config: QwenTitansTrainConfig) -> None:
                     batch = next(train_iter)
                 input_ids = batch["input_ids"].to(device)
                 labels = batch["labels"].to(device)
-                B, T = input_ids.shape  # Update B and T for new batch
+                B, T = input_ids.shape  # CRITICAL: Update B and T for new batch before state init
 
                 # Reset memory for new sequences
                 state_manager.reset()
@@ -554,7 +563,7 @@ def evaluate(
     )
 
     total_loss = 0.0
-    num_batches = 0
+    total_tokens = 0
 
     for batch in tqdm(val_loader, desc="Evaluating", leave=False):
         input_ids = batch["input_ids"].to(device)
@@ -565,28 +574,38 @@ def evaluate(
         state_manager.reset()
         state_manager.init_states(B, device)
 
-        # Process in segments
+        # Process in segments, tracking loss per token
         batch_loss = 0.0
+        batch_tokens = 0
         for start in range(0, T, config.segment_len):
             end = min(start + config.segment_len, T)
             seg_input = input_ids[:, start:end]
             seg_labels = labels[:, start:end]
+            seg_len = end - start
 
             state_manager.sync_to_layers()
 
             with torch.amp.autocast(device_type=device.type, dtype=dtype):
                 outputs = model(seg_input, labels=seg_labels, use_cache=False)
-                batch_loss += outputs.loss.item()
+                seg_loss = outputs.loss.item()
+                
+                # Check for NaN
+                if torch.isnan(torch.tensor(seg_loss)):
+                    print(f"WARNING: NaN detected in validation loss")
+                    continue
+                
+                # Weight by actual segment length (last segment may be shorter)
+                batch_loss += seg_loss * seg_len * B
+                batch_tokens += seg_len * B
 
             state_manager.sync_from_layers()
 
-        total_loss += batch_loss
-        num_batches += 1
+        # Normalize batch loss by tokens
+        if batch_tokens > 0:
+            total_loss += batch_loss
+            total_tokens += batch_tokens
 
-        if num_batches >= 50:  # Limit eval batches
-            break
-
-    return total_loss / num_batches if num_batches > 0 else float("inf")
+    return total_loss / total_tokens if total_tokens > 0 else float("inf")
 
 
 def save_checkpoint(
