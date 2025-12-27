@@ -331,25 +331,26 @@ def load_titans_state(model: nn.Module, path: str) -> None:
         for name, param in layer.memory.named_parameters():
             key = f"{layer_key}.memory.{name}"
             if key in titans_state:
-                param.data.copy_(titans_state[key])
+                # Convert dtype to match model parameter
+                param.data.copy_(titans_state[key].to(param.dtype))
 
         # Projection parameters
         for name, param in layer.mem_proj.named_parameters():
             key = f"{layer_key}.mem_proj.{name}"
             if key in titans_state:
-                param.data.copy_(titans_state[key])
+                param.data.copy_(titans_state[key].to(param.dtype))
 
         # Gate parameters
         for name, param in layer.gate.named_parameters():
             key = f"{layer_key}.gate.{name}"
             if key in titans_state:
-                param.data.copy_(titans_state[key])
+                param.data.copy_(titans_state[key].to(param.dtype))
 
         # Warm start parameters (if present)
         if layer.warm_start is not None:
             for name, param in layer.warm_start.named_parameters():
                 key = f"{layer_key}.warm_start.{name}"
                 if key in titans_state:
-                    param.data.copy_(titans_state[key])
+                    param.data.copy_(titans_state[key].to(param.dtype))
 
     print(f"Loaded Titans state from {path}")
