@@ -78,6 +78,11 @@ class QwenTitansTrainConfig:
     use_internal_loss: bool = True
     internal_loss_weight: float = 0.01  # Reduced: raw loss is 100s-1000s
 
+    # Gate warmup: freeze gate open for first N steps to let memory learn
+    # Without this, gate closes before memory learns anything useful
+    gate_warmup_steps: int = 500  # Keep gate frozen for first 500 steps
+    gate_min_value: float = 0.1  # Regularize gate to stay above this
+
     # Training
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
@@ -184,6 +189,57 @@ def get_lr(step: int, config: QwenTitansTrainConfig) -> float:
     return config.learning_rate * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
+def get_gate_params(titans_layers) -> list[torch.nn.Parameter]:
+    """Get all gate parameters from Titans layers."""
+    gate_params = []
+    for layer in titans_layers:
+        if hasattr(layer, "gate"):
+            for param in layer.gate.parameters():
+                gate_params.append(param)
+    return gate_params
+
+
+def set_gate_trainable(titans_layers, trainable: bool) -> None:
+    """Enable/disable gradient for gate parameters."""
+    for layer in titans_layers:
+        if hasattr(layer, "gate"):
+            for param in layer.gate.parameters():
+                param.requires_grad = trainable
+
+
+def compute_gate_regularization(titans_layers, min_value: float = 0.1) -> torch.Tensor:
+    """
+    Compute regularization loss to prevent gate from collapsing to 0.
+
+    Penalizes gate values below min_value using a soft penalty.
+    """
+    from nanogpt_titans.qwen_titans.memory_adapter import SelfModifyingGate
+
+    total_penalty = 0.0
+    count = 0
+
+    for layer in titans_layers:
+        if hasattr(layer, "gate"):
+            if isinstance(layer.gate, SelfModifyingGate):
+                # For self-modifying gate, use the bias to compute expected gate value
+                gate_bias = layer.gate.gate_proj.bias
+                expected_gate = torch.sigmoid(gate_bias)
+            else:
+                # For simple gate, use the bias directly
+                gate_bias = layer.gate[0].bias
+                expected_gate = torch.sigmoid(gate_bias)
+
+            # Soft penalty: max(0, min_value - gate)^2
+            penalty = F.relu(min_value - expected_gate) ** 2
+            total_penalty = total_penalty + penalty.sum()
+            count += 1
+
+    if count == 0:
+        return torch.tensor(0.0)
+
+    return total_penalty / count
+
+
 def collect_diagnostics(model, titans_layers) -> dict:
     """
     Collect Phase 3 diagnostic metrics.
@@ -281,6 +337,12 @@ def train(config: QwenTitansTrainConfig) -> None:
     # Get Titans layers for diagnostics
     titans_layers = get_titans_layers(model)
 
+    # Gate warmup: freeze gate initially so memory can learn before gate collapses
+    gate_warmup_active = config.gate_warmup_steps > 0
+    if gate_warmup_active:
+        print(f"\nGate warmup: freezing gate for first {config.gate_warmup_steps} steps")
+        set_gate_trainable(titans_layers, trainable=False)
+
     # Move to device
     model.to(device)
 
@@ -346,6 +408,12 @@ def train(config: QwenTitansTrainConfig) -> None:
             scaler.load_state_dict(checkpoint["scaler_state_dict"])
         print(f"Resumed from step {start_step}, best_val_loss: {best_val_loss:.4f}")
 
+        # If resuming past gate warmup, unfreeze gate
+        if start_step >= config.gate_warmup_steps and gate_warmup_active:
+            print(f"Resume step {start_step} >= gate_warmup_steps {config.gate_warmup_steps}, unfreezing gate")
+            set_gate_trainable(titans_layers, trainable=True)
+            gate_warmup_active = False
+
     # Training loop
     print(f"\nStarting training for {config.max_steps} steps...")
     model.train()
@@ -360,6 +428,16 @@ def train(config: QwenTitansTrainConfig) -> None:
     total_internal_loss = 0.0
 
     while step < config.max_steps:
+        # Gate warmup: unfreeze gate after warmup period
+        if gate_warmup_active and step == config.gate_warmup_steps:
+            print(f"\nStep {step}: Gate warmup complete, unfreezing gate parameters")
+            set_gate_trainable(titans_layers, trainable=True)
+            # Re-add gate params to optimizer
+            gate_params = get_gate_params(titans_layers)
+            if gate_params:
+                optimizer.add_param_group({"params": gate_params, "lr": config.learning_rate})
+            gate_warmup_active = False
+
         # Get batch
         try:
             batch = next(train_iter)
@@ -413,6 +491,13 @@ def train(config: QwenTitansTrainConfig) -> None:
                             else:
                                 loss = loss + config.internal_loss_weight * internal_loss
                                 total_internal_loss += internal_loss.item()
+
+                    # Gate regularization: prevent gate from collapsing to 0
+                    # Only apply after warmup (when gate is trainable)
+                    if not gate_warmup_active and config.gate_min_value > 0:
+                        gate_reg = compute_gate_regularization(titans_layers, config.gate_min_value)
+                        if gate_reg.item() > 0:
+                            loss = loss + 0.1 * gate_reg  # Light regularization weight
 
                     # Check for NaN in main loss - skip this segment if NaN
                     if torch.isnan(loss):
@@ -687,6 +772,12 @@ def main() -> None:
     parser.add_argument("--no_internal_loss", action="store_true")
     parser.add_argument("--internal_loss_weight", type=float, default=0.01)
 
+    # Gate warmup: prevent gate collapse
+    parser.add_argument("--gate_warmup_steps", type=int, default=500,
+                        help="Keep gate frozen for first N steps to let memory learn")
+    parser.add_argument("--gate_min_value", type=float, default=0.1,
+                        help="Regularize gate to stay above this value")
+
     # I/O arguments
     parser.add_argument("--output_dir", type=str, default="out-qwen-titans")
     parser.add_argument("--resume_from", type=str, default=None)
@@ -716,6 +807,9 @@ def main() -> None:
         "use_warm_start": args.use_warm_start,
         "use_internal_loss": args.use_internal_loss and not args.no_internal_loss,
         "internal_loss_weight": args.internal_loss_weight,
+        # Gate warmup
+        "gate_warmup_steps": args.gate_warmup_steps,
+        "gate_min_value": args.gate_min_value,
         # Training
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,

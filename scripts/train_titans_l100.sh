@@ -101,6 +101,8 @@ if [[ "$EVAL_ONLY" == "false" ]]; then
     echo "=============================================="
 
     # Build training command
+    # Note: gate_warmup_steps keeps gate frozen for first 500 steps so memory can learn
+    # before gate has a chance to collapse (chicken-egg problem fix)
     TRAIN_CMD="uv run python -m nanogpt_titans.train_qwen_titans \
         --model_name $MODEL \
         --output_dir $OUTPUT_DIR \
@@ -116,6 +118,8 @@ if [[ "$EVAL_ONLY" == "false" ]]; then
         --save_interval 500 \
         --num_cms_levels 3 \
         --internal_loss_weight 0.001 \
+        --gate_warmup_steps 500 \
+        --gate_min_value 0.1 \
         --dataset_name wikitext \
         --dataset_config wikitext-103-raw-v1"
 
