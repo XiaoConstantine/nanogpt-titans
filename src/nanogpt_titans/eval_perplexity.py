@@ -1,5 +1,5 @@
 """
-Perplexity evaluation for TitansGPT.
+Perplexity evaluation for TitansGPT and Qwen-Titans.
 
 This script evaluates perplexity at different positions in sequences
 to demonstrate the benefit of the Titans memory mechanism.
@@ -10,7 +10,14 @@ Key metrics:
 - Comparison with baseline (no memory context)
 
 Usage:
+    # TitansGPT (nanoGPT-based)
     uv run python -m nanogpt_titans.eval_perplexity --checkpoint=out-titans/ckpt.pt --dataset=wikitext103
+
+    # Qwen-Titans
+    uv run python -m nanogpt_titans.eval_perplexity --qwen --model_name=Qwen/Qwen2-0.5B --titans_state=out-qwen-titans/titans_state_final.pt
+
+    # Base Qwen (no memory, for comparison)
+    uv run python -m nanogpt_titans.eval_perplexity --qwen --model_name=Qwen/Qwen2-0.5B
 """
 
 from __future__ import annotations
@@ -22,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
+from torch import nn
 from tqdm import tqdm
 
 from nanogpt_titans.model import TitansConfig, TitansGPT
@@ -217,34 +225,299 @@ def print_results(results: dict[str, Any], model_name: str = "Model") -> None:
         print(f"  Segment {seg_idx:2d}: {data['perplexity']:6.2f} {bar}")
 
 
+# =============================================================================
+# Qwen-Titans Support
+# =============================================================================
+
+
+def load_qwen_model(
+    model_name: str,
+    titans_state: str | None,
+    memory_layers: list[int],
+    segment_len: int,
+    device: str,
+    dtype: torch.dtype,
+) -> tuple[nn.Module, Any, int]:
+    """
+    Load Qwen model, optionally with Titans memory.
+
+    Returns:
+        Tuple of (model, tokenizer, segment_len)
+    """
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    from nanogpt_titans.qwen_titans import (
+        TitansQwenConfig,
+        patch_qwen_with_titans,
+        load_titans_state,
+    )
+
+    print(f"Loading {model_name}...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=dtype,
+        device_map=device,
+        attn_implementation="eager",
+    )
+
+    if titans_state:
+        # Patch with Titans memory
+        titans_config = TitansQwenConfig.from_qwen_config(
+            model.config,
+            segment_len=segment_len,
+            memory_layers=memory_layers,
+        )
+        print(f"Patching with Titans memory at layers {memory_layers}...")
+        model = patch_qwen_with_titans(model, titans_config)
+        load_titans_state(model, titans_state)
+
+    model.eval()
+    return model, tokenizer, segment_len
+
+
+def evaluate_qwen_perplexity_by_position(
+    model: nn.Module,
+    tokenizer: Any,
+    texts: list[str],
+    segment_len: int,
+    device: torch.device,
+    ctx: Any,
+    use_titans: bool = False,
+) -> dict[str, Any]:
+    """
+    Evaluate perplexity at different positions for Qwen models.
+
+    Args:
+        model: Qwen model (with or without Titans)
+        tokenizer: Tokenizer
+        texts: List of text samples to evaluate
+        segment_len: Segment length for processing
+        device: Device to use
+        ctx: Autocast context
+        use_titans: Whether model has Titans memory
+
+    Returns:
+        Dictionary with perplexity metrics
+    """
+    from nanogpt_titans.qwen_titans import TitansStateManager
+
+    if use_titans:
+        state_manager = TitansStateManager(model)
+
+    # Track losses by position
+    position_losses: dict[str, list[float]] = {"early": [], "middle": [], "late": []}
+    total_losses: list[float] = []
+
+    for text in tqdm(texts, desc="Evaluating"):
+        # Tokenize
+        tokens = tokenizer(text, return_tensors="pt", truncation=True, max_length=4096)
+        input_ids = tokens["input_ids"].to(device)
+        seq_len = input_ids.size(1)
+
+        if seq_len < segment_len * 2:
+            continue  # Skip short sequences
+
+        num_segments = seq_len // segment_len
+
+        if use_titans:
+            state_manager.reset()
+            state_manager.init_states(1, device)
+
+        segment_losses = []
+
+        with torch.no_grad(), ctx:
+            for seg_idx in range(num_segments):
+                start = seg_idx * segment_len
+                end = min(start + segment_len, seq_len - 1)
+
+                seg_input = input_ids[:, start:end]
+                seg_labels = input_ids[:, start + 1:end + 1]
+
+                if seg_input.size(1) != seg_labels.size(1):
+                    continue
+
+                if use_titans:
+                    state_manager.sync_to_layers()
+
+                outputs = model(seg_input, labels=seg_labels, use_cache=False)
+                loss = outputs.loss.item()
+
+                if use_titans:
+                    state_manager.sync_from_layers()
+
+                # Skip NaN losses
+                if not math.isnan(loss):
+                    segment_losses.append((seg_idx, loss))
+
+        if not segment_losses:
+            continue
+
+        # Categorize by position
+        num_segs = len(segment_losses)
+        for i, (seg_idx, loss) in enumerate(segment_losses):
+            total_losses.append(loss)
+
+            if num_segs <= 2:
+                if i == 0:
+                    position_losses["early"].append(loss)
+                else:
+                    position_losses["late"].append(loss)
+            else:
+                if i < num_segs // 3:
+                    position_losses["early"].append(loss)
+                elif i < 2 * num_segs // 3:
+                    position_losses["middle"].append(loss)
+                else:
+                    position_losses["late"].append(loss)
+
+    # Compute perplexities
+    if not total_losses:
+        return {"error": "No valid losses computed"}
+
+    overall_loss = float(np.mean(total_losses))
+    overall_ppl = math.exp(overall_loss)
+
+    by_position: dict[str, float] = {}
+    for pos in ["early", "middle", "late"]:
+        if position_losses[pos]:
+            avg_loss = float(np.mean(position_losses[pos]))
+            by_position[pos] = math.exp(avg_loss)
+        else:
+            by_position[pos] = 0.0
+
+    return {
+        "overall_perplexity": overall_ppl,
+        "overall_loss": overall_loss,
+        "by_position": by_position,
+        "num_samples": len(texts),
+        "num_valid_losses": len(total_losses),
+    }
+
+
 def main() -> None:
     """Entry point."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Evaluate TitansGPT perplexity")
+    parser = argparse.ArgumentParser(description="Evaluate TitansGPT or Qwen-Titans perplexity")
+    # Model selection
+    parser.add_argument("--qwen", action="store_true", help="Use Qwen-Titans instead of TitansGPT")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2-0.5B", help="Qwen model name")
+    parser.add_argument("--titans_state", type=str, default=None, help="Path to Titans state for Qwen")
+    parser.add_argument("--memory_layers", type=str, default="12", help="Memory layer indices (comma-separated)")
+    parser.add_argument("--segment_len", type=int, default=256, help="Segment length for Qwen")
+
+    # TitansGPT args
     parser.add_argument("--checkpoint", type=str, default="out-titans/ckpt.pt")
-    parser.add_argument("--dataset", type=str, default="wikitext103",
-                       choices=["shakespeare", "wikitext103", "openwebtext"])
+
+    # Common args
+    parser.add_argument("--dataset", type=str, default="wikitext",
+                       choices=["shakespeare", "wikitext103", "openwebtext", "wikitext"])
     parser.add_argument("--block_size", type=int, default=None,
                        help="Override block size (default: use model's)")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_batches", type=int, default=100)
+    parser.add_argument("--num_samples", type=int, default=50, help="Number of samples for Qwen eval")
     parser.add_argument("--device", type=str,
                        default="cuda" if torch.cuda.is_available()
                        else "mps" if torch.backends.mps.is_available()
                        else "cpu")
-    parser.add_argument("--dtype", type=str, default="float16")
+    parser.add_argument("--dtype", type=str, default="bfloat16")
 
     args = parser.parse_args()
+    memory_layers = [int(x.strip()) for x in args.memory_layers.split(",")]
 
     # Setup
     device = torch.device(args.device)
     device_type = "cuda" if "cuda" in args.device else "cpu"
 
     dtype_map = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
-    ptdtype = dtype_map.get(args.dtype, torch.float16)
+    ptdtype = dtype_map.get(args.dtype, torch.bfloat16)
     ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
+    # =========================================================================
+    # Qwen-Titans evaluation
+    # =========================================================================
+    if args.qwen:
+        model, tokenizer, segment_len = load_qwen_model(
+            model_name=args.model_name,
+            titans_state=args.titans_state,
+            memory_layers=memory_layers,
+            segment_len=args.segment_len,
+            device=args.device,
+            dtype=ptdtype,
+        )
+
+        use_titans = args.titans_state is not None
+        model_name = f"Qwen-Titans ({args.model_name})" if use_titans else f"Base Qwen ({args.model_name})"
+
+        # Load text data from HuggingFace datasets
+        print(f"\nLoading {args.dataset} dataset...")
+        from datasets import load_dataset
+
+        if args.dataset == "wikitext":
+            dataset = load_dataset("wikitext", "wikitext-103-v1", split="test")
+            texts = [t for t in dataset["text"] if len(t) > 500][:args.num_samples]
+        else:
+            # Fallback to local data if available
+            data_dir = Path("data") / args.dataset
+            val_path = data_dir / "val.bin"
+            if val_path.exists():
+                data = np.memmap(val_path, dtype=np.uint16, mode="r")
+                # Convert to text (basic decode)
+                texts = [tokenizer.decode(data[i:i+2048].tolist()) for i in range(0, min(len(data), args.num_samples * 2048), 2048)]
+            else:
+                print(f"Dataset {args.dataset} not found. Using wikitext.")
+                dataset = load_dataset("wikitext", "wikitext-103-v1", split="test")
+                texts = [t for t in dataset["text"] if len(t) > 500][:args.num_samples]
+
+        print(f"Evaluating on {len(texts)} samples...")
+
+        results = evaluate_qwen_perplexity_by_position(
+            model=model,
+            tokenizer=tokenizer,
+            texts=texts,
+            segment_len=segment_len,
+            device=device,
+            ctx=ctx,
+            use_titans=use_titans,
+        )
+
+        # Print results
+        print(f"\n{'=' * 60}")
+        print(f"PERPLEXITY EVALUATION: {model_name}")
+        print("=" * 60)
+
+        if "error" in results:
+            print(f"Error: {results['error']}")
+            return
+
+        print(f"\nOverall Perplexity: {results['overall_perplexity']:.2f}")
+        print(f"Overall Loss: {results['overall_loss']:.4f}")
+        print(f"Samples evaluated: {results['num_samples']}")
+        print(f"Valid losses: {results['num_valid_losses']}")
+
+        print("\nPerplexity by Position:")
+        for pos in ["early", "middle", "late"]:
+            ppl = results['by_position'].get(pos, 0)
+            if ppl > 0:
+                print(f"  {pos.capitalize():8s}: {ppl:.2f}")
+
+        early_ppl = results['by_position'].get('early', 0)
+        late_ppl = results['by_position'].get('late', 0)
+        if early_ppl > 0 and late_ppl > 0:
+            improvement = (early_ppl - late_ppl) / early_ppl * 100
+            print(f"\n  Improvement (early->late): {improvement:.1f}%")
+            if improvement > 0:
+                print("  ✓ Memory is helping with later positions")
+            else:
+                print("  ✗ Memory not showing benefit (may need more training)")
+
+        return
+
+    # =========================================================================
+    # TitansGPT evaluation (original)
+    # =========================================================================
     # Load data
     data_dir = Path("data") / args.dataset
     val_path = data_dir / "val.bin"
