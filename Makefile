@@ -99,11 +99,14 @@ kaggle-package:
 	rm -rf kaggle_package kaggle_titans.zip
 	mkdir -p kaggle_package/src/nanogpt_titans
 	cp -r src/nanogpt_titans/*.py kaggle_package/src/nanogpt_titans/
+	cp -r src/nanogpt_titans/qwen_titans kaggle_package/src/nanogpt_titans/
+	find kaggle_package -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+	find kaggle_package -type f -name "*.pyc" -delete 2>/dev/null || true
 	cp pyproject.toml kaggle_package/
 	cp README.md kaggle_package/ 2>/dev/null || true
 	@echo "Creating setup script..."
 	@echo '#!/bin/bash' > kaggle_package/setup.sh
-	@echo 'pip install tiktoken datasets tqdm' >> kaggle_package/setup.sh
+	@echo 'pip install tiktoken datasets tqdm transformers accelerate' >> kaggle_package/setup.sh
 	@echo 'export PYTHONPATH=$${PYTHONPATH}:$$(pwd)/src' >> kaggle_package/setup.sh
 	cd kaggle_package && zip -r ../kaggle_titans.zip .
 	rm -rf kaggle_package
