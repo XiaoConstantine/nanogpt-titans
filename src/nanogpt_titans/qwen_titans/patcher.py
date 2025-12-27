@@ -78,11 +78,23 @@ def patch_qwen_with_titans(
             print(f"Layer {idx} is already a Titans layer, skipping")
             continue
 
+        # Get device and dtype from original layer
+        device = next(original_layer.parameters()).device
+        dtype = next(original_layer.parameters()).dtype
+
         titans_layer = TitansQwenDecoderLayer(
             original_layer=original_layer,
             layer_idx=idx,
             titans_config=titans_config,
         )
+
+        # Move new Titans components to same device/dtype as original layer
+        titans_layer.memory.to(device=device, dtype=dtype)
+        titans_layer.mem_proj.to(device=device, dtype=dtype)
+        titans_layer.gate.to(device=device, dtype=dtype)
+        if titans_layer.warm_start is not None:
+            titans_layer.warm_start.to(device=device, dtype=dtype)
+
         layers[idx] = titans_layer
         print(f"Replaced layer {idx} with TitansQwenDecoderLayer")
 
