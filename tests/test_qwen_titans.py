@@ -569,6 +569,42 @@ class TestTitansQwenDecoderLayer:
         layer.set_memory_enabled(True)
         assert layer.memory_enabled is True
 
+    def test_all_hope_params_trainable_and_update(self, small_config, mock_qwen_layer):
+        """Test mem_scale, mem_ln, and gate are trainable and update during training."""
+        layer = TitansQwenDecoderLayer(mock_qwen_layer, 0, small_config)
+        
+        # Check all critical params exist and are trainable after proper setup
+        assert hasattr(layer, "mem_scale")
+        assert hasattr(layer, "mem_ln")
+        assert hasattr(layer, "gate")
+        
+        # Store initial values
+        initial_mem_scale = layer.mem_scale.clone().detach()
+        initial_gate_bias = layer.gate.gate_mlp[2].bias.clone().detach()
+        initial_mem_ln_weight = layer.mem_ln.weight.clone().detach()
+        
+        # Set to training mode
+        layer.train()
+        
+        # Create optimizer with only the layer's parameters
+        optimizer = torch.optim.AdamW(layer.parameters(), lr=1e-2)
+        
+        # Run a few training steps
+        for _ in range(5):
+            optimizer.zero_grad()
+            x = torch.randn(2, 32, 64)
+            out = layer(x)
+            if isinstance(out, tuple):
+                out = out[0]
+            loss = out.mean()
+            loss.backward()
+            optimizer.step()
+        
+        # Check values changed
+        assert not torch.allclose(initial_mem_scale, layer.mem_scale), "mem_scale should update"
+        assert not torch.allclose(initial_gate_bias, layer.gate.gate_mlp[2].bias), "gate should update"
+        assert not torch.allclose(initial_mem_ln_weight, layer.mem_ln.weight), "mem_ln should update"
+
 
 # --- Config Tests ---
 
