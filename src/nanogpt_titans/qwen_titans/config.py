@@ -65,10 +65,12 @@ class TitansQwenConfig:
     # HOPE-inspired configuration (from Nested Learning paper)
     # Uses gated residual integration (no sequence length change)
 
-    # Titans variant: "mac" (Memory as Context) or "mag" (Memory as Gate)
-    # MAC: memory tokens prepended to attention (original Titans)
-    # MAG: memory modulates attention via multiplicative gating (more stable)
-    titans_variant: str = "mag"  # Default to MAG for better stability
+    # Titans variant: "hope" (recommended), "mag", or "mal"
+    # HOPE: gated residual integration (fixed for pre-trained models) - RECOMMENDED
+    # MAG: memory modulates attention via multiplicative gating (deprecated)
+    # MAL: memory as preprocessing layer (deprecated)
+    # Note: "mac" is an alias for "hope" for backwards compatibility
+    titans_variant: str = "hope"  # Default to HOPE (the fixed implementation)
 
     # Continuum Memory System (multi-frequency memory)
     use_cms: bool = True  # Use multi-frequency memory levels
@@ -78,20 +80,22 @@ class TitansQwenConfig:
     )  # Update every N segments
 
     # Self-modifying components (online adaptation via delta rule)
-    use_self_mod_proj: bool = True  # Self-modifying projection
-    use_self_mod_gate: bool = True  # Self-modifying gate
+    # NOTE: use_self_mod_gate=False enables the new PositionDependentGate
+    use_self_mod_proj: bool = False  # Disabled: standard projection is more stable
+    use_self_mod_gate: bool = False  # Disabled: use PositionDependentGate instead
     self_mod_lr: float = 0.001  # Learning rate for delta rule updates
-    gate_init_bias: float = -0.5  # sigmoid(-0.5) ~ 0.38, more aggressive start
+    gate_init_bias: float = -2.0  # sigmoid(-2) ~ 0.12, conservative start
 
     # Warm start (initialize memory from input instead of random)
-    use_warm_start: bool = True
+    use_warm_start: bool = False  # Disabled: adds complexity, not proven to help
     warm_start_prefix_len: int = 32  # Tokens to use for warm start
     warm_start_layers: int = 2  # Transformer layers in warm start encoder
 
     # Internal loss (self-supervised signal for memory)
-    # Uses memory's own prediction error: ||M(k) - v||^2
-    use_internal_loss: bool = True
-    internal_loss_weight: float = 0.01  # Reduced: raw loss is 100s-1000s
+    # WARNING: Internal loss can dominate LM loss and train memory for wrong objective
+    # Keep disabled or use very small weight (1e-4 max)
+    use_internal_loss: bool = False  # DISABLED by default - causes degradation
+    internal_loss_weight: float = 0.0  # Set to 0 or 1e-4 max if enabled
 
     @classmethod
     def from_qwen_config(

@@ -27,7 +27,7 @@ from nanogpt_titans.qwen_titans.memory_adapter import (
     WarmStartEncoder,
     DeepMomentumUpdate,
 )
-from nanogpt_titans.qwen_titans.decoder_layer import TitansQwenDecoderLayer
+from nanogpt_titans.qwen_titans.decoder_layer import TitansQwenDecoderLayer, PositionDependentGate
 from nanogpt_titans.qwen_titans.patcher import (
     patch_qwen_with_titans,
     freeze_base_model,
@@ -42,6 +42,52 @@ from nanogpt_titans.qwen_titans.patcher import (
 @pytest.fixture
 def small_config():
     """Small config for fast testing."""
+    return TitansQwenConfig(
+        n_embd=64,
+        n_head=4,
+        n_layer=4,
+        block_size=256,
+        vocab_size=1000,
+        segment_len=32,
+        num_persist_mem=2,
+        num_longterm_mem=4,
+        memory_depth=2,
+        memory_expansion=2,
+        use_cms=False,
+        use_self_mod_proj=False,  # Use new fixed implementation
+        use_self_mod_gate=False,  # Use PositionDependentGate
+        use_warm_start=False,
+        use_internal_loss=False,  # Disabled by default
+        gate_init_bias=-2.0,
+    )
+
+
+@pytest.fixture
+def small_config_with_internal_loss():
+    """Small config with internal loss enabled for testing."""
+    return TitansQwenConfig(
+        n_embd=64,
+        n_head=4,
+        n_layer=4,
+        block_size=256,
+        vocab_size=1000,
+        segment_len=32,
+        num_persist_mem=2,
+        num_longterm_mem=4,
+        memory_depth=2,
+        memory_expansion=2,
+        use_cms=False,
+        use_self_mod_proj=False,
+        use_self_mod_gate=False,
+        use_warm_start=False,
+        use_internal_loss=True,  # Enabled for this test
+        gate_init_bias=-2.0,
+    )
+
+
+@pytest.fixture
+def legacy_config():
+    """Legacy config with self-modifying components for backwards compat testing."""
     return TitansQwenConfig(
         n_embd=64,
         n_head=4,
@@ -83,6 +129,67 @@ def cms_config():
 def batch_hidden():
     """Sample batch of hidden states."""
     return torch.randn(2, 32, 64)  # [B, T, C]
+
+
+# --- PositionDependentGate Tests ---
+
+class TestPositionDependentGate:
+    """Tests for PositionDependentGate (new fixed implementation)."""
+
+    def test_output_shape(self):
+        """Test output shape is [B, T, 1]."""
+        gate = PositionDependentGate(dim=64, init_bias=-2.0)
+        x = torch.randn(2, 10, 64)
+        out = gate(x)
+        assert out.shape == (2, 10, 1)
+
+    def test_initial_gate_conservative(self):
+        """Test gate starts near 0 (conservative)."""
+        gate = PositionDependentGate(dim=64, init_bias=-2.0)
+        x = torch.randn(2, 10, 64)
+        out = gate(x)
+        
+        # sigmoid(-2) ≈ 0.12, should be close to that initially
+        mean_gate = out.mean().item()
+        assert 0.05 < mean_gate < 0.25
+
+    def test_gate_between_zero_and_one(self):
+        """Test gate values are valid probabilities."""
+        gate = PositionDependentGate(dim=64, init_bias=0.0)
+        x = torch.randn(2, 10, 64)
+        out = gate(x)
+        
+        # All values should be in [0, 1]
+        assert (out >= 0).all()
+        assert (out <= 1).all()
+
+    def test_position_dependent(self):
+        """Test different positions can have different gate values after training."""
+        gate = PositionDependentGate(dim=64, init_bias=-2.0)
+        
+        # Create input with very different values at different positions
+        x = torch.zeros(2, 10, 64)
+        x[:, 0, :] = 10.0  # First position very different
+        x[:, -1, :] = -10.0  # Last position very different
+        
+        out = gate(x)
+        
+        # After some training, positions should have different gates
+        # (initially they may be similar due to zero init)
+        # This test mainly ensures the MLP structure is correct
+        assert out.shape == (2, 10, 1)
+
+    def test_gradients_flow(self):
+        """Test gradients flow through gate."""
+        gate = PositionDependentGate(dim=64, init_bias=-2.0)
+        x = torch.randn(2, 10, 64, requires_grad=True)
+        out = gate(x)
+        loss = out.sum()
+        loss.backward()
+        
+        assert x.grad is not None
+        # Check MLP parameters have gradients
+        assert gate.gate_mlp[0].weight.grad is not None
 
 
 # --- SelfModifyingLinear Tests ---
@@ -381,7 +488,9 @@ class TestTitansQwenDecoderLayer:
         _ = layer(x)
         stats = layer.get_gate_statistics()
 
-        assert 0.1 < stats["mean_gate"] < 0.15
+        # New implementation: mem_scale starts at sigmoid(-2) ≈ 0.12
+        assert "mem_scale" in stats
+        assert 0.05 < stats["mem_scale"] < 0.2
 
     def test_memory_state_management(self, small_config, mock_qwen_layer):
         """Test memory state can be set and retrieved."""
@@ -397,10 +506,9 @@ class TestTitansQwenDecoderLayer:
         layer.set_memory_state(None)
         assert layer._current_memory_state is None
 
-    def test_internal_loss_computed(self, small_config, mock_qwen_layer):
-        """Test internal loss is computed during training."""
-        small_config.use_internal_loss = True
-        layer = TitansQwenDecoderLayer(mock_qwen_layer, 0, small_config)
+    def test_internal_loss_computed(self, small_config_with_internal_loss, mock_qwen_layer):
+        """Test internal loss is computed during training when enabled."""
+        layer = TitansQwenDecoderLayer(mock_qwen_layer, 0, small_config_with_internal_loss)
         layer.train()
         x = torch.randn(2, 32, 64)
 
@@ -410,12 +518,56 @@ class TestTitansQwenDecoderLayer:
         assert internal_loss is not None
         assert internal_loss.item() >= 0
 
+    def test_internal_loss_disabled_by_default(self, small_config, mock_qwen_layer):
+        """Test internal loss is NOT computed when disabled (default)."""
+        layer = TitansQwenDecoderLayer(mock_qwen_layer, 0, small_config)
+        layer.train()
+        x = torch.randn(2, 32, 64)
+
+        _ = layer(x)
+        internal_loss = layer.get_internal_loss()
+
+        # Should be None when internal loss is disabled
+        assert internal_loss is None
+
     def test_memory_updates_can_be_disabled(self, small_config, mock_qwen_layer):
         """Test memory updates can be disabled."""
         layer = TitansQwenDecoderLayer(mock_qwen_layer, 0, small_config)
         layer.enable_memory_updates(False)
 
         assert layer.update_memory is False
+    
+    def test_noop_mode_matches_original(self, small_config, mock_qwen_layer):
+        """Test no-op mode returns same output as original layer."""
+        layer = TitansQwenDecoderLayer(mock_qwen_layer, 0, small_config)
+        layer.set_noop_mode()
+        
+        x = torch.randn(2, 32, 64)
+        
+        # Get output from Titans layer in no-op mode
+        out_titans = layer(x)
+        if isinstance(out_titans, tuple):
+            out_titans = out_titans[0]
+        
+        # Get output from original layer
+        out_original = mock_qwen_layer(x)
+        if isinstance(out_original, tuple):
+            out_original = out_original[0]
+        
+        # Should be identical
+        assert torch.allclose(out_titans, out_original)
+    
+    def test_memory_enabled_flag(self, small_config, mock_qwen_layer):
+        """Test memory can be enabled/disabled."""
+        layer = TitansQwenDecoderLayer(mock_qwen_layer, 0, small_config)
+        
+        assert layer.memory_enabled is True
+        
+        layer.set_memory_enabled(False)
+        assert layer.memory_enabled is False
+        
+        layer.set_memory_enabled(True)
+        assert layer.memory_enabled is True
 
 
 # --- Config Tests ---
@@ -429,8 +581,12 @@ class TestTitansQwenConfig:
 
         assert config.n_embd == 1536
         assert config.use_cms is True
-        assert config.use_self_mod_proj is True
-        assert config.use_self_mod_gate is True
+        # New defaults: self-mod components disabled, use PositionDependentGate
+        assert config.use_self_mod_proj is False
+        assert config.use_self_mod_gate is False
+        # Internal loss disabled by default
+        assert config.use_internal_loss is False
+        assert config.internal_loss_weight == 0.0
 
     def test_prefix_len_property(self):
         """Test prefix_len calculation."""

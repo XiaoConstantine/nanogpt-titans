@@ -15,6 +15,7 @@ from torch import nn
 from nanogpt_titans.qwen_titans.config import TitansQwenConfig
 from nanogpt_titans.qwen_titans.decoder_layer import TitansQwenDecoderLayer
 from nanogpt_titans.qwen_titans.mag_decoder_layer import MAGQwenDecoderLayer
+from nanogpt_titans.qwen_titans.mal_decoder_layer import MALQwenDecoderLayer
 
 
 def patch_qwen_with_titans(
@@ -33,9 +34,11 @@ def patch_qwen_with_titans(
         model: Pre-trained Qwen2ForCausalLM or similar model
         titans_config: Titans configuration (if None, creates from model config)
         layer_indices: Which layers to enhance with memory (default: middle layer)
-        variant: "mac" or "mag" (default: from config, or "mag" if not specified)
-            - MAC: Memory as Context (original Titans, additive gating)
-            - MAG: Memory as Gate (multiplicative gating, more stable)
+        variant: "hope" (recommended), "mac" (alias for hope), "mag", or "mal"
+            - HOPE: Gated residual integration (fixed for pre-trained models) - RECOMMENDED
+            - MAC: Alias for HOPE (backwards compatibility)
+            - MAG: Memory as Gate (multiplicative gating, deprecated)
+            - MAL: Memory as Layer (sequential, deprecated)
 
     Returns:
         Modified model with Titans layers (modifies in-place and returns)
@@ -44,7 +47,7 @@ def patch_qwen_with_titans(
         >>> from transformers import AutoModelForCausalLM
         >>> model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-1.5B")
         >>> config = TitansQwenConfig.from_qwen_config(model.config)
-        >>> model = patch_qwen_with_titans(model, config, variant="mag")
+        >>> model = patch_qwen_with_titans(model, config, variant="hope")
     """
     # Create config if not provided
     if titans_config is None:
@@ -59,16 +62,23 @@ def patch_qwen_with_titans(
         variant = titans_config.titans_variant
     variant = variant.lower()
 
-    if variant not in ("mac", "mag"):
-        raise ValueError(f"Unknown Titans variant: {variant}. Use 'mac' or 'mag'.")
+    # Normalize variant name: "mac" is alias for "hope"
+    if variant == "mac":
+        variant = "hope"
+
+    if variant not in ("hope", "mag", "mal"):
+        raise ValueError(f"Unknown Titans variant: {variant}. Use 'hope', 'mag', or 'mal'.")
 
     # Select decoder layer class based on variant
     if variant == "mag":
         DecoderLayerClass = MAGQwenDecoderLayer
-        variant_name = "MAG (Memory as Gate)"
+        variant_name = "MAG (Memory as Gate) [deprecated]"
+    elif variant == "mal":
+        DecoderLayerClass = MALQwenDecoderLayer
+        variant_name = "MAL (Memory as Layer) [deprecated]"
     else:
         DecoderLayerClass = TitansQwenDecoderLayer
-        variant_name = "MAC (Memory as Context)"
+        variant_name = "HOPE (Gated Residual)"
 
     print(f"Using Titans variant: {variant_name}")
 
@@ -97,7 +107,7 @@ def patch_qwen_with_titans(
         original_layer = layers[idx]
 
         # Check if already a Titans layer
-        if isinstance(original_layer, (TitansQwenDecoderLayer, MAGQwenDecoderLayer)):
+        if isinstance(original_layer, (TitansQwenDecoderLayer, MAGQwenDecoderLayer, MALQwenDecoderLayer)):
             print(f"Layer {idx} is already a Titans layer, skipping")
             continue
 
@@ -117,6 +127,9 @@ def patch_qwen_with_titans(
         # Handle variant-specific components
         if variant == "mag":
             titans_layer.memory_to_gate.to(device=device, dtype=dtype)
+        elif variant == "mal":
+            titans_layer.mem_proj.to(device=device, dtype=dtype)
+            # MAL gate is a scalar Parameter, already on correct device after to()
         else:
             titans_layer.mem_proj.to(device=device, dtype=dtype)
             titans_layer.gate.to(device=device, dtype=dtype)
@@ -176,7 +189,7 @@ def freeze_base_model(model: nn.Module) -> dict[str, int]:
     for idx in model._titans_layer_indices:
         layer = layers[idx]
 
-        if not isinstance(layer, (TitansQwenDecoderLayer, MAGQwenDecoderLayer)):
+        if not isinstance(layer, (TitansQwenDecoderLayer, MAGQwenDecoderLayer, MALQwenDecoderLayer)):
             print(f"Warning: Layer {idx} is not a Titans layer")
             continue
 
@@ -197,8 +210,16 @@ def freeze_base_model(model: nn.Module) -> dict[str, int]:
             titans_params += layer.modulation_scale.numel()
             layer.modulation_bias.requires_grad = True
             titans_params += layer.modulation_bias.numel()
+        elif isinstance(layer, MALQwenDecoderLayer):
+            # MAL: mem_proj and scalar gate
+            for param in layer.mem_proj.parameters():
+                param.requires_grad = True
+                titans_params += param.numel()
+            # MAL gate is a scalar Parameter, not a module
+            layer.gate.requires_grad = True
+            titans_params += layer.gate.numel()
         else:
-            # MAC: mem_proj and gate
+            # MAC: mem_proj and gate (nn.Linear)
             for param in layer.mem_proj.parameters():
                 param.requires_grad = True
                 titans_params += param.numel()
@@ -261,7 +282,7 @@ def get_titans_layers(model: nn.Module) -> list[nn.Module]:
     return [
         layers[idx]
         for idx in model._titans_layer_indices
-        if isinstance(layers[idx], (TitansQwenDecoderLayer, MAGQwenDecoderLayer))
+        if isinstance(layers[idx], (TitansQwenDecoderLayer, MAGQwenDecoderLayer, MALQwenDecoderLayer))
     ]
 
 
@@ -344,8 +365,14 @@ def save_titans_state(model: nn.Module, path: str) -> None:
                 titans_state[f"{layer_key}.memory_to_gate.{name}"] = param.data
             titans_state[f"{layer_key}.modulation_scale"] = layer.modulation_scale.data
             titans_state[f"{layer_key}.modulation_bias"] = layer.modulation_bias.data
+        elif isinstance(layer, MALQwenDecoderLayer):
+            # MAL: mem_proj and scalar gate
+            for name, param in layer.mem_proj.named_parameters():
+                titans_state[f"{layer_key}.mem_proj.{name}"] = param.data
+            # MAL gate is a scalar Parameter
+            titans_state[f"{layer_key}.gate"] = layer.gate.data
         else:
-            # MAC: mem_proj and gate
+            # MAC: mem_proj and gate (nn.Linear)
             for name, param in layer.mem_proj.named_parameters():
                 titans_state[f"{layer_key}.mem_proj.{name}"] = param.data
             for name, param in layer.gate.named_parameters():
@@ -407,8 +434,18 @@ def load_titans_state(model: nn.Module, path: str) -> None:
             bias_key = f"{layer_key}.modulation_bias"
             if bias_key in titans_state:
                 layer.modulation_bias.data.copy_(titans_state[bias_key].to(layer.modulation_bias.dtype))
+        elif isinstance(layer, MALQwenDecoderLayer):
+            # MAL: mem_proj and scalar gate
+            for name, param in layer.mem_proj.named_parameters():
+                key = f"{layer_key}.mem_proj.{name}"
+                if key in titans_state:
+                    param.data.copy_(titans_state[key].to(param.dtype))
+            # MAL gate is a scalar Parameter
+            gate_key = f"{layer_key}.gate"
+            if gate_key in titans_state:
+                layer.gate.data.copy_(titans_state[gate_key].to(layer.gate.dtype))
         else:
-            # MAC: mem_proj and gate
+            # MAC: mem_proj and gate (nn.Linear)
             for name, param in layer.mem_proj.named_parameters():
                 key = f"{layer_key}.mem_proj.{name}"
                 if key in titans_state:

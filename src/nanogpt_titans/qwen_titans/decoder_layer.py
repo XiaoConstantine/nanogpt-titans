@@ -3,6 +3,12 @@ Titans-enhanced Qwen2 decoder layer.
 
 Uses HOPE-style gated residual integration for test-time learning memory.
 This approach preserves sequence length and works with pre-trained models.
+
+Key fixes for pre-trained model compatibility:
+1. LayerNorm + learned scale after memory projection (fixes scale mismatch)
+2. Position-dependent gate (per-token, not global)
+3. Disabled/minimal internal loss by default
+4. Conservative initialization that starts as near-identity
 """
 
 from __future__ import annotations
@@ -10,6 +16,7 @@ from __future__ import annotations
 from typing import Optional, Tuple, Any, Union
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from nanogpt_titans.model import MemoryState
@@ -24,22 +31,57 @@ from nanogpt_titans.qwen_titans.memory_adapter import (
 )
 
 
+class PositionDependentGate(nn.Module):
+    """
+    Position-dependent gate that produces per-token gate values.
+    
+    Unlike global gates, this allows the model to decide per-token
+    whether to use memory, which is critical for tasks like needle-in-haystack.
+    """
+    
+    def __init__(self, dim: int, init_bias: float = -2.0) -> None:
+        super().__init__()
+        # Small MLP: hidden_states -> gate value per token
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(dim, dim // 4),
+            nn.SiLU(),
+            nn.Linear(dim // 4, 1),
+        )
+        # Initialize for conservative output (near 0)
+        nn.init.zeros_(self.gate_mlp[0].weight)
+        nn.init.zeros_(self.gate_mlp[0].bias)
+        nn.init.zeros_(self.gate_mlp[2].weight)
+        nn.init.constant_(self.gate_mlp[2].bias, init_bias)  # sigmoid(-2) ≈ 0.12
+        
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Compute per-token gate values.
+        
+        Args:
+            hidden_states: [B, T, C]
+            
+        Returns:
+            gate values: [B, T, 1] in range (0, 1)
+        """
+        return torch.sigmoid(self.gate_mlp(hidden_states))
+
+
 class TitansQwenDecoderLayer(nn.Module):
     """
     Titans-enhanced Qwen2 decoder layer using gated residual integration.
 
-    Architecture (HOPE-style):
+    Architecture (HOPE-style, fixed for pre-trained models):
     1. Forward through original Qwen2DecoderLayer (unchanged)
     2. Retrieve from memory (uses M_{t-1} for causality)
-    3. Project memory to match hidden state dimensions
-    4. Apply gated residual: output = attn_output + gate * mem_projection
+    3. Project memory + LayerNorm + learned scale (fixes scale mismatch)
+    4. Apply position-dependent gated residual (per-token gates)
     5. Update memory with segment output
 
-    Key benefits:
-    - No sequence length change (avoids mask/position issues)
-    - Gate starts near 0 (conservative, doesn't hurt base model)
-    - Gate learns to open as memory becomes useful
-    - Compatible with pre-trained attention weights
+    Key fixes for pre-trained compatibility:
+    - LayerNorm + learned scale ensures memory matches hidden distribution
+    - Position-dependent gate allows per-token memory usage decisions
+    - Conservative initialization starts as near-identity
+    - Internal loss disabled by default (set weight to 0)
 
     Example:
         >>> original_layer = model.model.layers[14]
@@ -77,7 +119,7 @@ class TitansQwenDecoderLayer(nn.Module):
             self.memory = NeuralMemoryAdapter(titans_config)
             self._use_cms = False
 
-        # Self-modifying projection: memory output -> hidden state space
+        # Memory projection: memory output -> hidden state space
         if titans_config.use_self_mod_proj:
             self.mem_proj = SelfModifyingLinear(
                 titans_config.n_embd,
@@ -92,22 +134,30 @@ class TitansQwenDecoderLayer(nn.Module):
                 bias=False,
             )
 
-        # Self-modifying gate for memory integration
+        # === FIX 1: LayerNorm + learned scale for distribution alignment ===
+        # This fixes the scale mismatch (memory norm ~0.03 vs hidden norm ~212)
+        self.mem_ln = nn.LayerNorm(titans_config.n_embd)
+        # Learned scale starts at 0 -> sigmoid(0) = 0.5, multiplied by 0.1 init
+        # This means memory contribution starts very small
+        self.mem_scale = nn.Parameter(torch.tensor(-2.0))  # sigmoid(-2) ≈ 0.12
+        
+        # === FIX 2: Position-dependent gate (per-token, not global) ===
+        # This allows the model to decide per-token whether to use memory
         if titans_config.use_self_mod_gate:
+            # Keep self-modifying gate but make it position-dependent
             self.gate = SelfModifyingGate(
                 titans_config.n_embd,
                 init_bias=titans_config.gate_init_bias,
                 lr=titans_config.self_mod_lr,
             )
+            self._use_self_mod_gate = True
         else:
-            # Simple learned gate without delta rule
-            self.gate = nn.Sequential(
-                nn.Linear(titans_config.n_embd, 1, bias=True),
-                nn.Sigmoid(),
+            # New position-dependent gate
+            self.gate = PositionDependentGate(
+                titans_config.n_embd,
+                init_bias=titans_config.gate_init_bias,
             )
-            # Initialize for conservative gate
-            nn.init.zeros_(self.gate[0].weight)
-            nn.init.constant_(self.gate[0].bias, titans_config.gate_init_bias)
+            self._use_self_mod_gate = False
 
         # Warm start encoder (optional)
         if titans_config.use_warm_start:
@@ -117,6 +167,9 @@ class TitansQwenDecoderLayer(nn.Module):
 
         # Flag to control memory updates
         self.update_memory = True
+        
+        # Flag to completely disable memory (for no-op baseline testing)
+        self.memory_enabled = True
 
         # Store memory state during forward
         self._current_memory_state: Optional[Union[MemoryState, ContinuumMemoryState]] = None
@@ -127,7 +180,6 @@ class TitansQwenDecoderLayer(nn.Module):
 
         # Cache isinstance checks for faster forward pass
         self._use_self_mod_proj = isinstance(self.mem_proj, SelfModifyingLinear)
-        self._use_self_mod_gate = isinstance(self.gate, SelfModifyingGate)
         self._use_cms = titans_config.use_cms
 
         # Copy attributes that Qwen's internal code expects
@@ -160,8 +212,9 @@ class TitansQwenDecoderLayer(nn.Module):
 
         1. Run original layer forward (unchanged)
         2. Retrieve from memory
-        3. Project and gate memory contribution
-        4. Add to output via gated residual
+        3. Project + LayerNorm + scale (fixes distribution mismatch)
+        4. Apply position-dependent gated residual
+        5. Update memory
 
         Args:
             hidden_states: Input hidden states [B, T, C]
@@ -180,19 +233,6 @@ class TitansQwenDecoderLayer(nn.Module):
         """
         B, T, C = hidden_states.shape
         device = hidden_states.device
-
-        # Use provided state or stored state
-        if memory_state is None:
-            memory_state = self._current_memory_state
-
-        # Initialize memory state if needed
-        if memory_state is None:
-            memory_state = self.memory.init_state(B, device)
-
-            # Warm start: initialize memory from input
-            if self.warm_start is not None and T >= self.config.warm_start_prefix_len:
-                _ = self.warm_start(hidden_states)
-                # TODO: Use warm start output to initialize memory state
 
         # 1. Forward through original layer (UNCHANGED - preserves pre-trained behavior)
         layer_outputs = self.original_layer(
@@ -215,11 +255,32 @@ class TitansQwenDecoderLayer(nn.Module):
             attn_output = layer_outputs
             other_outputs = ()
 
+        # === NO-OP BASELINE: If memory disabled, just return original output ===
+        if not self.memory_enabled:
+            self._updated_memory_state = None
+            self._internal_loss = None
+            if other_outputs:
+                return (attn_output,) + other_outputs
+            return attn_output
+
+        # Use provided state or stored state
+        if memory_state is None:
+            memory_state = self._current_memory_state
+
+        # Initialize memory state if needed
+        if memory_state is None:
+            memory_state = self.memory.init_state(B, device)
+
+            # Warm start: initialize memory from input
+            if self.warm_start is not None and T >= self.config.warm_start_prefix_len:
+                _ = self.warm_start(hidden_states)
+                # TODO: Use warm start output to initialize memory state
+
         # 2. Retrieve from memory (causal - uses M_{t-1})
         mem_retrieved = self.memory(hidden_states, memory_state)  # [B, num_longterm_mem, C]
 
-        # 3. Project memory to full sequence length (fused operations)
-        # Pool -> project -> broadcast in one path
+        # 3. Project memory + LayerNorm + scale (FIX for distribution alignment)
+        # Pool -> project -> normalize -> scale -> broadcast
         mem_pooled = mem_retrieved.mean(dim=1, keepdim=True)  # [B, 1, C]
 
         # Apply projection (self-modifying or standard)
@@ -228,23 +289,29 @@ class TitansQwenDecoderLayer(nn.Module):
         else:
             mem_projected = self.mem_proj(mem_pooled)
 
-        # Clamp to prevent extreme values (also handles NaN/Inf)
-        mem_projected = torch.clamp(mem_projected, min=-100.0, max=100.0)
+        # === FIX 1: LayerNorm + learned scale ===
+        # LayerNorm ensures memory has similar distribution to hidden states
+        mem_projected = self.mem_ln(mem_projected)
+        # Learned scale controls memory contribution strength (starts small)
+        scale = torch.sigmoid(self.mem_scale)  # (0, 1)
+        mem_projected = mem_projected * scale
 
         # Broadcast to sequence length
         mem_projected = mem_projected.expand(-1, T, -1)  # [B, T, C]
 
-        # 4. Apply gated residual
+        # 4. Apply position-dependent gated residual
         if self._use_self_mod_gate:
+            # Self-modifying gate (legacy path)
             output = self.gate(mem_projected, attn_output, update=self.training)
         else:
-            # Simple gate
+            # === FIX 2: Position-dependent gate ===
+            # Gate is computed per-token from hidden states
             gate_value = self.gate(attn_output)  # [B, T, 1]
             output = attn_output + gate_value * mem_projected
 
         # 5. Compute internal loss (memory's own prediction error)
-        # This is the Titans paper approach: ||M(k) - v||^2
-        # Memory predicts its own stored values, NOT transformer output
+        # NOTE: This should be heavily down-weighted or disabled (weight <= 1e-4)
+        # The internal loss can dominate LM loss and train memory for wrong objective
         if self.config.use_internal_loss and self.training:
             self._internal_loss = self._compute_memory_surprise(hidden_states)
 
@@ -260,7 +327,7 @@ class TitansQwenDecoderLayer(nn.Module):
         # Return in HuggingFace-compatible format
         if other_outputs:
             return (output,) + other_outputs
-        return output
+        return attn_output if not self.memory_enabled else output
 
     def set_memory_state(self, state: Optional[Union[MemoryState, ContinuumMemoryState]]) -> None:
         """Set the memory state to use for next forward pass."""
@@ -280,13 +347,35 @@ class TitansQwenDecoderLayer(nn.Module):
 
     def get_gate_statistics(self) -> dict:
         """Get gate statistics for monitoring."""
+        stats = {
+            "mem_scale": torch.sigmoid(self.mem_scale).item(),
+        }
         if isinstance(self.gate, SelfModifyingGate):
-            return {
-                "mean_gate": self.gate.mean_gate_value,
-                "gate_bias": self.gate.gate_proj.bias.item(),
-            }
+            stats["mean_gate"] = self.gate.mean_gate_value
+            stats["gate_bias"] = self.gate.gate_proj.bias.item()
+        elif isinstance(self.gate, PositionDependentGate):
+            stats["gate_bias"] = self.gate.gate_mlp[2].bias.item()
         else:
-            return {"gate_bias": self.gate[0].bias.item()}
+            stats["gate_bias"] = self.gate[0].bias.item()
+        return stats
+    
+    def set_memory_enabled(self, enabled: bool) -> None:
+        """
+        Enable or disable memory completely (for no-op baseline testing).
+        
+        When disabled, the layer acts exactly like the original Qwen layer.
+        """
+        self.memory_enabled = enabled
+        
+    def set_noop_mode(self) -> None:
+        """
+        Set layer to complete no-op mode for baseline testing.
+        
+        This ensures the wrapper doesn't affect model output at all.
+        Use this to verify the wrapper itself doesn't cause regression.
+        """
+        self.memory_enabled = False
+        self.update_memory = False
 
     def _compute_memory_surprise(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """

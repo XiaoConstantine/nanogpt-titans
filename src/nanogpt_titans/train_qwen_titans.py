@@ -70,16 +70,18 @@ class QwenTitansTrainConfig:
     adaptive_memory: bool = True
 
     # Titans variant
-    titans_variant: str = "mag"  # "mac" or "mag" - MAG is more stable
+    titans_variant: str = "hope"  # "hope" (recommended), "mag", or "mal"
 
     # HOPE features
     use_cms: bool = True  # Continuum Memory System
     num_cms_levels: int = 3
-    use_self_mod_proj: bool = True  # Only used for MAC
-    use_self_mod_gate: bool = True  # Only used for MAC
+    use_self_mod_proj: bool = False  # Disabled: standard projection more stable
+    use_self_mod_gate: bool = False  # Disabled: use PositionDependentGate instead
     use_warm_start: bool = False  # Start without for simplicity
-    use_internal_loss: bool = True
-    internal_loss_weight: float = 0.01  # Reduced: raw loss is 100s-1000s
+    # CRITICAL: Internal loss should be disabled or heavily down-weighted
+    # It dominates LM loss and trains memory for wrong objective (autoencoding, not LM)
+    use_internal_loss: bool = False  # DISABLED by default
+    internal_loss_weight: float = 0.0  # Set to 0 or 1e-4 max if enabled
 
     # Gate warmup: freeze gate open for first N steps to let memory learn
     # Without this, gate closes before memory learns anything useful
@@ -245,22 +247,29 @@ def compute_gate_regularization(titans_layers, min_value: float = 0.1) -> torch.
     return total_penalty / count
 
 
-def collect_diagnostics(model, titans_layers, variant: str = "mac") -> dict:
+def collect_diagnostics(model, titans_layers, variant: str = "hope") -> dict:
     """
     Collect diagnostic metrics.
 
-    For MAC:
-    - gate_mean: Should increase from 0.1 → 0.5
+    For HOPE (fixed implementation):
+    - mem_scale: Learned memory scale (should gradually increase from ~0.12)
     - gate_bias: Gate bias term
 
     For MAG:
     - modulation_scale: How much memory modulates attention
     - modulation_bias: Center of modulation
 
-    Both:
+    For MAL:
+    - gate_value: Scalar gate value (should increase as memory becomes useful)
+
+    All:
     - cms_weights: CMS level weights (should be distributed)
     """
     diagnostics = {}
+
+    # Normalize variant name
+    if variant == "mac":
+        variant = "hope"
 
     # Gate/modulation statistics
     gate_stats = get_gate_statistics(model)
@@ -271,12 +280,19 @@ def collect_diagnostics(model, titans_layers, variant: str = "mac") -> dict:
             biases = [s.get("modulation_bias", 0) for s in gate_stats.values()]
             diagnostics["mod_scale"] = sum(scales) / len(scales) if scales else 0.1
             diagnostics["mod_bias"] = sum(biases) / len(biases) if biases else 0
+        elif variant == "mal":
+            # MAL uses scalar gate_value
+            gate_values = [s.get("gate_value", 0.1) for s in gate_stats.values()]
+            diagnostics["gate_value"] = sum(gate_values) / len(gate_values) if gate_values else 0.1
         else:
-            # MAC uses gate_mean and gate_bias
-            mean_gates = [s.get("mean_gate", 0) for s in gate_stats.values()]
-            gate_biases = [s.get("gate_bias", 0) for s in gate_stats.values()]
-            diagnostics["gate_mean"] = sum(mean_gates) / len(mean_gates) if mean_gates else 0
-            diagnostics["gate_bias"] = sum(gate_biases) / len(gate_biases) if gate_biases else 0
+            # HOPE uses mem_scale and gate_bias
+            mem_scales = [s.get("mem_scale", 0.12) for s in gate_stats.values()]
+            gate_biases = [s.get("gate_bias", -2.0) for s in gate_stats.values()]
+            diagnostics["mem_scale"] = sum(mem_scales) / len(mem_scales) if mem_scales else 0.12
+            diagnostics["gate_bias"] = sum(gate_biases) / len(gate_biases) if gate_biases else -2.0
+            # For backwards compat, also report gate_mean as sigmoid of gate_bias
+            import math
+            diagnostics["gate_mean"] = 1 / (1 + math.exp(-diagnostics["gate_bias"]))
 
     # CMS level weights (if using CMS)
     for layer in titans_layers:
@@ -358,13 +374,15 @@ def train(config: QwenTitansTrainConfig) -> None:
     # Get Titans layers for diagnostics
     titans_layers = get_titans_layers(model)
 
-    # Gate warmup: only needed for MAC (MAG doesn't have gate collapse issue)
+    # Gate warmup: only needed for MAC (MAG/MAL don't have gate collapse issue)
     gate_warmup_active = config.gate_warmup_steps > 0 and config.titans_variant == "mac"
     if gate_warmup_active:
         print(f"\nGate warmup: freezing gate for first {config.gate_warmup_steps} steps")
         set_gate_trainable(titans_layers, trainable=False)
     elif config.titans_variant == "mag":
         print("\nMAG variant: no gate warmup needed (multiplicative gating is stable)")
+    elif config.titans_variant == "mal":
+        print("\nMAL variant: no gate warmup needed (sequential composition is stable)")
 
     # Move to device
     model.to(device)
@@ -609,11 +627,23 @@ def train(config: QwenTitansTrainConfig) -> None:
             log_history.append(log_entry)
 
             # Print with diagnostics - variant-specific metrics
-            if config.titans_variant == "mag":
+            variant = config.titans_variant.lower()
+            if variant == "mac":
+                variant = "hope"
+            
+            if variant == "mag":
                 mod_str = f", mod_scale={diagnostics.get('mod_scale', 0.1):.4f}"
+            elif variant == "mal":
+                mod_str = f", gate={diagnostics.get('gate_value', 0.1):.4f}"
             else:
-                mod_str = f", gate={diagnostics.get('gate_mean', 0):.4f}" if 'gate_mean' in diagnostics else ""
-            print(f"step {step}: loss {avg_loss:.4f}, int_loss {avg_internal:.4f}{mod_str}, lr {lr:.2e}, time {dt*1000:.1f}ms")
+                # HOPE: show mem_scale and gate_mean
+                mem_scale = diagnostics.get('mem_scale', 0.12)
+                gate_mean = diagnostics.get('gate_mean', 0.12)
+                mod_str = f", mem_scale={mem_scale:.3f}, gate={gate_mean:.3f}"
+            
+            # Only show internal loss if enabled
+            int_loss_str = f", int_loss {avg_internal:.4f}" if config.use_internal_loss else ""
+            print(f"step {step}: loss {avg_loss:.4f}{int_loss_str}{mod_str}, lr {lr:.2e}, time {dt*1000:.1f}ms")
 
             # Log CMS weights every 50 steps
             if config.use_cms and step % 50 == 0 and "cms_weight_0" in diagnostics:
@@ -800,9 +830,9 @@ def main() -> None:
     parser.add_argument("--dataset_config", type=str, default="wikitext-2-raw-v1")
 
     # Titans variant
-    parser.add_argument("--titans_variant", type=str, default="mag",
-                        choices=["mac", "mag"],
-                        help="Titans variant: 'mac' (Memory as Context) or 'mag' (Memory as Gate, more stable)")
+    parser.add_argument("--titans_variant", type=str, default="hope",
+                        choices=["hope", "mac", "mag", "mal"],
+                        help="Titans variant: 'hope' (recommended), 'mac' (alias for hope), 'mag' (deprecated), or 'mal' (deprecated)")
 
     # HOPE feature arguments
     parser.add_argument("--use_cms", action="store_true", default=True,
