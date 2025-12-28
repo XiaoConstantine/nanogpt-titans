@@ -117,6 +117,7 @@ class QwenTitansTrainConfig:
         else "float16" if torch.cuda.is_available()
         else "float32"
     ))
+    compile: bool = False  # torch.compile for faster training (requires PyTorch 2.0+)
 
     # Logging
     wandb_log: bool = False
@@ -367,6 +368,14 @@ def train(config: QwenTitansTrainConfig) -> None:
 
     # Move to device
     model.to(device)
+
+    # Compile model for faster training (PyTorch 2.0+)
+    if config.compile:
+        if device.type == "cuda":
+            print("\nCompiling model with torch.compile...")
+            model = torch.compile(model)
+        else:
+            print("\nWarning: torch.compile only supported on CUDA, skipping")
 
     # Load dataset
     print(f"\nLoading dataset: {config.dataset_name}...")
@@ -820,6 +829,8 @@ def main() -> None:
     # System arguments
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--dtype", type=str, default=None)
+    parser.add_argument("--compile", action="store_true",
+                        help="Use torch.compile for faster training (CUDA only)")
 
     args = parser.parse_args()
 
@@ -868,6 +879,8 @@ def main() -> None:
         config_kwargs["device"] = args.device
     if args.dtype:
         config_kwargs["dtype"] = args.dtype
+    if args.compile:
+        config_kwargs["compile"] = args.compile
 
     config = QwenTitansTrainConfig(**config_kwargs)
     train(config)

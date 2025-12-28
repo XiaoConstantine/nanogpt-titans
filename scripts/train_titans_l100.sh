@@ -106,6 +106,7 @@ if [[ "$EVAL_ONLY" == "false" ]]; then
         --model_name $MODEL \
         --output_dir $OUTPUT_DIR \
         --titans_variant mag \
+        --compile \
         --max_steps $STEPS \
         --batch_size $BATCH_SIZE \
         --gradient_accumulation_steps $GRAD_ACCUM \
