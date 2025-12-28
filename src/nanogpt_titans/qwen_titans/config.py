@@ -65,6 +65,11 @@ class TitansQwenConfig:
     # HOPE-inspired configuration (from Nested Learning paper)
     # Uses gated residual integration (no sequence length change)
 
+    # Titans variant: "mac" (Memory as Context) or "mag" (Memory as Gate)
+    # MAC: memory tokens prepended to attention (original Titans)
+    # MAG: memory modulates attention via multiplicative gating (more stable)
+    titans_variant: str = "mag"  # Default to MAG for better stability
+
     # Continuum Memory System (multi-frequency memory)
     use_cms: bool = True  # Use multi-frequency memory levels
     num_cms_levels: int = 3  # Number of frequency levels

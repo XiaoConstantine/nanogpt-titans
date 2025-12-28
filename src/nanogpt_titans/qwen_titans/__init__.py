@@ -20,6 +20,7 @@ Usage:
 from nanogpt_titans.qwen_titans.config import TitansQwenConfig
 from nanogpt_titans.qwen_titans.memory_adapter import NeuralMemoryAdapter
 from nanogpt_titans.qwen_titans.decoder_layer import TitansQwenDecoderLayer
+from nanogpt_titans.qwen_titans.mag_decoder_layer import MAGQwenDecoderLayer
 from nanogpt_titans.qwen_titans.patcher import (
     patch_qwen_with_titans,
     freeze_base_model,
@@ -40,6 +41,7 @@ __all__ = [
     "TitansQwenConfig",
     "NeuralMemoryAdapter",
     "TitansQwenDecoderLayer",
+    "MAGQwenDecoderLayer",
     "patch_qwen_with_titans",
     "freeze_base_model",
     "get_trainable_param_count",

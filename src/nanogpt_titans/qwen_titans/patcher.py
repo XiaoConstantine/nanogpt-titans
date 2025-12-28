@@ -14,23 +14,28 @@ from torch import nn
 
 from nanogpt_titans.qwen_titans.config import TitansQwenConfig
 from nanogpt_titans.qwen_titans.decoder_layer import TitansQwenDecoderLayer
+from nanogpt_titans.qwen_titans.mag_decoder_layer import MAGQwenDecoderLayer
 
 
 def patch_qwen_with_titans(
     model: nn.Module,
     titans_config: Optional[TitansQwenConfig] = None,
     layer_indices: Optional[list[int]] = None,
+    variant: Optional[str] = None,
 ) -> nn.Module:
     """
     Patch a Qwen2 model with Titans memory layers.
 
     Replaces specified decoder layers with Titans-enhanced layers
-    that add test-time learning memory via gated residual integration.
+    that add test-time learning memory.
 
     Args:
         model: Pre-trained Qwen2ForCausalLM or similar model
         titans_config: Titans configuration (if None, creates from model config)
         layer_indices: Which layers to enhance with memory (default: middle layer)
+        variant: "mac" or "mag" (default: from config, or "mag" if not specified)
+            - MAC: Memory as Context (original Titans, additive gating)
+            - MAG: Memory as Gate (multiplicative gating, more stable)
 
     Returns:
         Modified model with Titans layers (modifies in-place and returns)
@@ -39,7 +44,7 @@ def patch_qwen_with_titans(
         >>> from transformers import AutoModelForCausalLM
         >>> model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-1.5B")
         >>> config = TitansQwenConfig.from_qwen_config(model.config)
-        >>> model = patch_qwen_with_titans(model, config, layer_indices=[14])
+        >>> model = patch_qwen_with_titans(model, config, variant="mag")
     """
     # Create config if not provided
     if titans_config is None:
@@ -48,6 +53,24 @@ def patch_qwen_with_titans(
     # Use config's memory_layers if layer_indices not specified
     if layer_indices is None:
         layer_indices = titans_config.memory_layers
+
+    # Determine variant
+    if variant is None:
+        variant = titans_config.titans_variant
+    variant = variant.lower()
+
+    if variant not in ("mac", "mag"):
+        raise ValueError(f"Unknown Titans variant: {variant}. Use 'mac' or 'mag'.")
+
+    # Select decoder layer class based on variant
+    if variant == "mag":
+        DecoderLayerClass = MAGQwenDecoderLayer
+        variant_name = "MAG (Memory as Gate)"
+    else:
+        DecoderLayerClass = TitansQwenDecoderLayer
+        variant_name = "MAC (Memory as Context)"
+
+    print(f"Using Titans variant: {variant_name}")
 
     # Access the decoder layers
     # Handle different model structures (Qwen2ForCausalLM, Qwen2Model, etc.)
@@ -74,7 +97,7 @@ def patch_qwen_with_titans(
         original_layer = layers[idx]
 
         # Check if already a Titans layer
-        if isinstance(original_layer, TitansQwenDecoderLayer):
+        if isinstance(original_layer, (TitansQwenDecoderLayer, MAGQwenDecoderLayer)):
             print(f"Layer {idx} is already a Titans layer, skipping")
             continue
 
@@ -82,7 +105,7 @@ def patch_qwen_with_titans(
         device = next(original_layer.parameters()).device
         dtype = next(original_layer.parameters()).dtype
 
-        titans_layer = TitansQwenDecoderLayer(
+        titans_layer = DecoderLayerClass(
             original_layer=original_layer,
             layer_idx=idx,
             titans_config=titans_config,
@@ -90,17 +113,23 @@ def patch_qwen_with_titans(
 
         # Move new Titans components to same device/dtype as original layer
         titans_layer.memory.to(device=device, dtype=dtype)
-        titans_layer.mem_proj.to(device=device, dtype=dtype)
-        titans_layer.gate.to(device=device, dtype=dtype)
-        if titans_layer.warm_start is not None:
-            titans_layer.warm_start.to(device=device, dtype=dtype)
+
+        # Handle variant-specific components
+        if variant == "mag":
+            titans_layer.memory_to_gate.to(device=device, dtype=dtype)
+        else:
+            titans_layer.mem_proj.to(device=device, dtype=dtype)
+            titans_layer.gate.to(device=device, dtype=dtype)
+            if titans_layer.warm_start is not None:
+                titans_layer.warm_start.to(device=device, dtype=dtype)
 
         layers[idx] = titans_layer
-        print(f"Replaced layer {idx} with TitansQwenDecoderLayer")
+        print(f"Replaced layer {idx} with {DecoderLayerClass.__name__}")
 
     # Store metadata on model for later access
     model._titans_layer_indices = layer_indices
     model._titans_config = titans_config
+    model._titans_variant = variant
 
     return model
 
@@ -147,8 +176,8 @@ def freeze_base_model(model: nn.Module) -> dict[str, int]:
     for idx in model._titans_layer_indices:
         layer = layers[idx]
 
-        if not isinstance(layer, TitansQwenDecoderLayer):
-            print(f"Warning: Layer {idx} is not a TitansQwenDecoderLayer")
+        if not isinstance(layer, (TitansQwenDecoderLayer, MAGQwenDecoderLayer)):
+            print(f"Warning: Layer {idx} is not a Titans layer")
             continue
 
         # Unfreeze all Titans components (memory, gate, projection, warm start)
@@ -157,21 +186,32 @@ def freeze_base_model(model: nn.Module) -> dict[str, int]:
             param.requires_grad = True
             titans_params += param.numel()
 
-        # Memory projection
-        for param in layer.mem_proj.parameters():
-            param.requires_grad = True
-            titans_params += param.numel()
-
-        # Gate
-        for param in layer.gate.parameters():
-            param.requires_grad = True
-            titans_params += param.numel()
-
-        # Warm start encoder (if present)
-        if layer.warm_start is not None:
-            for param in layer.warm_start.parameters():
+        # Handle variant-specific components
+        if isinstance(layer, MAGQwenDecoderLayer):
+            # MAG: memory_to_gate projection and modulation params
+            for param in layer.memory_to_gate.parameters():
                 param.requires_grad = True
                 titans_params += param.numel()
+            # Modulation scale and bias
+            layer.modulation_scale.requires_grad = True
+            titans_params += layer.modulation_scale.numel()
+            layer.modulation_bias.requires_grad = True
+            titans_params += layer.modulation_bias.numel()
+        else:
+            # MAC: mem_proj and gate
+            for param in layer.mem_proj.parameters():
+                param.requires_grad = True
+                titans_params += param.numel()
+
+            for param in layer.gate.parameters():
+                param.requires_grad = True
+                titans_params += param.numel()
+
+            # Warm start encoder (if present)
+            if layer.warm_start is not None:
+                for param in layer.warm_start.parameters():
+                    param.requires_grad = True
+                    titans_params += param.numel()
 
     # Count parameters
     total = sum(p.numel() for p in model.parameters())
@@ -200,7 +240,7 @@ def get_trainable_param_count(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def get_titans_layers(model: nn.Module) -> list[TitansQwenDecoderLayer]:
+def get_titans_layers(model: nn.Module) -> list[nn.Module]:
     """
     Get all Titans layers from a patched model.
 
@@ -208,7 +248,7 @@ def get_titans_layers(model: nn.Module) -> list[TitansQwenDecoderLayer]:
         model: Model patched with patch_qwen_with_titans
 
     Returns:
-        List of TitansQwenDecoderLayer instances
+        List of Titans layer instances (TitansQwenDecoderLayer or MAGQwenDecoderLayer)
     """
     if not hasattr(model, "_titans_layer_indices"):
         return []
@@ -221,7 +261,7 @@ def get_titans_layers(model: nn.Module) -> list[TitansQwenDecoderLayer]:
     return [
         layers[idx]
         for idx in model._titans_layer_indices
-        if isinstance(layers[idx], TitansQwenDecoderLayer)
+        if isinstance(layers[idx], (TitansQwenDecoderLayer, MAGQwenDecoderLayer))
     ]
 
 
