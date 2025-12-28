@@ -525,17 +525,18 @@ class TestTitansQwenDecoderLayer:
 
         assert out.shape == x.shape
 
-    def test_gate_starts_conservative(self, small_config, mock_qwen_layer):
-        """Test gate starts near 0."""
+    def test_gate_starts_at_half(self, small_config, mock_qwen_layer):
+        """Test gate and mem_scale start at 0.5 for good gradient flow."""
         layer = TitansQwenDecoderLayer(mock_qwen_layer, 0, small_config)
         x = torch.randn(2, 32, 64)
 
         _ = layer(x)
         stats = layer.get_gate_statistics()
 
-        # New implementation: mem_scale starts at sigmoid(-2) ≈ 0.12
+        # mem_scale starts at sigmoid(0) = 0.5 for stronger gradients
+        # (conservative init at 0.12 caused gradient starvation)
         assert "mem_scale" in stats
-        assert 0.05 < stats["mem_scale"] < 0.2
+        assert 0.4 < stats["mem_scale"] < 0.6
 
     def test_memory_state_management(self, small_config, mock_qwen_layer):
         """Test memory state can be set and retrieved."""

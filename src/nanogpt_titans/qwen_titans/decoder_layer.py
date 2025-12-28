@@ -138,9 +138,9 @@ class TitansQwenDecoderLayer(nn.Module):
         # === FIX 1: LayerNorm + learned scale for distribution alignment ===
         # This fixes the scale mismatch (memory norm ~0.03 vs hidden norm ~212)
         self.mem_ln = nn.LayerNorm(titans_config.n_embd)
-        # Learned scale starts at 0 -> sigmoid(0) = 0.5, multiplied by 0.1 init
-        # This means memory contribution starts very small
-        self.mem_scale = nn.Parameter(torch.tensor(-2.0))  # sigmoid(-2) ≈ 0.12
+        # Learned scale: start at sigmoid(0) = 0.5 for stronger gradients
+        # Conservative init (-2.0 -> 0.12) caused gradient starvation
+        self.mem_scale = nn.Parameter(torch.tensor(0.0))  # sigmoid(0) = 0.5
         
         # === FIX 2: Position-dependent gate (per-token, not global) ===
         # This allows the model to decide per-token whether to use memory

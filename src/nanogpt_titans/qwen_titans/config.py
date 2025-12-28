@@ -84,7 +84,7 @@ class TitansQwenConfig:
     use_self_mod_proj: bool = False  # Disabled: standard projection is more stable
     use_self_mod_gate: bool = False  # Disabled: use PositionDependentGate instead
     self_mod_lr: float = 0.001  # Learning rate for delta rule updates
-    gate_init_bias: float = -2.0  # sigmoid(-2) ~ 0.12, conservative start
+    gate_init_bias: float = 0.0  # sigmoid(0) = 0.5, allows gradient flow
 
     # Warm start (initialize memory from input instead of random)
     use_warm_start: bool = False  # Disabled: adds complexity, not proven to help
