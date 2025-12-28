@@ -98,8 +98,10 @@ kaggle-package:
 	@echo "Creating Kaggle package..."
 	rm -rf kaggle_package kaggle_titans.zip
 	mkdir -p kaggle_package/src/nanogpt_titans
+	mkdir -p kaggle_package/scripts
 	cp -r src/nanogpt_titans/*.py kaggle_package/src/nanogpt_titans/
 	cp -r src/nanogpt_titans/qwen_titans kaggle_package/src/nanogpt_titans/
+	cp -r scripts/*.sh kaggle_package/scripts/ 2>/dev/null || true
 	find kaggle_package -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 	find kaggle_package -type f -name "*.pyc" -delete 2>/dev/null || true
 	cp pyproject.toml kaggle_package/
