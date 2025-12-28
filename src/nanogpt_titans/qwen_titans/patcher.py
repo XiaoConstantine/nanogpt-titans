@@ -328,26 +328,32 @@ def save_titans_state(model: nn.Module, path: str) -> None:
         path: Path to save state dict
     """
     titans_state = {}
+    variant = getattr(model, "_titans_variant", "mac")
 
     for layer in get_titans_layers(model):
         layer_key = f"layer_{layer.layer_idx}"
 
-        # Memory parameters
+        # Memory parameters (common to both variants)
         for name, param in layer.memory.named_parameters():
             titans_state[f"{layer_key}.memory.{name}"] = param.data
 
-        # Projection parameters
-        for name, param in layer.mem_proj.named_parameters():
-            titans_state[f"{layer_key}.mem_proj.{name}"] = param.data
-
-        # Gate parameters
-        for name, param in layer.gate.named_parameters():
-            titans_state[f"{layer_key}.gate.{name}"] = param.data
-
-        # Warm start parameters (if present)
-        if layer.warm_start is not None:
-            for name, param in layer.warm_start.named_parameters():
-                titans_state[f"{layer_key}.warm_start.{name}"] = param.data
+        # Variant-specific parameters
+        if isinstance(layer, MAGQwenDecoderLayer):
+            # MAG: memory_to_gate projection and modulation params
+            for name, param in layer.memory_to_gate.named_parameters():
+                titans_state[f"{layer_key}.memory_to_gate.{name}"] = param.data
+            titans_state[f"{layer_key}.modulation_scale"] = layer.modulation_scale.data
+            titans_state[f"{layer_key}.modulation_bias"] = layer.modulation_bias.data
+        else:
+            # MAC: mem_proj and gate
+            for name, param in layer.mem_proj.named_parameters():
+                titans_state[f"{layer_key}.mem_proj.{name}"] = param.data
+            for name, param in layer.gate.named_parameters():
+                titans_state[f"{layer_key}.gate.{name}"] = param.data
+            # Warm start parameters (if present)
+            if layer.warm_start is not None:
+                for name, param in layer.warm_start.named_parameters():
+                    titans_state[f"{layer_key}.warm_start.{name}"] = param.data
 
     # Also save config
     if hasattr(model, "_titans_config"):
@@ -360,6 +366,7 @@ def save_titans_state(model: nn.Module, path: str) -> None:
             "use_self_mod_proj": model._titans_config.use_self_mod_proj,
             "use_self_mod_gate": model._titans_config.use_self_mod_gate,
             "use_warm_start": model._titans_config.use_warm_start,
+            "titans_variant": variant,
         }
 
     torch.save(titans_state, path)
@@ -379,30 +386,42 @@ def load_titans_state(model: nn.Module, path: str) -> None:
     for layer in get_titans_layers(model):
         layer_key = f"layer_{layer.layer_idx}"
 
-        # Memory parameters
+        # Memory parameters (common to both variants)
         for name, param in layer.memory.named_parameters():
             key = f"{layer_key}.memory.{name}"
             if key in titans_state:
                 # Convert dtype to match model parameter
                 param.data.copy_(titans_state[key].to(param.dtype))
 
-        # Projection parameters
-        for name, param in layer.mem_proj.named_parameters():
-            key = f"{layer_key}.mem_proj.{name}"
-            if key in titans_state:
-                param.data.copy_(titans_state[key].to(param.dtype))
-
-        # Gate parameters
-        for name, param in layer.gate.named_parameters():
-            key = f"{layer_key}.gate.{name}"
-            if key in titans_state:
-                param.data.copy_(titans_state[key].to(param.dtype))
-
-        # Warm start parameters (if present)
-        if layer.warm_start is not None:
-            for name, param in layer.warm_start.named_parameters():
-                key = f"{layer_key}.warm_start.{name}"
+        # Variant-specific parameters
+        if isinstance(layer, MAGQwenDecoderLayer):
+            # MAG: memory_to_gate projection and modulation params
+            for name, param in layer.memory_to_gate.named_parameters():
+                key = f"{layer_key}.memory_to_gate.{name}"
                 if key in titans_state:
                     param.data.copy_(titans_state[key].to(param.dtype))
+            # Modulation scale and bias
+            scale_key = f"{layer_key}.modulation_scale"
+            if scale_key in titans_state:
+                layer.modulation_scale.data.copy_(titans_state[scale_key].to(layer.modulation_scale.dtype))
+            bias_key = f"{layer_key}.modulation_bias"
+            if bias_key in titans_state:
+                layer.modulation_bias.data.copy_(titans_state[bias_key].to(layer.modulation_bias.dtype))
+        else:
+            # MAC: mem_proj and gate
+            for name, param in layer.mem_proj.named_parameters():
+                key = f"{layer_key}.mem_proj.{name}"
+                if key in titans_state:
+                    param.data.copy_(titans_state[key].to(param.dtype))
+            for name, param in layer.gate.named_parameters():
+                key = f"{layer_key}.gate.{name}"
+                if key in titans_state:
+                    param.data.copy_(titans_state[key].to(param.dtype))
+            # Warm start parameters (if present)
+            if layer.warm_start is not None:
+                for name, param in layer.warm_start.named_parameters():
+                    key = f"{layer_key}.warm_start.{name}"
+                    if key in titans_state:
+                        param.data.copy_(titans_state[key].to(param.dtype))
 
     print(f"Loaded Titans state from {path}")
