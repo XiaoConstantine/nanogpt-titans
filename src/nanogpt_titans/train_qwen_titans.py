@@ -369,6 +369,11 @@ def train(config: QwenTitansTrainConfig) -> None:
     # Move to device
     model.to(device)
 
+    # Enable gradient checkpointing for memory efficiency
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+        print("\nEnabled gradient checkpointing")
+
     # Compile model for faster training (PyTorch 2.0+)
     if config.compile:
         if device.type == "cuda":
@@ -514,14 +519,14 @@ def train(config: QwenTitansTrainConfig) -> None:
                     loss = outputs.loss
 
                     # Add internal loss from HOPE memory
-                    if config.use_internal_loss:
+                    # Only compute every N segments to reduce overhead
+                    if config.use_internal_loss and (start == 0):  # Only first segment per sequence
                         internal_losses = get_internal_losses(model)
-                        internal_loss = sum(internal_losses) if internal_losses else torch.tensor(0.0, device=device)
                         if internal_losses:
+                            internal_loss = torch.stack(internal_losses).sum()
                             # Check for NaN in internal loss
                             if torch.isnan(internal_loss):
                                 print(f"WARNING: NaN detected in internal_loss at step {step}")
-                                internal_loss = torch.tensor(0.0, device=device)
                             else:
                                 loss = loss + config.internal_loss_weight * internal_loss
                                 total_internal_loss += internal_loss.item()
