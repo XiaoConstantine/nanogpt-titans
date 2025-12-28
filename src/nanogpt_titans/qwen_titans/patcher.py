@@ -219,7 +219,7 @@ def freeze_base_model(model: nn.Module) -> dict[str, int]:
             layer.gate.requires_grad = True
             titans_params += layer.gate.numel()
         else:
-            # MAC: mem_proj and gate (nn.Linear)
+            # HOPE: mem_proj, gate, mem_ln, mem_scale
             for param in layer.mem_proj.parameters():
                 param.requires_grad = True
                 titans_params += param.numel()
@@ -227,6 +227,17 @@ def freeze_base_model(model: nn.Module) -> dict[str, int]:
             for param in layer.gate.parameters():
                 param.requires_grad = True
                 titans_params += param.numel()
+
+            # LayerNorm for memory (new in fixed implementation)
+            if hasattr(layer, "mem_ln"):
+                for param in layer.mem_ln.parameters():
+                    param.requires_grad = True
+                    titans_params += param.numel()
+
+            # Learned scale for memory contribution (new in fixed implementation)
+            if hasattr(layer, "mem_scale"):
+                layer.mem_scale.requires_grad = True
+                titans_params += layer.mem_scale.numel()
 
             # Warm start encoder (if present)
             if layer.warm_start is not None:
