@@ -47,10 +47,11 @@ class PositionDependentGate(nn.Module):
             nn.SiLU(),
             nn.Linear(dim // 4, 1),
         )
-        # Initialize for conservative output (near 0)
-        nn.init.zeros_(self.gate_mlp[0].weight)
+        # Initialize with small random weights (not zeros!) to allow gradient flow
+        # Zero weights create dead gradients - the gate can never learn
+        nn.init.normal_(self.gate_mlp[0].weight, std=0.01)
         nn.init.zeros_(self.gate_mlp[0].bias)
-        nn.init.zeros_(self.gate_mlp[2].weight)
+        nn.init.normal_(self.gate_mlp[2].weight, std=0.01)
         nn.init.constant_(self.gate_mlp[2].bias, init_bias)  # sigmoid(-2) ≈ 0.12
         
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

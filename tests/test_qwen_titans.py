@@ -186,10 +186,55 @@ class TestPositionDependentGate:
         out = gate(x)
         loss = out.sum()
         loss.backward()
-        
+
         assert x.grad is not None
         # Check MLP parameters have gradients
         assert gate.gate_mlp[0].weight.grad is not None
+
+    def test_weights_receive_nonzero_gradients(self):
+        """Test MLP weights receive non-zero gradients (can actually learn).
+
+        This is critical - with zero-initialized weights, gradients would be zero
+        and the gate could never learn position-dependent behavior.
+        """
+        gate = PositionDependentGate(dim=64, init_bias=-2.0)
+        x = torch.randn(2, 10, 64)
+        out = gate(x)
+        loss = out.sum()
+        loss.backward()
+
+        # All MLP weights should have NON-ZERO gradients
+        w1_grad = gate.gate_mlp[0].weight.grad
+        w2_grad = gate.gate_mlp[2].weight.grad
+
+        assert w1_grad is not None
+        assert w2_grad is not None
+        # Critical: gradients must be non-zero for learning to occur
+        assert w1_grad.abs().sum() > 0, "First layer weights have zero gradient - gate cannot learn!"
+        assert w2_grad.abs().sum() > 0, "Second layer weights have zero gradient - gate cannot learn!"
+
+    def test_weights_update_after_optimizer_step(self):
+        """Test gate weights actually change after optimizer step."""
+        gate = PositionDependentGate(dim=64, init_bias=-2.0)
+        optimizer = torch.optim.Adam(gate.parameters(), lr=0.01)
+
+        # Save initial weights
+        w1_before = gate.gate_mlp[0].weight.clone()
+        w2_before = gate.gate_mlp[2].weight.clone()
+
+        # Forward + backward + step
+        x = torch.randn(2, 10, 64)
+        out = gate(x)
+        loss = out.sum()
+        loss.backward()
+        optimizer.step()
+
+        # Weights should have changed
+        w1_after = gate.gate_mlp[0].weight
+        w2_after = gate.gate_mlp[2].weight
+
+        assert not torch.allclose(w1_before, w1_after), "First layer weights didn't update!"
+        assert not torch.allclose(w2_before, w2_after), "Second layer weights didn't update!"
 
 
 # --- SelfModifyingLinear Tests ---
