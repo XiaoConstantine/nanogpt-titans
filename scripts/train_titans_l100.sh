@@ -101,11 +101,11 @@ if [[ "$EVAL_ONLY" == "false" ]]; then
     echo "=============================================="
 
     # Build training command
-    # Note: gate_warmup_steps keeps gate frozen for first 500 steps so memory can learn
-    # before gate has a chance to collapse (chicken-egg problem fix)
+    # Using MAG variant (Memory as Gate) - more stable than MAC, no gate collapse
     TRAIN_CMD="uv run python -m nanogpt_titans.train_qwen_titans \
         --model_name $MODEL \
         --output_dir $OUTPUT_DIR \
+        --titans_variant mag \
         --max_steps $STEPS \
         --batch_size $BATCH_SIZE \
         --gradient_accumulation_steps $GRAD_ACCUM \
@@ -117,9 +117,7 @@ if [[ "$EVAL_ONLY" == "false" ]]; then
         --eval_interval 200 \
         --save_interval 500 \
         --num_cms_levels 3 \
-        --internal_loss_weight 0.001 \
-        --gate_warmup_steps 500 \
-        --gate_min_value 0.1 \
+        --internal_loss_weight 0.01 \
         --dataset_name wikitext \
         --dataset_config wikitext-103-raw-v1"
 
