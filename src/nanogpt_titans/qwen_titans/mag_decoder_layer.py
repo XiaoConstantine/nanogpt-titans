@@ -118,6 +118,8 @@ class MAGQwenDecoderLayer(nn.Module):
             self.input_layernorm = original_layer.input_layernorm
         if hasattr(original_layer, "post_attention_layernorm"):
             self.post_attention_layernorm = original_layer.post_attention_layernorm
+        if hasattr(original_layer, "attention_type"):
+            self.attention_type = original_layer.attention_type
 
     def forward(
         self,
