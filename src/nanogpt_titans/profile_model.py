@@ -305,6 +305,317 @@ def profile_with_torch_profiler(
 
 
 # =============================================================================
+# Qwen-Titans Gradient Diagnostics
+# =============================================================================
+
+
+def diagnose_gradient_flow(
+    model_name: str = "Qwen/Qwen2-0.5B",
+    memory_layers: list[int] | None = None,
+    segment_len: int = 512,
+    batch_size: int = 2,
+    seq_len: int = 1024,
+    num_steps: int = 50,
+    learning_rate: float = 1e-4,
+    device: str = "cuda",
+    dtype_str: str = "bfloat16",
+) -> dict:
+    """
+    Diagnose why mem_scale and gate aren't evolving.
+
+    Tracks:
+    - Gradient norms for all TITANS parameters
+    - Parameter values before/after training
+    - Learning rate applied to each param group
+    - Whether gradients are being zeroed unexpectedly
+    """
+    if not _TRANSFORMERS_AVAILABLE:
+        raise ImportError("Requires: pip install transformers")
+
+    from nanogpt_titans.qwen_titans import TitansStateManager
+    from nanogpt_titans.qwen_titans.decoder_layer import TitansQwenDecoderLayer
+
+    dtype_map = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
+    dtype = dtype_map[dtype_str]
+    device = torch.device(device if torch.cuda.is_available() else "cpu")
+
+    print("=" * 70)
+    print("GRADIENT FLOW DIAGNOSTICS")
+    print("=" * 70)
+    print(f"Model: {model_name}")
+    print(f"Learning rate: {learning_rate}")
+    print(f"Steps: {num_steps}")
+    print()
+
+    # Load model
+    print(f"Loading {model_name}...")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=dtype,
+        trust_remote_code=True,
+        attn_implementation="eager",
+    )
+
+    qwen_config = model.config
+    n_layer = qwen_config.num_hidden_layers
+    if memory_layers is None:
+        memory_layers = [n_layer // 2]
+
+    # Patch with TITANS
+    titans_config = TitansQwenConfig.from_qwen_config(
+        qwen_config,
+        segment_len=segment_len,
+        memory_layers=memory_layers,
+        use_cms=True,
+    )
+
+    model = patch_qwen_with_titans(model, titans_config, variant="hope")
+    param_stats = freeze_base_model(model)
+    titans_layers = get_titans_layers(model)
+
+    model.to(device)
+
+    # Store initial values
+    initial_values = {}
+    for layer in titans_layers:
+        layer_key = f"layer_{layer.layer_idx}"
+        for name, param in layer.named_parameters():
+            if param.requires_grad:
+                key = f"{layer_key}.{name}"
+                initial_values[key] = param.data.clone()
+
+    print(f"\nTracking {len(initial_values)} trainable parameters")
+
+    # Key parameters to watch
+    key_params = ["mem_scale", "gate.gate_mlp.2.bias", "gate.gate_mlp.0.weight"]
+
+    print("\n" + "-" * 70)
+    print("INITIAL VALUES:")
+    print("-" * 70)
+    for layer in titans_layers:
+        layer_key = f"layer_{layer.layer_idx}"
+        print(f"\n{layer_key}:")
+        if hasattr(layer, 'mem_scale'):
+            val = torch.sigmoid(layer.mem_scale).item()
+            print(f"  mem_scale (sigmoid): {val:.6f}")
+            print(f"  mem_scale (raw):     {layer.mem_scale.item():.6f}")
+        if hasattr(layer, 'gate') and hasattr(layer.gate, 'gate_mlp'):
+            bias = layer.gate.gate_mlp[2].bias.item()
+            print(f"  gate bias (raw):     {bias:.6f}")
+            print(f"  gate bias (sigmoid): {torch.sigmoid(torch.tensor(bias)).item():.6f}")
+
+    # Setup optimizer - check param groups
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate)
+
+    print(f"\nOptimizer param groups: {len(optimizer.param_groups)}")
+    print(f"Total trainable params in optimizer: {sum(p.numel() for g in optimizer.param_groups for p in g['params'])}")
+
+    # State manager
+    state_manager = TitansStateManager(model)
+
+    # Create dummy data
+    input_ids = torch.randint(0, qwen_config.vocab_size, (batch_size, seq_len), device=device)
+    labels = input_ids.clone()
+
+    # Training loop with detailed gradient tracking
+    print("\n" + "=" * 70)
+    print("TRAINING WITH GRADIENT TRACKING")
+    print("=" * 70)
+
+    model.train()
+
+    device_type = "cuda" if device.type == "cuda" else "cpu"
+    ctx = torch.amp.autocast(device_type=device_type, dtype=dtype) if device_type == "cuda" else nullcontext()
+
+    grad_history = []
+
+    for step in range(num_steps):
+        optimizer.zero_grad(set_to_none=True)
+
+        state_manager.reset()
+        state_manager.init_states(batch_size, device)
+
+        total_loss = 0.0
+        num_segments = 0
+
+        # Process segments
+        for start in range(0, seq_len, segment_len):
+            end = min(start + segment_len, seq_len)
+            seg_input = input_ids[:, start:end]
+            seg_labels = labels[:, start:end]
+
+            state_manager.sync_to_layers()
+
+            with ctx:
+                outputs = model(seg_input, labels=seg_labels, use_cache=False)
+                loss = outputs.loss
+
+            loss.backward()
+            total_loss += loss.item()
+            num_segments += 1
+
+            state_manager.sync_from_layers()
+
+        # Collect gradient info BEFORE optimizer step
+        step_grads = {"step": step, "loss": total_loss / num_segments, "grads": {}, "values": {}}
+
+        for layer in titans_layers:
+            layer_key = f"layer_{layer.layer_idx}"
+
+            # mem_scale
+            if hasattr(layer, 'mem_scale'):
+                param = layer.mem_scale
+                if param.grad is not None:
+                    step_grads["grads"][f"{layer_key}.mem_scale"] = param.grad.item()
+                else:
+                    step_grads["grads"][f"{layer_key}.mem_scale"] = None
+                step_grads["values"][f"{layer_key}.mem_scale"] = param.item()
+
+            # gate bias
+            if hasattr(layer, 'gate') and hasattr(layer.gate, 'gate_mlp'):
+                param = layer.gate.gate_mlp[2].bias
+                if param.grad is not None:
+                    step_grads["grads"][f"{layer_key}.gate_bias"] = param.grad.item()
+                else:
+                    step_grads["grads"][f"{layer_key}.gate_bias"] = None
+                step_grads["values"][f"{layer_key}.gate_bias"] = param.item()
+
+            # gate weight norm
+            if hasattr(layer, 'gate') and hasattr(layer.gate, 'gate_mlp'):
+                param = layer.gate.gate_mlp[2].weight
+                if param.grad is not None:
+                    step_grads["grads"][f"{layer_key}.gate_weight_norm"] = param.grad.norm().item()
+                else:
+                    step_grads["grads"][f"{layer_key}.gate_weight_norm"] = None
+
+            # mem_proj weight norm
+            if hasattr(layer, 'mem_proj'):
+                for name, param in layer.mem_proj.named_parameters():
+                    if param.grad is not None:
+                        step_grads["grads"][f"{layer_key}.mem_proj.{name}"] = param.grad.norm().item()
+
+        grad_history.append(step_grads)
+
+        # Clip and step
+        torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+        optimizer.step()
+
+        # Print progress
+        if step % 10 == 0 or step == num_steps - 1:
+            print(f"\nStep {step}:")
+            print(f"  Loss: {step_grads['loss']:.4f}")
+            for key, grad in step_grads["grads"].items():
+                if "mem_scale" in key or "gate_bias" in key:
+                    val = step_grads["values"].get(key.replace("_norm", ""), "N/A")
+                    grad_str = f"{grad:.2e}" if grad is not None else "None!"
+                    print(f"  {key}: grad={grad_str}, value={val:.6f}")
+
+    # Final analysis
+    print("\n" + "=" * 70)
+    print("FINAL ANALYSIS")
+    print("=" * 70)
+
+    # Compare initial vs final
+    print("\nParameter Changes:")
+    for layer in titans_layers:
+        layer_key = f"layer_{layer.layer_idx}"
+        print(f"\n{layer_key}:")
+
+        if hasattr(layer, 'mem_scale'):
+            init_val = initial_values.get(f"{layer_key}.mem_scale", torch.tensor(0.0)).item()
+            final_val = layer.mem_scale.item()
+            delta = final_val - init_val
+            print(f"  mem_scale: {init_val:.6f} → {final_val:.6f} (Δ={delta:+.6f})")
+            print(f"  mem_scale (sigmoid): {torch.sigmoid(torch.tensor(init_val)).item():.4f} → {torch.sigmoid(layer.mem_scale).item():.4f}")
+
+        if hasattr(layer, 'gate') and hasattr(layer.gate, 'gate_mlp'):
+            init_key = f"{layer_key}.gate.gate_mlp.2.bias"
+            if init_key in initial_values:
+                init_val = initial_values[init_key].item()
+                final_val = layer.gate.gate_mlp[2].bias.item()
+                delta = final_val - init_val
+                print(f"  gate bias: {init_val:.6f} → {final_val:.6f} (Δ={delta:+.6f})")
+
+    # Gradient flow analysis
+    print("\n" + "-" * 70)
+    print("GRADIENT FLOW ANALYSIS:")
+    print("-" * 70)
+
+    # Check if gradients were ever non-zero
+    for key in ["mem_scale", "gate_bias"]:
+        grads = [h["grads"].get(f"layer_{memory_layers[0]}.{key}") for h in grad_history]
+        non_none = [g for g in grads if g is not None]
+        non_zero = [g for g in non_none if abs(g) > 1e-10]
+
+        print(f"\n{key}:")
+        print(f"  Total steps: {len(grads)}")
+        print(f"  Non-None gradients: {len(non_none)}")
+        print(f"  Non-zero gradients: {len(non_zero)}")
+        if non_zero:
+            print(f"  Gradient range: [{min(non_zero):.2e}, {max(non_zero):.2e}]")
+            print(f"  Gradient mean: {sum(non_zero)/len(non_zero):.2e}")
+        else:
+            print("  ⚠️  NO GRADIENTS FLOWING TO THIS PARAMETER!")
+
+    # Diagnose issues
+    print("\n" + "=" * 70)
+    print("DIAGNOSIS:")
+    print("=" * 70)
+
+    issues = []
+
+    # Check mem_scale gradients
+    mem_scale_grads = [h["grads"].get(f"layer_{memory_layers[0]}.mem_scale") for h in grad_history]
+    if all(g is None for g in mem_scale_grads):
+        issues.append("mem_scale: No gradients (param not in computation graph)")
+    elif all(g is None or abs(g) < 1e-10 for g in mem_scale_grads):
+        issues.append("mem_scale: Gradients too small (vanishing gradient)")
+
+    # Check gate gradients
+    gate_grads = [h["grads"].get(f"layer_{memory_layers[0]}.gate_bias") for h in grad_history]
+    if all(g is None for g in gate_grads):
+        issues.append("gate: No gradients (param not in computation graph)")
+    elif all(g is None or abs(g) < 1e-10 for g in gate_grads):
+        issues.append("gate: Gradients too small (vanishing gradient)")
+
+    # Check if values changed
+    for layer in titans_layers:
+        layer_key = f"layer_{layer.layer_idx}"
+        if hasattr(layer, 'mem_scale'):
+            init = initial_values.get(f"{layer_key}.mem_scale", torch.tensor(0.0)).item()
+            final = layer.mem_scale.item()
+            if abs(final - init) < 1e-5:
+                issues.append(f"mem_scale: Value unchanged after {num_steps} steps")
+
+    if issues:
+        print("\n⚠️  ISSUES FOUND:")
+        for issue in issues:
+            print(f"  - {issue}")
+
+        print("\n💡 POSSIBLE FIXES:")
+        if any("No gradients" in i for i in issues):
+            print("  1. Check if mem_scale is used in forward pass")
+            print("  2. Verify param.requires_grad = True")
+            print("  3. Check freeze_base_model() unfreezes these params")
+        if any("too small" in i for i in issues):
+            print("  1. Increase learning rate (try 5e-4 or 1e-3)")
+            print("  2. Check if loss is backpropagating through memory path")
+            print("  3. Reduce gradient clipping threshold")
+        if any("unchanged" in i for i in issues):
+            print("  1. Learning rate may be too low")
+            print("  2. Gradients may be clipped to zero")
+    else:
+        print("\n✅ Gradients are flowing correctly!")
+
+    return {
+        "grad_history": grad_history,
+        "initial_values": {k: v.item() if v.numel() == 1 else v.tolist() for k, v in initial_values.items()},
+        "issues": issues,
+    }
+
+
+# =============================================================================
 # Qwen-Titans Profiling
 # =============================================================================
 
@@ -706,6 +1017,7 @@ def main() -> None:
 
     # Model selection
     parser.add_argument("--qwen", action="store_true", help="Profile Qwen-Titans instead of TitansGPT")
+    parser.add_argument("--diagnose", action="store_true", help="Diagnose gradient flow for mem_scale/gate (use with --qwen)")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2-0.5B", help="Qwen model name (for --qwen)")
     parser.add_argument("--memory_layers", type=str, default=None, help="Memory layer indices, comma-separated (for --qwen)")
 
@@ -738,6 +1050,21 @@ def main() -> None:
     memory_layers = None
     if args.memory_layers:
         memory_layers = [int(x.strip()) for x in args.memory_layers.split(",")]
+
+    # Gradient flow diagnostics
+    if args.diagnose:
+        diagnose_gradient_flow(
+            model_name=args.model_name,
+            memory_layers=memory_layers,
+            segment_len=args.segment_len,
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+            num_steps=args.num_iters * 5,  # More steps for diagnosis
+            learning_rate=1e-4,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            dtype_str=args.dtype,
+        )
+        return
 
     # Qwen-Titans profiling
     if args.qwen:

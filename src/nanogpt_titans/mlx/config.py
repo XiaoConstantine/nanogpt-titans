@@ -47,6 +47,14 @@ class MLXTitansConfig:
     # Gate warmup: freeze gate for first N steps to let memory learn first
     gate_warmup_steps: int = 0
 
+    # Gate regularization: prevent gate from collapsing below min_value (like PyTorch)
+    gate_min_value: float = 0.15  # Matches PyTorch default
+    gate_reg_weight: float = 1.0  # Regularization weight
+
+    # Internal loss (for memory to learn independently of gate)
+    use_internal_loss: bool = False
+    internal_loss_weight: float = 1e-4  # Small weight to not dominate LM loss
+
     # Output
     output_dir: str = "out-mlx-titans"
 

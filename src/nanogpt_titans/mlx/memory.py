@@ -90,8 +90,13 @@ class MLXNeuralMemory(nn.Module):
         # Template MLP weights - these are cloned per-sequence as initial memory
         # For a 2-layer MLP: h = silu(x @ W0.T), out = h @ W1.T
         # W0: [hidden_dim, dim], W1: [dim, hidden_dim]
-        self.template_w0 = mx.random.normal((self.hidden_dim, dim)) * 0.02
-        self.template_w1 = mx.random.normal((dim, self.hidden_dim)) * 0.02
+        # NOTE: Using Linear layers to make weights trainable parameters
+        self._template_mlp_w0 = nn.Linear(dim, self.hidden_dim, bias=False)
+        self._template_mlp_w1 = nn.Linear(self.hidden_dim, dim, bias=False)
+
+        # Initialize with small weights
+        self._template_mlp_w0.weight = mx.random.normal((self.hidden_dim, dim)) * 0.02
+        self._template_mlp_w1.weight = mx.random.normal((dim, self.hidden_dim)) * 0.02
 
         # Learned initial query for first segment (when no previous output exists)
         self.init_query = mx.random.normal((1, 1, dim)) * 0.02
@@ -114,19 +119,26 @@ class MLXNeuralMemory(nn.Module):
 
     def init_state(self, batch_size: int) -> MLXMemoryState:
         """Initialize memory state - clone MLP weights for each batch item."""
+        # Get template weights from Linear layers (trainable parameters)
+        # w0 has shape [hidden_dim, dim], w1 has shape [dim, hidden_dim]
+        template_w0 = self._template_mlp_w0.weight  # [H, C]
+        template_w1 = self._template_mlp_w1.weight  # [C, H]
+
         # Expand template weights to [B, *param_shape]
         w0 = mx.broadcast_to(
-            self.template_w0[None, :, :],
+            template_w0[None, :, :],
             (batch_size, self.hidden_dim, self.dim)
         )
         w1 = mx.broadcast_to(
-            self.template_w1[None, :, :],
+            template_w1[None, :, :],
             (batch_size, self.dim, self.hidden_dim)
         )
 
+        # Stop gradient - state weights are updated by test-time learning,
+        # not by backprop. Template weights receive gradients via internal loss.
         weights = {
-            'w0': mx.array(w0),  # Force copy
-            'w1': mx.array(w1),
+            'w0': mx.stop_gradient(w0),
+            'w1': mx.stop_gradient(w1),
         }
 
         # Initialize momentum to zero
@@ -218,6 +230,64 @@ class MLXNeuralMemory(nn.Module):
         dW0 = mx.matmul(mx.transpose(dh_pre, axes=(0, 2, 1)), keys)  # [B, H, C]
 
         return {'w0': dW0, 'w1': dW1}
+
+    def compute_internal_loss(
+        self,
+        x: mx.array,
+        state: MLXMemoryState
+    ) -> mx.array:
+        """
+        Compute internal loss: ||M(keys) - values||^2
+
+        This is the reconstruction error that teaches the TEMPLATE weights
+        to store/retrieve patterns. From Titans paper Eq. 9.
+
+        Uses template weights (trainable) not state weights (test-time updated).
+
+        Args:
+            x: Input hidden states [B, T, C]
+            state: Current memory state (unused - we use template weights)
+
+        Returns:
+            Scalar internal loss
+        """
+        B, T, C = x.shape
+
+        # Clip input for numerical stability
+        x_clipped = mx.clip(x, -10.0, 10.0)
+
+        # Project to keys and values
+        keys = self.key_proj(x_clipped)
+        values = self.value_proj(x_clipped)
+
+        # Clip projections
+        keys = mx.clip(keys, -10.0, 10.0)
+        values = mx.clip(values, -10.0, 10.0)
+
+        # Use TEMPLATE weights (trainable parameters) for internal loss
+        # This trains the template so init_state produces better initial memory
+        W0 = self._template_mlp_w0.weight  # [H, C]
+        W1 = self._template_mlp_w1.weight  # [C, H]
+
+        # Forward through template MLP (non-batched, then broadcast)
+        # Layer 0: h = silu(keys @ W0.T)
+        h_pre = mx.matmul(keys, W0.T)  # [B, T, H]
+        h = mx.sigmoid(h_pre) * h_pre  # SiLU
+
+        # Layer 1: pred = h @ W1.T
+        pred = mx.matmul(h, W1.T)  # [B, T, C]
+
+        # Clip prediction
+        pred = mx.clip(pred, -10.0, 10.0)
+
+        # MSE loss
+        diff = pred - values
+        loss = mx.mean(diff * diff)
+
+        # Clip final loss to prevent gradient explosion
+        loss = mx.minimum(loss, mx.array(100.0))
+
+        return loss
 
     def __call__(self, x: mx.array, state: MLXMemoryState) -> mx.array:
         """
@@ -403,6 +473,24 @@ class MLXContinuumMemorySystem(nn.Module):
         combined = mx.sum(weights_expanded * stacked, axis=0)  # [B, T, C]
 
         return combined
+
+    def compute_internal_loss(
+        self,
+        x: mx.array,
+        state: MLXCMSState
+    ) -> mx.array:
+        """
+        Compute internal loss for CMS (uses first/fastest level).
+
+        Args:
+            x: Input hidden states [B, T, C]
+            state: Current CMS state
+
+        Returns:
+            Scalar internal loss
+        """
+        # Use first memory level for internal loss
+        return self.memories[0].compute_internal_loss(x, state.level_states[0])
 
     def update(self, hidden_states: mx.array, state: MLXCMSState) -> MLXCMSState:
         """

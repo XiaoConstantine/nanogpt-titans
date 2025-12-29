@@ -176,3 +176,23 @@ class MLXTitansLayer(nn.Module):
         new_state = self.memory.update(output, state)
 
         return output, new_state
+
+    def compute_internal_loss(
+        self,
+        hidden_states: mx.array,
+        state: TitansLayerState
+    ) -> mx.array:
+        """
+        Compute internal loss for memory module.
+
+        This provides an independent learning signal for memory,
+        separate from the gate and LM loss.
+
+        Args:
+            hidden_states: Input hidden states [B, T, C]
+            state: Current memory state
+
+        Returns:
+            Scalar internal loss
+        """
+        return self.memory.compute_internal_loss(hidden_states, state)

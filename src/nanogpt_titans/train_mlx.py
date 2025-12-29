@@ -238,11 +238,23 @@ def train(config: MLXTitansConfig):
     print(f"Applying TITANS at layer {memory_layer_idx} of {num_layers}")
 
     # Create combined model wrapper
-    combined_model = CombinedModel(model, titans_layer, memory_layer_idx)
+    combined_model = CombinedModel(
+        model, titans_layer, memory_layer_idx,
+        use_internal_loss=config.use_internal_loss,
+        internal_loss_weight=config.internal_loss_weight
+    )
+    if config.use_internal_loss:
+        print(f"Internal loss enabled with weight={config.internal_loss_weight}")
 
-    # Create loss function
-    loss_fn = create_loss_fn(combined_model)
+    # Create loss function with gate regularization
+    loss_fn = create_loss_fn(
+        combined_model,
+        gate_min_value=config.gate_min_value,
+        gate_reg_weight=config.gate_reg_weight
+    )
     loss_and_grad_fn = nn.value_and_grad(combined_model, loss_fn)
+    if config.gate_min_value > 0:
+        print(f"Gate regularization enabled: min_value={config.gate_min_value}, weight={config.gate_reg_weight}")
 
     t0 = time.time()
 
@@ -326,6 +338,13 @@ def train(config: MLXTitansConfig):
                 for i in range(config.num_cms_levels):
                     cms_weights[f"cms_weight_{i}"] = float(weights[i].item())
 
+            # Get internal loss if enabled
+            internal_loss_val = 0.0
+            if config.use_internal_loss:
+                il = combined_model.get_internal_loss()
+                if il is not None:
+                    internal_loss_val = float(il.item())
+
             log_entry = {
                 "step": step,
                 "loss": avg_loss,
@@ -333,6 +352,7 @@ def train(config: MLXTitansConfig):
                 "gate_mean": gate_mean,
                 "lr": lr,
                 "time_ms": dt * 1000,
+                "internal_loss": internal_loss_val,
                 **cms_weights,
             }
             log_history.append(log_entry)
@@ -341,7 +361,11 @@ def train(config: MLXTitansConfig):
             if cms_weights:
                 cms_str = ", cms=[" + ", ".join(f"{v:.3f}" for v in cms_weights.values()) + "]"
 
-            print(f"step {step}: loss={avg_loss:.4f}, mem_scale={mem_scale:.3f}, gate={gate_mean:.3f}{cms_str}, lr={lr:.2e}")
+            il_str = ""
+            if config.use_internal_loss:
+                il_str = f", int_loss={internal_loss_val:.4f}"
+
+            print(f"step {step}: loss={avg_loss:.4f}, mem_scale={mem_scale:.3f}, gate={gate_mean:.3f}{cms_str}{il_str}, lr={lr:.2e}")
 
     # Save results
     log_path = output_dir / "mlx_training_log.json"
@@ -383,6 +407,16 @@ def main():
     parser.add_argument("--no_cms", action="store_false", dest="use_cms")
     parser.add_argument("--gate_warmup_steps", type=int, default=0)
     parser.add_argument("--no_adaptive", action="store_true")
+    parser.add_argument("--use_internal_loss", action="store_true", default=False,
+                        help="Enable internal loss for memory to learn independently")
+    parser.add_argument("--internal_loss_weight", type=float, default=1e-4,
+                        help="Weight for internal loss (default: 1e-4)")
+    parser.add_argument("--gate_min_value", type=float, default=0.15,
+                        help="Minimum gate value for regularization (default: 0.15, like PyTorch)")
+    parser.add_argument("--gate_reg_weight", type=float, default=1.0,
+                        help="Weight for gate regularization loss (default: 1.0)")
+    parser.add_argument("--gate_init_bias", type=float, default=-2.0,
+                        help="Initial gate bias (default: -2.0 → sigmoid ≈ 0.12, like PyTorch)")
 
     args = parser.parse_args()
 
@@ -399,6 +433,11 @@ def main():
         use_cms=args.use_cms,
         gate_warmup_steps=args.gate_warmup_steps,
         adaptive_memory=not args.no_adaptive,
+        use_internal_loss=args.use_internal_loss,
+        internal_loss_weight=args.internal_loss_weight,
+        gate_min_value=args.gate_min_value,
+        gate_reg_weight=args.gate_reg_weight,
+        gate_init_bias=args.gate_init_bias,
     )
 
     train(config)

@@ -31,18 +31,25 @@ class CombinedModel(nn.Module):
         self,
         base_model,
         titans_layer: MLXTitansLayer,
-        memory_layer_idx: int
+        memory_layer_idx: int,
+        use_internal_loss: bool = False,
+        internal_loss_weight: float = 1e-4
     ):
         super().__init__()
         self.base_model = base_model
         self.titans_layer = titans_layer
         self.memory_layer_idx = memory_layer_idx
+        self.use_internal_loss = use_internal_loss
+        self.internal_loss_weight = internal_loss_weight
 
         # Get inner model reference
         self._inner_model = base_model.model if hasattr(base_model, 'model') else base_model
 
         # Memory state (initialized on first forward)
         self._memory_state: Optional[TitansLayerState] = None
+
+        # Store internal loss from last forward (for logging)
+        self._last_internal_loss: Optional[mx.array] = None
 
     def init_memory_state(self, batch_size: int):
         """Initialize memory state for the TITANS layer."""
@@ -68,13 +75,29 @@ class CombinedModel(nn.Module):
         mask = nn.MultiHeadAttention.create_additive_causal_mask(T)
         mask = mask.astype(h.dtype)
 
+        # Track hidden states and state at memory layer for internal loss
+        h_at_memory_layer = None
+        state_before_update = None
+
         # Forward through transformer layers with TITANS integration
         for i, layer in enumerate(self._inner_model.layers):
             h = layer(h, mask=mask, cache=None)
 
             # Apply TITANS at the specified layer (with memory state update)
             if i == self.memory_layer_idx:
+                # Store hidden states and state BEFORE memory update for internal loss
+                if self.use_internal_loss:
+                    h_at_memory_layer = h
+                    state_before_update = self._memory_state
                 h, self._memory_state = self.titans_layer(h, self._memory_state)
+
+        # Compute internal loss if enabled (using state BEFORE update)
+        if self.use_internal_loss and h_at_memory_layer is not None and state_before_update is not None:
+            self._last_internal_loss = self.titans_layer.compute_internal_loss(
+                h_at_memory_layer, state_before_update
+            )
+        else:
+            self._last_internal_loss = None
 
         # Final layer norm
         h = self._inner_model.norm(h)
@@ -89,8 +112,37 @@ class CombinedModel(nn.Module):
 
         return logits
 
+    def get_internal_loss(self) -> Optional[mx.array]:
+        """Get the internal loss from the last forward pass."""
+        return self._last_internal_loss
 
-def create_loss_fn(combined_model: CombinedModel):
+
+def compute_gate_regularization(titans_layer: MLXTitansLayer, min_value: float = 0.15) -> mx.array:
+    """
+    Compute regularization loss to prevent gate from collapsing below min_value.
+
+    Matches PyTorch compute_gate_regularization() exactly.
+    Penalty: max(0, min_value - gate)^2
+
+    Args:
+        titans_layer: The TITANS layer containing the gate
+        min_value: Minimum gate value to maintain
+
+    Returns:
+        Regularization loss (scalar)
+    """
+    # Get gate bias and compute expected gate value
+    gate_bias = titans_layer.gate.linear2.bias[0]
+    expected_gate = mx.sigmoid(gate_bias)
+
+    # Soft penalty: max(0, min_value - gate)^2
+    diff = min_value - expected_gate
+    penalty = mx.maximum(diff, mx.array(0.0)) ** 2
+
+    return penalty
+
+
+def create_loss_fn(combined_model: CombinedModel, gate_min_value: float = 0.0, gate_reg_weight: float = 0.0):
     """Create a loss function for the combined model."""
     def loss_fn(combined_model, input_ids: mx.array, target_ids: mx.array):
         logits = combined_model(input_ids)
@@ -99,9 +151,21 @@ def create_loss_fn(combined_model: CombinedModel):
         B, T, V = logits.shape
         logits_flat = logits.reshape(-1, V)
         targets_flat = target_ids.reshape(-1)
-        loss = mx.mean(nn.losses.cross_entropy(logits_flat, targets_flat))
+        lm_loss = mx.mean(nn.losses.cross_entropy(logits_flat, targets_flat))
 
-        return loss
+        # Add internal loss if enabled
+        total_loss = lm_loss
+        if combined_model.use_internal_loss:
+            internal_loss = combined_model.get_internal_loss()
+            if internal_loss is not None:
+                total_loss = lm_loss + combined_model.internal_loss_weight * internal_loss
+
+        # Add gate regularization if enabled (prevents gate from collapsing)
+        if gate_min_value > 0 and gate_reg_weight > 0:
+            gate_reg = compute_gate_regularization(combined_model.titans_layer, gate_min_value)
+            total_loss = total_loss + gate_reg_weight * gate_reg
+
+        return total_loss
 
     return loss_fn
 
