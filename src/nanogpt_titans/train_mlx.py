@@ -54,21 +54,23 @@ def load_model_and_tokenizer(model_name: str):
     return model, tokenizer
 
 
-def create_titans_layer(model, config: MLXTitansConfig) -> MLXTitansLayer:
-    """Create a TITANS layer matching model dimensions."""
-    # Get hidden size from model
+def get_model_dim(model) -> int:
+    """Get hidden dimension from model."""
     if hasattr(model, 'model') and hasattr(model.model, 'layers'):
         sample_layer = model.model.layers[0]
         if hasattr(sample_layer, 'hidden_size'):
-            dim = sample_layer.hidden_size
+            return sample_layer.hidden_size
         elif hasattr(sample_layer.self_attn, 'hidden_size'):
-            dim = sample_layer.self_attn.hidden_size
+            return sample_layer.self_attn.hidden_size
         else:
-            dim = sample_layer.self_attn.q_proj.weight.shape[0]
-    else:
-        dim = 896  # Default for Qwen2-0.5B
+            return sample_layer.self_attn.q_proj.weight.shape[0]
+    return 896  # Default for Qwen2-0.5B
 
-    print(f"Creating TITANS layer with dim={dim}, CMS={config.use_cms}")
+
+def create_titans_layer(model, config: MLXTitansConfig) -> MLXTitansLayer:
+    """Create a single TITANS layer matching model dimensions."""
+    dim = get_model_dim(model)
+
     return MLXTitansLayer(
         dim=dim,
         use_cms=config.use_cms,
@@ -80,6 +82,30 @@ def create_titans_layer(model, config: MLXTitansConfig) -> MLXTitansLayer:
         memory_lr_max=config.memory_lr_max,
         gate_init_bias=config.gate_init_bias,
     )
+
+
+def create_titans_layers(model, config: MLXTitansConfig) -> Dict[int, MLXTitansLayer]:
+    """Create TITANS layers for all specified layer indices."""
+    dim = get_model_dim(model)
+    num_layers = len(model.model.layers)
+
+    titans_layers = {}
+    for layer_idx in config.memory_layers:
+        # Clamp to valid range
+        idx = min(layer_idx, num_layers - 1)
+        titans_layers[idx] = MLXTitansLayer(
+            dim=dim,
+            use_cms=config.use_cms,
+            num_cms_levels=config.num_cms_levels,
+            cms_update_frequencies=config.cms_update_frequencies,
+            memory_depth=config.memory_depth,
+            memory_expansion=config.memory_expansion,
+            adaptive_memory=config.adaptive_memory,
+            memory_lr_max=config.memory_lr_max,
+            gate_init_bias=config.gate_init_bias,
+        )
+
+    return titans_layers
 
 
 # =============================================================================
@@ -154,7 +180,7 @@ def train(config: MLXTitansConfig):
     print("MLX TITANS Training (Full HOPE Architecture)")
     print("=" * 60)
     print(f"Model: {config.model_name}")
-    print(f"Memory layer: {config.memory_layer}")
+    print(f"Memory layers: {config.memory_layers}")
     print(f"CMS enabled: {config.use_cms}")
     if config.use_cms:
         print(f"CMS levels: {config.num_cms_levels}")
@@ -169,30 +195,36 @@ def train(config: MLXTitansConfig):
     # Load model
     model, tokenizer = load_model_and_tokenizer(config.model_name)
 
-    # Create TITANS layer
-    titans_layer = create_titans_layer(model, config)
+    # Create TITANS layers for all specified indices
+    titans_layers = create_titans_layers(model, config)
+    num_titans_layers = len(titans_layers)
+    print(f"Created {num_titans_layers} TITANS layer(s) at indices: {sorted(titans_layers.keys())}")
 
     # Count parameters
-    titans_params = sum(p.size for _, p in tree_flatten(titans_layer.parameters()))
-    print(f"TITANS trainable params: {titans_params:,}")
+    titans_params = sum(
+        p.size for layer in titans_layers.values()
+        for _, p in tree_flatten(layer.parameters())
+    )
+    print(f"TITANS trainable params: {titans_params:,} ({titans_params // num_titans_layers:,} per layer)")
 
     # Separate param groups for different LRs
-    def count_param_groups(layer):
+    def count_param_groups(layers_dict):
         gate_scale_count = 0
         memory_count = 0
 
-        for name, param in tree_flatten(layer.parameters()):
-            name_str = ".".join(str(k) for k in name) if isinstance(name, tuple) else str(name)
-            if ('gate' in name_str or 'mem_scale' in name_str or 'mem_ln' in name_str or
-                'level_weights' in name_str or 'to_lr' in name_str or
-                'to_momentum' in name_str or 'to_decay' in name_str):
-                gate_scale_count += param.size
-            else:
-                memory_count += param.size
+        for layer in layers_dict.values():
+            for name, param in tree_flatten(layer.parameters()):
+                name_str = ".".join(str(k) for k in name) if isinstance(name, tuple) else str(name)
+                if ('gate' in name_str or 'mem_scale' in name_str or 'mem_ln' in name_str or
+                    'level_weights' in name_str or 'to_lr' in name_str or
+                    'to_momentum' in name_str or 'to_decay' in name_str):
+                    gate_scale_count += param.size
+                else:
+                    memory_count += param.size
 
         return gate_scale_count, memory_count
 
-    gate_scale_count, memory_count = count_param_groups(titans_layer)
+    gate_scale_count, memory_count = count_param_groups(titans_layers)
     print(f"Gate/scale/CMS params: {gate_scale_count:,}")
     print(f"Memory params: {memory_count:,}")
 
@@ -232,14 +264,13 @@ def train(config: MLXTitansConfig):
     print(f"\nStarting training...")
     log_history = []
 
-    # Determine memory layer index
+    # Determine memory layer indices
     num_layers = len(model.model.layers)
-    memory_layer_idx = min(config.memory_layer, num_layers - 1)
-    print(f"Applying TITANS at layer {memory_layer_idx} of {num_layers}")
+    print(f"Applying TITANS at layers {sorted(titans_layers.keys())} of {num_layers} total")
 
-    # Create combined model wrapper
+    # Create combined model wrapper with multiple layers
     combined_model = CombinedModel(
-        model, titans_layer, memory_layer_idx,
+        model, titans_layers,
         use_internal_loss=config.use_internal_loss,
         internal_loss_weight=config.internal_loss_weight
     )
@@ -253,6 +284,21 @@ def train(config: MLXTitansConfig):
         gate_reg_weight=config.gate_reg_weight
     )
     loss_and_grad_fn = nn.value_and_grad(combined_model, loss_fn)
+
+    # Helper function to evaluate gradient tree (prevents graph accumulation)
+    def _eval_grad_tree(tree):
+        """Evaluate all arrays in a gradient tree structure."""
+        arrays = []
+        def collect(t):
+            if isinstance(t, dict):
+                for v in t.values():
+                    collect(v)
+            elif isinstance(t, mx.array):
+                arrays.append(t)
+        collect(tree)
+        if arrays:
+            mx.eval(*arrays)
+
     if config.gate_min_value > 0:
         print(f"Gate regularization enabled: min_value={config.gate_min_value}, weight={config.gate_reg_weight}")
 
@@ -277,6 +323,14 @@ def train(config: MLXTitansConfig):
             loss, full_grads = loss_and_grad_fn(combined_model, input_ids, target_ids)
             grads = filter_titans_grads(full_grads)
 
+            # OPTIMIZATION: Evaluate loss AND gradients immediately when eager_eval=True
+            # This is crucial for MLX performance - lazy evaluation accumulates
+            # a huge graph across micro-steps, causing slow final eval (2-3s)
+            # With early eval: optimizer step drops from ~2000ms to ~20ms
+            if config.eager_eval:
+                mx.eval(loss)
+                _eval_grad_tree(grads)
+
             scale_factor = 1.0 / config.gradient_accumulation_steps
             grads_scaled = scale_grads_recursive(grads, scale_factor)
 
@@ -289,8 +343,10 @@ def train(config: MLXTitansConfig):
         lr = get_lr(step, config)
         lr_gate = lr * config.gate_lr_scale
 
-        # Extract TITANS layer gradients
-        if 'titans_layer' in accumulated_grads:
+        # Extract TITANS layers gradients
+        if 'titans_layers' in accumulated_grads:
+            titans_grads = accumulated_grads['titans_layers']
+        elif 'titans_layer' in accumulated_grads:
             titans_grads = accumulated_grads['titans_layer']
         else:
             titans_grads = accumulated_grads
@@ -298,17 +354,34 @@ def train(config: MLXTitansConfig):
         # Gate warmup: freeze gate params
         gate_warmup_active = step < config.gate_warmup_steps
 
-        # Apply memory optimizer
-        memory_only_grads = create_masked_grads(titans_grads, keep_gate_scale=False)
-        optimizer_memory.learning_rate = lr
-        optimizer_memory.update(titans_layer, memory_only_grads)
+        # Apply optimizers to each TITANS layer
+        # Collect all parameters to evaluate at once (more efficient)
+        params_to_eval = []
 
-        # Apply gate optimizer
-        gate_only_grads = create_masked_grads(titans_grads, keep_gate_scale=True, freeze_gate=gate_warmup_active)
-        optimizer_gate.learning_rate = lr_gate
-        optimizer_gate.update(titans_layer, gate_only_grads)
+        for layer_idx, layer in titans_layers.items():
+            # Get gradients for this layer
+            if isinstance(titans_grads, dict) and str(layer_idx) in titans_grads:
+                layer_grads = titans_grads[str(layer_idx)]
+            elif isinstance(titans_grads, dict) and layer_idx in titans_grads:
+                layer_grads = titans_grads[layer_idx]
+            else:
+                layer_grads = titans_grads  # Single layer case
 
-        mx.eval(titans_layer.parameters())
+            # Apply memory optimizer (non-gate parameters)
+            memory_only_grads = create_masked_grads(layer_grads, keep_gate_scale=False)
+            optimizer_memory.learning_rate = lr
+            optimizer_memory.update(layer, memory_only_grads)
+
+            # Apply gate optimizer (gate/scale parameters)
+            gate_only_grads = create_masked_grads(layer_grads, keep_gate_scale=True, freeze_gate=gate_warmup_active)
+            optimizer_gate.learning_rate = lr_gate
+            optimizer_gate.update(layer, gate_only_grads)
+
+            params_to_eval.extend(tree_flatten(layer.parameters()))
+
+        # OPTIMIZATION: Single eval call for all parameters
+        # This is more efficient than evaluating each layer separately
+        mx.eval(*[p for _, p in params_to_eval])
 
         # Logging
         if step % 10 == 0:
@@ -327,14 +400,20 @@ def train(config: MLXTitansConfig):
                 print(f"    LR memory={lr:.6f}, LR gate={lr_gate:.6f}")
                 print(f"    Gate warmup active: {gate_warmup_active}")
 
-            mem_scale = float(mx.sigmoid(titans_layer.mem_scale).item())
-            gate_bias = float(titans_layer.gate.linear2.bias.item())
+            # Collect stats from all layers
+            layer_stats = combined_model.get_layer_stats()
+            first_layer_idx = combined_model.memory_layer_indices[0]
+            first_layer = titans_layers[first_layer_idx]
+
+            # Use first layer for primary stats (backward compatible)
+            mem_scale = layer_stats[first_layer_idx]["mem_scale"]
+            gate_bias = layer_stats[first_layer_idx]["gate_bias"]
             gate_mean = 1 / (1 + math.exp(-gate_bias))
 
-            # Get CMS weights if enabled
+            # Get CMS weights if enabled (from first layer)
             cms_weights = {}
-            if config.use_cms and titans_layer._use_cms:
-                weights = mx.softmax(titans_layer.memory.level_weights)
+            if config.use_cms and first_layer._use_cms:
+                weights = mx.softmax(first_layer.memory.level_weights)
                 for i in range(config.num_cms_levels):
                     cms_weights[f"cms_weight_{i}"] = float(weights[i].item())
 
@@ -345,6 +424,7 @@ def train(config: MLXTitansConfig):
                 if il is not None:
                     internal_loss_val = float(il.item())
 
+            # Build log entry with all layer stats
             log_entry = {
                 "step": step,
                 "loss": avg_loss,
@@ -355,8 +435,15 @@ def train(config: MLXTitansConfig):
                 "internal_loss": internal_loss_val,
                 **cms_weights,
             }
+
+            # Add per-layer stats
+            for idx, stats in layer_stats.items():
+                log_entry[f"layer_{idx}_mem_scale"] = stats["mem_scale"]
+                log_entry[f"layer_{idx}_gate"] = 1 / (1 + math.exp(-stats["gate_bias"]))
+
             log_history.append(log_entry)
 
+            # Format output string
             cms_str = ""
             if cms_weights:
                 cms_str = ", cms=[" + ", ".join(f"{v:.3f}" for v in cms_weights.values()) + "]"
@@ -365,7 +452,15 @@ def train(config: MLXTitansConfig):
             if config.use_internal_loss:
                 il_str = f", int_loss={internal_loss_val:.4f}"
 
-            print(f"step {step}: loss={avg_loss:.4f}, mem_scale={mem_scale:.3f}, gate={gate_mean:.3f}{cms_str}{il_str}, lr={lr:.2e}")
+            # Show per-layer gates if multiple layers
+            if len(titans_layers) > 1:
+                layer_gates = [f"L{idx}:{1/(1+math.exp(-s['gate_bias'])):.3f}"
+                              for idx, s in layer_stats.items()]
+                gates_str = f", gates=[{', '.join(layer_gates)}]"
+            else:
+                gates_str = f", gate={gate_mean:.3f}"
+
+            print(f"step {step}: loss={avg_loss:.4f}, mem_scale={mem_scale:.3f}{gates_str}{cms_str}{il_str}, lr={lr:.2e}")
 
     # Save results
     log_path = output_dir / "mlx_training_log.json"
@@ -382,7 +477,14 @@ def train(config: MLXTitansConfig):
         print("=" * 60)
         print(f"Loss: {first['loss']:.4f} → {last['loss']:.4f}")
         print(f"mem_scale: {first['mem_scale']:.3f} → {last['mem_scale']:.3f}")
-        print(f"gate_mean: {first['gate_mean']:.3f} → {last['gate_mean']:.3f}")
+
+        # Show per-layer gate progression
+        print("Gate values per layer:")
+        for layer_idx in sorted(titans_layers.keys()):
+            first_gate = first.get(f"layer_{layer_idx}_gate", first.get("gate_mean", 0))
+            last_gate = last.get(f"layer_{layer_idx}_gate", last.get("gate_mean", 0))
+            print(f"  Layer {layer_idx}: {first_gate:.3f} → {last_gate:.3f}")
+
         if config.use_cms:
             print("CMS weights:")
             for i in range(config.num_cms_levels):
@@ -390,12 +492,20 @@ def train(config: MLXTitansConfig):
                 print(f"  Level {i} (freq={config.cms_update_frequencies[i]}): {first.get(key, 0):.3f} → {last.get(key, 0):.3f}")
 
 
+def parse_memory_layers(s: str) -> list:
+    """Parse comma-separated layer indices."""
+    if not s:
+        return [12]
+    return [int(x.strip()) for x in s.split(",")]
+
+
 def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="MLX TITANS Training (Full HOPE)")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2-0.5B")
-    parser.add_argument("--memory_layer", type=int, default=12)
+    parser.add_argument("--memory_layers", type=str, default="12",
+                        help="Comma-separated layer indices for TITANS (e.g., '6,12,18')")
     parser.add_argument("--max_steps", type=int, default=100)
     parser.add_argument("--warmup_steps", type=int, default=100)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
@@ -417,12 +527,17 @@ def main():
                         help="Weight for gate regularization loss (default: 1.0)")
     parser.add_argument("--gate_init_bias", type=float, default=-2.0,
                         help="Initial gate bias (default: -2.0 → sigmoid ≈ 0.12, like PyTorch)")
+    parser.add_argument("--no_eager_eval", action="store_true",
+                        help="Disable eager evaluation (slower but uses less memory per micro-step)")
 
     args = parser.parse_args()
 
+    # Parse memory layers
+    memory_layers = parse_memory_layers(args.memory_layers)
+
     config = MLXTitansConfig(
         model_name=args.model_name,
-        memory_layer=args.memory_layer,
+        memory_layers=memory_layers,
         max_steps=args.max_steps,
         warmup_steps=args.warmup_steps,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -438,6 +553,7 @@ def main():
         gate_min_value=args.gate_min_value,
         gate_reg_weight=args.gate_reg_weight,
         gate_init_bias=args.gate_init_bias,
+        eager_eval=not args.no_eager_eval,
     )
 
     train(config)

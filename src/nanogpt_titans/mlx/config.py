@@ -7,7 +7,7 @@ Compatible with PyTorch TitansQwenConfig for unified training workflows.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Tuple
+from typing import Tuple, List
 
 
 @dataclass
@@ -15,7 +15,7 @@ class MLXTitansConfig:
     """Configuration for MLX TITANS training - matches PyTorch TitansQwenConfig."""
 
     model_name: str = "Qwen/Qwen2-0.5B"
-    memory_layer: int = 12
+    memory_layers: List[int] = field(default_factory=lambda: [12])  # Can be multiple layers
 
     # Memory config
     segment_len: int = 512
@@ -58,6 +58,11 @@ class MLXTitansConfig:
     # Output
     output_dir: str = "out-mlx-titans"
 
+    # Performance optimization: evaluate after each micro-step
+    # This prevents MLX's lazy evaluation from building huge graphs
+    # Default True for best performance; set False for debugging
+    eager_eval: bool = True
+
 
 def config_to_mlx(pytorch_config) -> MLXTitansConfig:
     """
@@ -70,13 +75,13 @@ def config_to_mlx(pytorch_config) -> MLXTitansConfig:
         MLXTitansConfig with equivalent settings
     """
     # Handle both TitansQwenConfig and QwenTitansTrainConfig
-    memory_layer = getattr(pytorch_config, 'memory_layers', [12])
-    if isinstance(memory_layer, list):
-        memory_layer = memory_layer[0] if memory_layer else 12
+    memory_layers = getattr(pytorch_config, 'memory_layers', [12])
+    if not isinstance(memory_layers, list):
+        memory_layers = [memory_layers]
 
     return MLXTitansConfig(
         model_name=getattr(pytorch_config, 'model_name', "Qwen/Qwen2-0.5B"),
-        memory_layer=memory_layer,
+        memory_layers=memory_layers,
         segment_len=getattr(pytorch_config, 'segment_len', 512),
         memory_depth=getattr(pytorch_config, 'memory_depth', 2),
         memory_expansion=getattr(pytorch_config, 'memory_expansion', 2),

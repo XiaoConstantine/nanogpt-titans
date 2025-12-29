@@ -21,51 +21,65 @@ from nanogpt_titans.mlx.decoder_layer import MLXTitansLayer, TitansLayerState
 
 class CombinedModel(nn.Module):
     """
-    Combined model wrapper that includes both base model and TITANS layer.
+    Combined model wrapper that includes both base model and TITANS layers.
 
     This wrapper ensures gradients flow through the entire computation graph,
     matching PyTorch's behavior where gradients propagate through frozen layers.
+
+    Supports multiple TITANS layers at different positions in the transformer.
     """
 
     def __init__(
         self,
         base_model,
-        titans_layer: MLXTitansLayer,
-        memory_layer_idx: int,
+        titans_layers: Dict[int, MLXTitansLayer],
         use_internal_loss: bool = False,
         internal_loss_weight: float = 1e-4
     ):
+        """
+        Initialize combined model with multiple TITANS layers.
+
+        Args:
+            base_model: The base language model
+            titans_layers: Dict mapping layer_idx -> MLXTitansLayer
+            use_internal_loss: Whether to compute internal loss
+            internal_loss_weight: Weight for internal loss
+        """
         super().__init__()
         self.base_model = base_model
-        self.titans_layer = titans_layer
-        self.memory_layer_idx = memory_layer_idx
+        self.titans_layers = titans_layers
+        self.memory_layer_indices = sorted(titans_layers.keys())
         self.use_internal_loss = use_internal_loss
         self.internal_loss_weight = internal_loss_weight
 
         # Get inner model reference
         self._inner_model = base_model.model if hasattr(base_model, 'model') else base_model
 
-        # Memory state (initialized on first forward)
-        self._memory_state: Optional[TitansLayerState] = None
+        # Memory states per layer (initialized on first forward)
+        self._memory_states: Dict[int, Optional[TitansLayerState]] = {
+            idx: None for idx in self.memory_layer_indices
+        }
 
         # Store internal loss from last forward (for logging)
         self._last_internal_loss: Optional[mx.array] = None
 
     def init_memory_state(self, batch_size: int):
-        """Initialize memory state for the TITANS layer."""
-        self._memory_state = self.titans_layer.init_state(batch_size)
+        """Initialize memory state for all TITANS layers."""
+        for idx in self.memory_layer_indices:
+            self._memory_states[idx] = self.titans_layers[idx].init_state(batch_size)
 
     def reset_memory_state(self):
         """Reset memory state to None (will be re-initialized on next forward)."""
-        self._memory_state = None
+        self._memory_states = {idx: None for idx in self.memory_layer_indices}
 
     def __call__(self, input_ids: mx.array) -> mx.array:
         """Forward pass through base model with TITANS integration and memory updates."""
         B = input_ids.shape[0]
 
-        # Initialize memory state if needed
-        if self._memory_state is None:
-            self._memory_state = self.titans_layer.init_state(B)
+        # Initialize memory states if needed
+        for idx in self.memory_layer_indices:
+            if self._memory_states[idx] is None:
+                self._memory_states[idx] = self.titans_layers[idx].init_state(B)
 
         # Get embeddings
         h = self._inner_model.embed_tokens(input_ids)
@@ -75,27 +89,35 @@ class CombinedModel(nn.Module):
         mask = nn.MultiHeadAttention.create_additive_causal_mask(T)
         mask = mask.astype(h.dtype)
 
-        # Track hidden states and state at memory layer for internal loss
-        h_at_memory_layer = None
-        state_before_update = None
+        # Track hidden states and states for internal loss
+        h_at_memory_layers: Dict[int, mx.array] = {}
+        states_before_update: Dict[int, TitansLayerState] = {}
 
         # Forward through transformer layers with TITANS integration
         for i, layer in enumerate(self._inner_model.layers):
             h = layer(h, mask=mask, cache=None)
 
-            # Apply TITANS at the specified layer (with memory state update)
-            if i == self.memory_layer_idx:
+            # Apply TITANS at specified layers (with memory state update)
+            if i in self.memory_layer_indices:
                 # Store hidden states and state BEFORE memory update for internal loss
                 if self.use_internal_loss:
-                    h_at_memory_layer = h
-                    state_before_update = self._memory_state
-                h, self._memory_state = self.titans_layer(h, self._memory_state)
+                    h_at_memory_layers[i] = h
+                    states_before_update[i] = self._memory_states[i]
+                h, self._memory_states[i] = self.titans_layers[i](h, self._memory_states[i])
 
-        # Compute internal loss if enabled (using state BEFORE update)
-        if self.use_internal_loss and h_at_memory_layer is not None and state_before_update is not None:
-            self._last_internal_loss = self.titans_layer.compute_internal_loss(
-                h_at_memory_layer, state_before_update
-            )
+        # Compute internal loss if enabled (sum across all layers)
+        if self.use_internal_loss and h_at_memory_layers:
+            internal_losses = []
+            for idx in self.memory_layer_indices:
+                if idx in h_at_memory_layers and idx in states_before_update:
+                    loss = self.titans_layers[idx].compute_internal_loss(
+                        h_at_memory_layers[idx], states_before_update[idx]
+                    )
+                    internal_losses.append(loss)
+            if internal_losses:
+                self._last_internal_loss = mx.mean(mx.stack(internal_losses))
+            else:
+                self._last_internal_loss = None
         else:
             self._last_internal_loss = None
 
@@ -115,6 +137,23 @@ class CombinedModel(nn.Module):
     def get_internal_loss(self) -> Optional[mx.array]:
         """Get the internal loss from the last forward pass."""
         return self._last_internal_loss
+
+    # Convenience properties for single-layer backward compatibility
+    @property
+    def titans_layer(self) -> MLXTitansLayer:
+        """Get the first TITANS layer (for backward compatibility)."""
+        return self.titans_layers[self.memory_layer_indices[0]]
+
+    def get_layer_stats(self) -> Dict[int, Dict[str, float]]:
+        """Get stats for all TITANS layers."""
+        stats = {}
+        for idx in self.memory_layer_indices:
+            layer = self.titans_layers[idx]
+            stats[idx] = {
+                "mem_scale": float(mx.sigmoid(layer.mem_scale).item()),
+                "gate_bias": float(layer.gate.linear2.bias.item()),
+            }
+        return stats
 
 
 def compute_gate_regularization(titans_layer: MLXTitansLayer, min_value: float = 0.15) -> mx.array:
@@ -142,6 +181,30 @@ def compute_gate_regularization(titans_layer: MLXTitansLayer, min_value: float =
     return penalty
 
 
+def compute_multi_layer_gate_regularization(
+    titans_layers: Dict[int, MLXTitansLayer],
+    min_value: float = 0.15
+) -> mx.array:
+    """
+    Compute gate regularization for multiple TITANS layers.
+
+    Args:
+        titans_layers: Dict mapping layer_idx -> MLXTitansLayer
+        min_value: Minimum gate value to maintain
+
+    Returns:
+        Mean regularization loss across all layers
+    """
+    if not titans_layers:
+        return mx.array(0.0)
+
+    penalties = []
+    for layer in titans_layers.values():
+        penalties.append(compute_gate_regularization(layer, min_value))
+
+    return mx.mean(mx.stack(penalties))
+
+
 def create_loss_fn(combined_model: CombinedModel, gate_min_value: float = 0.0, gate_reg_weight: float = 0.0):
     """Create a loss function for the combined model."""
     def loss_fn(combined_model, input_ids: mx.array, target_ids: mx.array):
@@ -162,7 +225,9 @@ def create_loss_fn(combined_model: CombinedModel, gate_min_value: float = 0.0, g
 
         # Add gate regularization if enabled (prevents gate from collapsing)
         if gate_min_value > 0 and gate_reg_weight > 0:
-            gate_reg = compute_gate_regularization(combined_model.titans_layer, gate_min_value)
+            gate_reg = compute_multi_layer_gate_regularization(
+                combined_model.titans_layers, gate_min_value
+            )
             total_loss = total_loss + gate_reg_weight * gate_reg
 
         return total_loss
@@ -174,20 +239,27 @@ def filter_titans_grads(grads: Dict[str, Any]) -> Dict[str, Any]:
     """
     Filter gradients to only include TITANS layer gradients.
 
+    OPTIMIZATION: Direct key lookup instead of string matching when possible.
+
     Args:
         grads: Full gradient dict from value_and_grad
 
     Returns:
         Filtered dict with only titans_layer gradients
     """
+    # Fast path: direct key lookup
+    if 'titans_layers' in grads:
+        return {'titans_layers': grads['titans_layers']}
     if 'titans_layer' in grads:
         return {'titans_layer': grads['titans_layer']}
-    else:
-        filtered = {}
-        for key, value in grads.items():
-            if 'titans' in key.lower() or 'memory' in key.lower() or 'gate' in key.lower():
-                filtered[key] = value
-        return filtered if filtered else grads
+
+    # Fallback: filter by keyword (slower)
+    filtered = {}
+    for key, value in grads.items():
+        key_lower = key.lower()
+        if 'titans' in key_lower or 'memory' in key_lower or 'gate' in key_lower:
+            filtered[key] = value
+    return filtered if filtered else grads
 
 
 def get_lr(step: int, config: MLXTitansConfig, use_linear: bool = False) -> float:
