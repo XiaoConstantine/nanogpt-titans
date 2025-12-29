@@ -1,0 +1,178 @@
+"""
+MLX TITANS decoder layer implementations.
+
+Provides MLX-native implementations of:
+- MLXPositionDependentGate: Per-token gating
+- MLXTitansLayer: TITANS layer with HOPE architecture
+
+Matches PyTorch TitansQwenDecoderLayer exactly.
+"""
+
+from __future__ import annotations
+
+from typing import Optional, Tuple, Union
+
+import mlx.core as mx
+import mlx.nn as nn
+
+from nanogpt_titans.mlx.memory import (
+    MLXMemoryState,
+    MLXCMSState,
+    MLXNeuralMemory,
+    MLXContinuumMemorySystem,
+)
+
+# Type alias for memory state
+TitansLayerState = Union[MLXCMSState, MLXMemoryState]
+
+
+class MLXPositionDependentGate(nn.Module):
+    """
+    Position-dependent gate that produces per-token gate values.
+
+    Unlike global gates, this allows the model to decide per-token
+    whether to use memory, which is critical for tasks like needle-in-haystack.
+
+    Matches PyTorch PositionDependentGate exactly.
+    """
+
+    def __init__(self, dim: int, init_bias: float = 0.0):
+        super().__init__()
+        # Small MLP: hidden_states -> gate value per token
+        self.linear1 = nn.Linear(dim, dim // 4)
+        self.linear2 = nn.Linear(dim // 4, 1)
+
+        # Initialize with small random weights to match PyTorch:
+        # nn.init.normal_(weight, std=0.01)
+        scale = 0.01
+        self.linear1.weight = mx.random.normal(self.linear1.weight.shape) * scale
+        self.linear1.bias = mx.zeros(self.linear1.bias.shape)
+        self.linear2.weight = mx.random.normal(self.linear2.weight.shape) * scale
+        self.linear2.bias = mx.array([init_bias])  # sigmoid(0) = 0.5
+
+    def __call__(self, x: mx.array) -> mx.array:
+        """
+        Compute per-token gate values.
+
+        Args:
+            x: Hidden states [B, T, C]
+
+        Returns:
+            Gate values [B, T, 1] in range (0, 1)
+        """
+        h = nn.silu(self.linear1(x))
+        return mx.sigmoid(self.linear2(h))
+
+
+class MLXTitansLayer(nn.Module):
+    """
+    TITANS memory layer in MLX with full HOPE architecture.
+
+    Matches PyTorch TitansQwenDecoderLayer:
+    1. ContinuumMemorySystem (CMS) for multi-frequency memory
+    2. Memory projection + LayerNorm + learned scale
+    3. Position-dependent gate for per-token gating
+    4. HOPE integration: output = hidden + gate * scale * LayerNorm(project(memory))
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        use_cms: bool = True,
+        num_cms_levels: int = 3,
+        cms_update_frequencies: tuple = (1, 4, 16),
+        memory_depth: int = 2,
+        memory_expansion: int = 2,
+        adaptive_memory: bool = True,
+        memory_lr_max: float = 0.01,
+        gate_init_bias: float = 0.0,
+    ):
+        super().__init__()
+        self.dim = dim
+        self._use_cms = use_cms
+
+        # Memory system (CMS or single)
+        if use_cms:
+            self.memory = MLXContinuumMemorySystem(
+                dim,
+                num_levels=num_cms_levels,
+                update_frequencies=cms_update_frequencies,
+                memory_depth=memory_depth,
+                memory_expansion=memory_expansion,
+                adaptive=adaptive_memory,
+                lr_max=memory_lr_max,
+            )
+        else:
+            self.memory = MLXNeuralMemory(
+                dim,
+                depth=memory_depth,
+                expansion=memory_expansion,
+                adaptive=adaptive_memory,
+                lr_max=memory_lr_max,
+            )
+
+        # Memory projection (matches PyTorch mem_proj)
+        self.mem_proj = nn.Linear(dim, dim, bias=False)
+
+        # LayerNorm + learned scale
+        self.mem_ln = nn.LayerNorm(dim)
+
+        # Learned scale: start at sigmoid(0) = 0.5 for good gradient flow
+        self.mem_scale = mx.array([0.0])
+
+        # Position-dependent gate
+        self.gate = MLXPositionDependentGate(dim, init_bias=gate_init_bias)
+
+    def init_state(self, batch_size: int) -> TitansLayerState:
+        """Initialize memory state for this layer."""
+        return self.memory.init_state(batch_size)
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        state: TitansLayerState
+    ) -> Tuple[mx.array, TitansLayerState]:
+        """
+        Apply HOPE-style memory enhancement to hidden states.
+
+        HOPE Architecture:
+        1. Retrieve from memory (CMS or single)
+        2. Pool -> Project -> LayerNorm -> Scale
+        3. Apply position-dependent gate
+        4. output = hidden_states + gate * scaled_memory
+        5. Update memory with current segment
+
+        Args:
+            hidden_states: Input hidden states [B, T, C]
+            state: Current memory state
+
+        Returns:
+            Tuple of (enhanced hidden states [B, T, C], updated state)
+        """
+        B, T, C = hidden_states.shape
+
+        # 1. Retrieve from memory (uses PREVIOUS segment's output for causality)
+        mem_retrieved = self.memory(hidden_states, state)  # [B, T, C]
+
+        # 2. Pool -> Project -> LayerNorm -> Scale
+        mem_pooled = mx.mean(mem_retrieved, axis=1, keepdims=True)  # [B, 1, C]
+        mem_projected = self.mem_proj(mem_pooled)  # [B, 1, C]
+        mem_projected = self.mem_ln(mem_projected)  # [B, 1, C]
+
+        # Apply learned scale: sigmoid(scale) in (0, 1)
+        scale = mx.sigmoid(self.mem_scale)  # scalar
+        mem_scaled = mem_projected * scale  # [B, 1, C]
+
+        # Broadcast to sequence length
+        mem_scaled = mx.broadcast_to(mem_scaled, (B, T, C))  # [B, T, C]
+
+        # 3. Position-dependent gate
+        gate_value = self.gate(hidden_states)  # [B, T, 1]
+
+        # 4. HOPE: Additive contribution
+        output = hidden_states + gate_value * mem_scaled
+
+        # 5. Update memory with current segment (test-time learning!)
+        new_state = self.memory.update(output, state)
+
+        return output, new_state

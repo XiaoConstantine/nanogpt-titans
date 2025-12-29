@@ -55,6 +55,21 @@ from nanogpt_titans.qwen_titans import (
 import torch.nn.functional as F
 
 
+def _detect_backend() -> str:
+    """Auto-detect best backend: cuda > mlx > mps > cpu."""
+    if torch.cuda.is_available():
+        return "pytorch"
+    # Check if MLX is available (Apple Silicon)
+    try:
+        from nanogpt_titans.mlx import is_available
+        if is_available():
+            return "mlx"
+    except ImportError:
+        pass
+    # Fall back to PyTorch MPS or CPU
+    return "pytorch"
+
+
 @dataclass
 class QwenTitansTrainConfig:
     """Training configuration for HOPE-Titans Qwen."""
@@ -108,7 +123,11 @@ class QwenTitansTrainConfig:
     output_dir: str = "out-qwen-titans"
     resume_from: Optional[str] = None
 
-    # System
+    # System - backend selection
+    # "auto" = cuda > mlx > mps > cpu
+    # "pytorch" = force PyTorch (cuda/mps/cpu)
+    # "mlx" = force MLX (Apple Silicon only)
+    backend: str = field(default_factory=_detect_backend)
     device: str = field(default_factory=lambda: (
         "cuda" if torch.cuda.is_available()
         else "mps" if torch.backends.mps.is_available()
@@ -428,11 +447,35 @@ def train(config: QwenTitansTrainConfig) -> None:
         num_workers=0,
     )
 
-    # Setup optimizer
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    # Setup optimizer with separate learning rates for gate/scale params
+    # Gate and mem_scale need MUCH higher LR to evolve meaningfully
+    gate_scale_params = []
+    other_params = []
+
+    for layer in titans_layers:
+        for name, param in layer.named_parameters():
+            if not param.requires_grad:
+                continue
+            # Higher LR for gate and mem_scale (they have tiny gradients relative to their impact)
+            if 'gate' in name or 'mem_scale' in name or 'mem_ln' in name:
+                gate_scale_params.append(param)
+            else:
+                other_params.append(param)
+
+    # Gate/scale get 50x higher LR to evolve meaningfully
+    gate_scale_lr = config.learning_rate * 50  # 1e-4 * 50 = 5e-3
+
+    param_groups = [
+        {"params": other_params, "lr": config.learning_rate},
+        {"params": gate_scale_params, "lr": gate_scale_lr, "name": "gate_scale"},
+    ]
+
+    print(f"\nOptimizer param groups:")
+    print(f"  Memory params: {sum(p.numel() for p in other_params):,} @ lr={config.learning_rate}")
+    print(f"  Gate/scale params: {sum(p.numel() for p in gate_scale_params):,} @ lr={gate_scale_lr}")
+
     optimizer = torch.optim.AdamW(
-        trainable_params,
-        lr=config.learning_rate,
+        param_groups,
         weight_decay=config.weight_decay,
     )
 
@@ -590,19 +633,23 @@ def train(config: QwenTitansTrainConfig) -> None:
                 state_manager.reset()
                 state_manager.init_states(B, device)
 
-        # Gradient clipping
+        # Gradient clipping (use all params from param groups)
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+        all_params = gate_scale_params + other_params
+        torch.nn.utils.clip_grad_norm_(all_params, 1.0)
 
         # Optimizer step
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
 
-        # Update learning rate
+        # Update learning rate (maintain ratio between param groups)
         lr = get_lr(step, config)
         for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
+            if param_group.get("name") == "gate_scale":
+                param_group["lr"] = lr * 50  # Keep 50x ratio for gate/scale
+            else:
+                param_group["lr"] = lr
 
         # Logging - show normalized loss (average per segment)
         avg_loss = total_loss / max(1, num_micro_segments)
@@ -862,12 +909,51 @@ def main() -> None:
     parser.add_argument("--resume_from", type=str, default=None)
 
     # System arguments
+    parser.add_argument("--backend", type=str, default=None,
+                        choices=["auto", "pytorch", "mlx"],
+                        help="Backend: 'auto' (cuda>mlx>mps>cpu), 'pytorch', or 'mlx'")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--dtype", type=str, default=None)
     parser.add_argument("--compile", action="store_true",
                         help="Use torch.compile for faster training (CUDA only)")
 
     args = parser.parse_args()
+
+    # Determine backend
+    backend = args.backend or _detect_backend()
+
+    # If using MLX backend, dispatch to MLX training
+    if backend == "mlx":
+        print("Using MLX backend (Apple Silicon optimized)")
+        try:
+            from nanogpt_titans.mlx import MLXTitansConfig, is_available
+            if not is_available():
+                print("MLX not available, falling back to PyTorch")
+                backend = "pytorch"
+            else:
+                from nanogpt_titans.train_mlx import train as mlx_train
+
+                # Convert config to MLX format
+                mlx_config = MLXTitansConfig(
+                    model_name=args.model_name,
+                    memory_layer=int(args.memory_layers.split(",")[0]),
+                    segment_len=args.segment_len,
+                    use_cms=args.use_cms and not args.no_cms,
+                    num_cms_levels=args.num_cms_levels,
+                    adaptive_memory=args.adaptive_memory,
+                    learning_rate=args.learning_rate,
+                    gate_lr_scale=50.0,  # MLX uses higher gate LR scale
+                    max_steps=args.max_steps,
+                    warmup_steps=args.warmup_steps,
+                    gradient_accumulation_steps=args.gradient_accumulation_steps,
+                    gate_warmup_steps=args.gate_warmup_steps,
+                    output_dir=args.output_dir,
+                )
+                mlx_train(mlx_config)
+                return
+        except ImportError as e:
+            print(f"MLX import failed: {e}, falling back to PyTorch")
+            backend = "pytorch"
 
     # Parse memory_layers
     memory_layers = [int(x.strip()) for x in args.memory_layers.split(",")]
@@ -908,6 +994,7 @@ def main() -> None:
         "dataset_config": args.dataset_config,
         "output_dir": args.output_dir,
         "resume_from": args.resume_from,
+        "backend": backend,
     }
 
     if args.device:
@@ -918,6 +1005,7 @@ def main() -> None:
         config_kwargs["compile"] = args.compile
 
     config = QwenTitansTrainConfig(**config_kwargs)
+    print(f"Using backend: {config.backend}, device: {config.device}")
     train(config)
 
 
