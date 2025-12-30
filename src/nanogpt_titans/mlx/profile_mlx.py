@@ -63,7 +63,7 @@ def _eval_result(result):
             _eval_result(v)
 
 
-def time_operation(fn, num_iters: int = 10, warmup: int = 3, eval_result: bool = True) -> TimingResult:
+def time_operation(fn, num_iters: int = 20, warmup: int = 10, eval_result: bool = True) -> TimingResult:
     """Time an operation with warmup.
 
     Args:
