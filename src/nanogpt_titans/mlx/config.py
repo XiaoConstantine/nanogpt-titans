@@ -30,6 +30,12 @@ class MLXTitansConfig:
     # vs weighted sum mode: all levels process same input, outputs are weighted sum
     use_cascade: bool = False
 
+    # CMS warmup/jitter (from nested_learning LevelSpec)
+    # Warmup: number of steps before each level starts updating
+    cms_warmup_steps: tuple[int, ...] = (0, 0, 0)  # Per-level warmup (e.g., (0, 10, 50))
+    # Jitter: random variation in update timing (0 = no jitter, 0.1 = ±10% variation)
+    cms_jitter: float = 0.0
+
     # Gate config - match PyTorch: sigmoid(0) = 0.5 for gradient flow
     gate_init_bias: float = 0.0
 
@@ -130,4 +136,6 @@ def config_to_mlx(pytorch_config) -> MLXTitansConfig:
         memory_grad_clip=getattr(pytorch_config, "memory_grad_clip", 1.0),
         use_teach_signal=getattr(pytorch_config, "use_teach_signal", False),
         teach_signal_weight=getattr(pytorch_config, "teach_signal_weight", 0.1),
+        cms_warmup_steps=tuple(getattr(pytorch_config, "cms_warmup_steps", (0, 0, 0))),
+        cms_jitter=getattr(pytorch_config, "cms_jitter", 0.0),
     )

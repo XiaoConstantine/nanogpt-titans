@@ -538,3 +538,193 @@ def create_titans_layer_from_model(model, config: MLXTitansConfig) -> MLXTitansL
         surprise_threshold=config.surprise_threshold,
         use_cascade=config.use_cascade,
     )
+
+
+# =============================================================================
+# Online Eval Mode (Chunked Memorization)
+# =============================================================================
+
+
+def online_eval(
+    combined_model: CombinedModel,
+    input_ids: mx.array,
+    chunk_size: int = 128,
+    return_all_logits: bool = False,
+) -> tuple[mx.array, list[dict]]:
+    """
+    Online evaluation with chunked memorization (from nested_learning).
+
+    Processes tokens incrementally with expanding context, updating memory
+    after each chunk. This simulates true online learning during inference.
+
+    Unlike batch evaluation where the full sequence is processed at once,
+    online eval:
+    1. Processes tokens[0:chunk_size], updates memory
+    2. Processes tokens[0:2*chunk_size] with updated memory
+    3. Continues until all tokens are processed
+
+    This allows the model to "learn" from earlier parts of the sequence
+    and apply that knowledge to later parts.
+
+    Args:
+        combined_model: CombinedModel with TITANS layers
+        input_ids: Input token IDs [B, T]
+        chunk_size: Number of tokens per chunk (default 128)
+        return_all_logits: If True, return logits for all chunks
+
+    Returns:
+        Tuple of:
+        - Final logits [B, T, V] (or list of chunk logits if return_all_logits=True)
+        - List of per-chunk metrics (gate values, memory stats, etc.)
+    """
+    B, T = input_ids.shape
+    chunk_metrics = []
+    all_logits = [] if return_all_logits else None
+
+    # Initialize memory state
+    combined_model.init_memory_state(B)
+
+    # Process sequence in expanding chunks
+    for chunk_end in range(chunk_size, T + 1, chunk_size):
+        # Get current chunk (with full history)
+        chunk_ids = input_ids[:, :chunk_end]
+
+        # Forward pass through combined model
+        logits = combined_model(chunk_ids)
+
+        # Collect metrics for this chunk
+        layer_stats = combined_model.get_layer_stats()
+        chunk_metrics.append({
+            "chunk_end": chunk_end,
+            "layer_stats": layer_stats,
+        })
+
+        # Store logits if requested
+        if return_all_logits:
+            all_logits.append(logits)
+
+        # Force evaluation to update memory state
+        mx.eval(logits)
+
+    # Handle remaining tokens if T is not divisible by chunk_size
+    remaining = T % chunk_size
+    if remaining > 0 and T > chunk_size:
+        logits = combined_model(input_ids)
+        mx.eval(logits)
+
+        layer_stats = combined_model.get_layer_stats()
+        chunk_metrics.append({
+            "chunk_end": T,
+            "layer_stats": layer_stats,
+        })
+
+        if return_all_logits:
+            all_logits.append(logits)
+
+    # Final forward pass on full sequence (with trained memory)
+    final_logits = combined_model(input_ids)
+
+    if return_all_logits:
+        return all_logits, chunk_metrics
+    else:
+        return final_logits, chunk_metrics
+
+
+def online_generate(
+    combined_model: CombinedModel,
+    tokenizer,
+    prompt: str,
+    max_new_tokens: int = 100,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    chunk_size: int = 128,
+) -> tuple[str, list[dict]]:
+    """
+    Online text generation with chunked memorization.
+
+    Generates text token by token, updating memory as the sequence grows.
+    This allows the model to adapt to the generated context.
+
+    Args:
+        combined_model: CombinedModel with TITANS layers
+        tokenizer: Tokenizer for encoding/decoding
+        prompt: Initial text prompt
+        max_new_tokens: Maximum tokens to generate
+        temperature: Sampling temperature (higher = more random)
+        top_p: Top-p (nucleus) sampling threshold
+        chunk_size: Tokens between memory updates
+
+    Returns:
+        Tuple of:
+        - Generated text (including prompt)
+        - List of generation metrics
+    """
+    # Encode prompt
+    input_ids = mx.array(tokenizer.encode(prompt)).reshape(1, -1)
+    B, T = input_ids.shape
+
+    # Initialize memory
+    combined_model.init_memory_state(B)
+
+    generation_metrics = []
+    generated_tokens = []
+
+    for i in range(max_new_tokens):
+        # Forward pass
+        logits = combined_model(input_ids)
+
+        # Get next token logits
+        next_logits = logits[:, -1, :]  # [B, V]
+
+        # Apply temperature
+        if temperature > 0:
+            next_logits = next_logits / temperature
+
+        # Top-p sampling
+        probs = mx.softmax(next_logits, axis=-1)
+        sorted_probs = mx.sort(probs, axis=-1)[:, ::-1]
+        cumsum_probs = mx.cumsum(sorted_probs, axis=-1)
+
+        # Create mask for top-p
+        mask = cumsum_probs <= top_p
+        # Ensure at least one token is selected
+        mask = mask.at[:, 0].set(True)
+
+        # Sample from filtered distribution
+        sorted_indices = mx.argsort(probs, axis=-1)[:, ::-1]
+        filtered_probs = mx.where(mask, sorted_probs, mx.zeros_like(sorted_probs))
+        filtered_probs = filtered_probs / mx.sum(filtered_probs, axis=-1, keepdims=True)
+
+        # Multinomial sample (simplified - just argmax for deterministic)
+        if temperature == 0:
+            next_token = mx.argmax(probs, axis=-1, keepdims=True)
+        else:
+            # Simple sampling via cumsum trick
+            u = mx.random.uniform(shape=(B, 1))
+            cumsum = mx.cumsum(filtered_probs, axis=-1)
+            next_idx = mx.argmax((cumsum >= u).astype(mx.int32), axis=-1, keepdims=True)
+            next_token = mx.take_along_axis(sorted_indices, next_idx, axis=-1)
+
+        # Append token
+        generated_tokens.append(int(next_token[0, 0].item()))
+        input_ids = mx.concatenate([input_ids, next_token], axis=1)
+
+        # Update memory periodically
+        if (i + 1) % chunk_size == 0:
+            layer_stats = combined_model.get_layer_stats()
+            generation_metrics.append({
+                "token_idx": i + 1,
+                "layer_stats": layer_stats,
+            })
+
+        mx.eval(input_ids)
+
+        # Check for EOS
+        if hasattr(tokenizer, "eos_token_id") and next_token[0, 0].item() == tokenizer.eos_token_id:
+            break
+
+    # Decode generated text
+    all_token_ids = [int(t.item()) for t in input_ids[0]]
+    generated_text = tokenizer.decode(all_token_ids)
+
+    return generated_text, generation_metrics

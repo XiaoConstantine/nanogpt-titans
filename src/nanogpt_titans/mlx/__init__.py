@@ -53,6 +53,8 @@ if _MLX_AVAILABLE:
         create_titans_layer_from_model,
         filter_titans_grads,
         get_lr,
+        online_eval,
+        online_generate,
         scale_grads_recursive,
     )
 
@@ -78,6 +80,8 @@ if _MLX_AVAILABLE:
         "create_titans_layer_from_model",
         "filter_titans_grads",
         "get_lr",
+        "online_eval",
+        "online_generate",
         "scale_grads_recursive",
     ]
 else:

@@ -82,6 +82,12 @@ class TitansQwenConfig:
     # vs weighted sum mode: all levels process same input, outputs are weighted sum
     use_cascade: bool = False
 
+    # CMS warmup/jitter (from nested_learning LevelSpec)
+    # Warmup: number of steps before each level starts updating
+    cms_warmup_steps: list[int] = field(default_factory=lambda: [0, 0, 0])
+    # Jitter: random variation in update timing (0 = no jitter, 0.1 = ±10% variation)
+    cms_jitter: float = 0.0
+
     # Self-modifying components (online adaptation via delta rule)
     # NOTE: use_self_mod_gate=False enables the new PositionDependentGate
     use_self_mod_proj: bool = False  # Disabled: standard projection is more stable

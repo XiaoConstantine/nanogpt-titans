@@ -40,8 +40,13 @@ if TYPE_CHECKING:
 class MemoryMetrics:
     """Metrics collected during a single memory update.
 
-    Provides visibility into memory learning dynamics for debugging
-    and hyperparameter tuning.
+    Per-component metrics from nested_learning for detailed debugging:
+    - grad_norm: Overall gradient norm
+    - surprise: Surprise value (same as grad_norm for memory)
+    - w0_grad_norm: Layer 0 weight gradient norm
+    - w1_grad_norm: Layer 1 weight gradient norm
+    - weight_norm: Current weight magnitude
+    - update_magnitude: Size of weight update applied
 
     Attributes:
         grad_norm: L2 norm of gradients before clipping
@@ -59,13 +64,37 @@ class MemoryMetrics:
     momentum_mean: float = 0.0
     decay_mean: float = 0.0
 
+    # Per-component metrics (from nested_learning)
+    w0_grad_norm: float = 0.0  # Layer 0 gradient norm
+    w1_grad_norm: float = 0.0  # Layer 1 gradient norm
+    weight_norm: float = 0.0   # Current weight magnitude
+    update_magnitude: float = 0.0  # Size of weight change
+
+    def to_dict(self) -> dict[str, float]:
+        """Convert metrics to dict for logging."""
+        return {
+            "grad_norm": self.grad_norm,
+            "surprise": self.surprise,
+            "update_skipped": self.update_skipped,
+            "lr_mean": self.lr_mean,
+            "momentum_mean": self.momentum_mean,
+            "decay_mean": self.decay_mean,
+            "w0_grad_norm": self.w0_grad_norm,
+            "w1_grad_norm": self.w1_grad_norm,
+            "weight_norm": self.weight_norm,
+            "update_magnitude": self.update_magnitude,
+        }
+
 
 @dataclass
 class CMSMetrics:
     """Metrics for ContinuumMemorySystem (multi-level memory).
 
-    Aggregates metrics from all CMS levels for debugging multi-frequency
-    memory dynamics.
+    Per-component metrics from nested_learning:
+    - level_metrics: Detailed metrics per memory level
+    - avg_surprise: Average surprise across active levels
+    - total_grad_norm: Combined gradient norm across all levels
+    - total_update_magnitude: Combined update size across all levels
 
     Attributes:
         level_metrics: List of MemoryMetrics, one per CMS level
@@ -76,6 +105,32 @@ class CMSMetrics:
     level_metrics: list[MemoryMetrics] = field(default_factory=list)
     avg_surprise: float = 0.0
     updates_skipped: int = 0
+
+    # Aggregate metrics across all levels (from nested_learning)
+    total_grad_norm: float = 0.0
+    total_update_magnitude: float = 0.0
+    active_levels: int = 0  # Number of levels that updated this step
+
+    def to_dict(self) -> dict:
+        """Convert metrics to dict for logging."""
+        # Compute per-level summary for easy logging
+        per_level = {}
+        for i, m in enumerate(self.level_metrics):
+            if not m.update_skipped:
+                per_level[f"level_{i}"] = {
+                    "grad_norm": m.grad_norm,
+                    "update_mag": m.update_magnitude,
+                }
+
+        return {
+            "avg_surprise": self.avg_surprise,
+            "updates_skipped": self.updates_skipped,
+            "total_grad_norm": self.total_grad_norm,
+            "total_update_magnitude": self.total_update_magnitude,
+            "active_levels": self.active_levels,
+            "per_level": per_level,
+            "level_metrics": [m.to_dict() for m in self.level_metrics],
+        }
 
 # =============================================================================
 # Self-Modifying Components (from Nested Learning / HOPE)
@@ -286,6 +341,10 @@ class ContinuumMemorySystem(nn.Module):
         # New: cascade mode from nested_learning
         self.use_cascade = getattr(config, "use_cascade", False)
 
+        # Warmup/jitter from nested_learning LevelSpec
+        self.warmup_steps = getattr(config, "cms_warmup_steps", [0] * self.num_levels)
+        self.jitter = getattr(config, "cms_jitter", 0.0)
+
         # Create a memory module for each level
         self.memories = nn.ModuleList([NeuralMemoryAdapter(config) for _ in range(self.num_levels)])
 
@@ -361,6 +420,44 @@ class ContinuumMemorySystem(nn.Module):
 
             return combined
 
+    def _should_update_level(self, level_idx: int, step: int) -> bool:
+        """
+        Check if a level should update at this step.
+
+        Incorporates warmup and jitter from nested_learning LevelSpec:
+        - Warmup: level doesn't update until step >= warmup_steps[level]
+        - Jitter: random ±jitter% variation in update frequency
+
+        Args:
+            level_idx: Index of the level
+            step: Current step count
+
+        Returns:
+            True if level should update
+        """
+        import random
+
+        # Check warmup
+        warmup = self.warmup_steps[level_idx] if level_idx < len(self.warmup_steps) else 0
+        if step < warmup:
+            return False
+
+        # Base frequency check
+        freq = self.update_frequencies[level_idx]
+
+        # Apply jitter if enabled
+        if self.jitter > 0 and freq > 1:
+            jitter_range = int(freq * self.jitter)
+            if jitter_range > 0:
+                jitter_offset = random.randint(-jitter_range, jitter_range)
+                effective_freq = max(1, freq + jitter_offset)
+            else:
+                effective_freq = freq
+        else:
+            effective_freq = freq
+
+        return step % effective_freq == 0
+
     def update(
         self,
         hidden_states: torch.Tensor,
@@ -373,6 +470,8 @@ class ContinuumMemorySystem(nn.Module):
         transformed output (matching nested_learning behavior).
 
         Features from nested_learning:
+        - Warmup: levels don't update until after warmup_steps
+        - Jitter: optional random variation in update timing
         - Surprise threshold: Skip updates when grad norm is below threshold
         - Per-level gradient clipping: Applied within each level's update
         - Metrics collection: Returns CMSMetrics with per-level info
@@ -397,8 +496,8 @@ class ContinuumMemorySystem(nn.Module):
         ):
             count = state.segment_counts[i] + 1
 
-            # Update only if segment count is multiple of frequency
-            if count % freq == 0:
+            # Check if this level should update (considers warmup and jitter)
+            if self._should_update_level(i, count):
                 # For now, use the underlying memory.update() which doesn't return metrics yet
                 # TODO: Extend NeuralMemory.update() to return metrics with surprise threshold
                 new_state = mem.update(current_input, level_state)
