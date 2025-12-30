@@ -289,7 +289,7 @@ class MLXNeuralMemory(nn.Module):
         """
         Compute gradients of MSE loss w.r.t. MLP weights.
 
-        Optimized with pre-computed transposes (more consistent than einsum).
+        Uses pre-computed transposes for consistent performance.
 
         MSE Loss = mean(|M(keys) - values|^2)
 
@@ -306,7 +306,7 @@ class MLXNeuralMemory(nn.Module):
         W0 = weights["w0"]  # [B, H, C]
         W1 = weights["w1"]  # [B, C, H]
 
-        # Pre-compute transposes once (more consistent than einsum)
+        # Pre-compute transposes once
         W0_T = mx.transpose(W0, axes=(0, 2, 1))  # [B, C, H]
         W1_T = mx.transpose(W1, axes=(0, 2, 1))  # [B, H, C]
 
@@ -469,6 +469,9 @@ class MLXNeuralMemory(nn.Module):
         """
         Update memory based on surprise (gradient of MSE loss w.r.t. MLP weights).
 
+        From nested_learning: Skip updates when surprise (grad_norm) is below threshold.
+        This prevents memory pollution from predictable tokens.
+
         Optimized with:
         - mx.compile for weight updates (2.3x speedup)
         - Deferred .item() calls to avoid CPU-GPU sync
@@ -486,6 +489,32 @@ class MLXNeuralMemory(nn.Module):
 
         # Compute gradients (aggregated over T) and surprise metric
         grads, grad_norm = self._compute_gradients(keys, values, state.weights)
+
+        # Surprise threshold: skip update if grad norm is below threshold (from nested_learning)
+        # This prevents memory pollution from predictable/boring tokens
+        if self.surprise_threshold > 0:
+            # Use mx.where for GPU-friendly conditional (avoids Python branching)
+            should_skip = grad_norm < self.surprise_threshold
+
+            # If we should skip, return current state with metrics indicating skip
+            # Note: We evaluate the condition here since we need to branch
+            if mx.all(should_skip).item():
+                metrics = MemoryMetrics(
+                    grad_norm=grad_norm,
+                    surprise=grad_norm,
+                    update_skipped=True,
+                    lr_mean=mx.array(0.0),
+                    momentum_mean=mx.array(0.0),
+                    decay_mean=mx.array(0.0),
+                )
+                self._last_metrics = metrics
+                # Return current state unchanged but update last_segment_output for causal retrieval
+                return MLXMemoryState(
+                    weights=state.weights,
+                    last_momentum=state.last_momentum,
+                    last_segment_output=x,
+                    step=state.step + 1,
+                ), metrics
 
         # Compute adaptive parameters if enabled
         if self.adaptive:
@@ -617,12 +646,18 @@ class MLXContinuumMemorySystem(nn.Module):
         grad_clip: float = 1.0,
         surprise_threshold: float = 0.0,
         use_cascade: bool = False,
+        warmup_steps: tuple[int, ...] | None = None,
+        jitter: float = 0.0,
     ):
         super().__init__()
         self.dim = dim
         self.num_levels = num_levels
         self.update_frequencies = update_frequencies
         self.use_cascade = use_cascade
+
+        # Warmup/jitter from nested_learning LevelSpec
+        self.warmup_steps = warmup_steps if warmup_steps else tuple(0 for _ in range(num_levels))
+        self.jitter = jitter
 
         # Create a memory module for each level with shared settings
         self.memories = [
@@ -703,12 +738,54 @@ class MLXContinuumMemorySystem(nn.Module):
         # Use first memory level for internal loss
         return self.memories[0].compute_internal_loss(x, state.level_states[0])
 
+    def _should_update_level(self, level_idx: int, step: int) -> bool:
+        """
+        Check if a level should update at this step.
+
+        Incorporates warmup and jitter from nested_learning LevelSpec:
+        - Warmup: level doesn't update until step >= warmup_steps[level]
+        - Jitter: random ±jitter% variation in update frequency
+
+        Args:
+            level_idx: Index of the level
+            step: Current step count
+
+        Returns:
+            True if level should update
+        """
+        # Check warmup
+        warmup = self.warmup_steps[level_idx] if level_idx < len(self.warmup_steps) else 0
+        if step < warmup:
+            return False
+
+        # Base frequency check
+        freq = self.update_frequencies[level_idx]
+
+        # Apply jitter if enabled
+        if self.jitter > 0 and freq > 1:
+            import random
+            # Jitter adjusts the effective frequency by ±jitter%
+            jitter_range = int(freq * self.jitter)
+            if jitter_range > 0:
+                jitter_offset = random.randint(-jitter_range, jitter_range)
+                effective_freq = max(1, freq + jitter_offset)
+            else:
+                effective_freq = freq
+        else:
+            effective_freq = freq
+
+        return step % effective_freq == 0
+
     def update(self, hidden_states: mx.array, state: MLXCMSState) -> tuple[MLXCMSState, CMSMetrics]:
         """
         Update memory levels based on their frequencies.
 
         In cascade mode, each level's update receives the previous level's
         transformed output (matching nested_learning behavior).
+
+        From nested_learning LevelSpec:
+        - Warmup: levels don't update until after warmup_steps
+        - Jitter: optional random variation in update timing
 
         Optimized to avoid CPU-GPU sync during training hot path.
 
@@ -727,9 +804,9 @@ class MLXContinuumMemorySystem(nn.Module):
         # In cascade mode, track the cascaded input for each level
         current_input = hidden_states
 
-        for i, (mem, freq) in enumerate(zip(self.memories, self.update_frequencies)):
-            # Update this level if step is a multiple of its frequency
-            if state.step % freq == 0:
+        for i, mem in enumerate(self.memories):
+            # Check if this level should update (considers warmup and jitter)
+            if self._should_update_level(i, state.step):
                 new_state, metrics = mem.update(current_input, state.level_states[i])
                 level_metrics.append(metrics)
                 surprise_values.append(metrics.surprise)

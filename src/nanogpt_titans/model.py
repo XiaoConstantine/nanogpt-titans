@@ -281,6 +281,10 @@ class TitansConfig:
     adaptive_memory: bool = True  # use learned lr/momentum/decay per token
     memory_lr_max: float = 0.01  # max learning rate for adaptive mode (sigmoid scaled)
 
+    # From nested_learning: surprise threshold and grad clipping
+    surprise_threshold: float = 0.0  # Skip updates when grad_norm < threshold (0=disabled)
+    memory_grad_clip: float = 1.0  # Per-level gradient clipping (0=disabled)
+
 
 class LayerNorm(nn.Module):
     """LayerNorm with optional bias (PyTorch doesn't support bias=False directly)."""
@@ -383,6 +387,10 @@ class NeuralMemory(nn.Module):
         self.adaptive = config.adaptive_memory  # type: ignore[assignment]
         self.lr_max = config.memory_lr_max  # type: ignore[assignment]
 
+        # From nested_learning: surprise threshold and grad clipping
+        self.surprise_threshold = getattr(config, "surprise_threshold", 0.0)
+        self.grad_clip = getattr(config, "memory_grad_clip", 1.0)
+
         if self.adaptive:
             # Projections to predict adaptive parameters from input
             # Each outputs a scalar per token, passed through sigmoid
@@ -482,6 +490,36 @@ class NeuralMemory(nn.Module):
                 "Set adaptive_memory=True in config when creating the model."
             )
         self.adaptive = enabled
+
+    def _clip_gradients(
+        self,
+        grads: dict[str, torch.Tensor],
+        max_norm: float,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Clip gradients by global L2 norm (from nested_learning).
+
+        Args:
+            grads: Gradient dict {name: [B, T, *param_shape]}
+            max_norm: Maximum gradient norm
+
+        Returns:
+            Clipped gradients
+        """
+        if max_norm <= 0:
+            return grads
+
+        # Compute global grad norm
+        total_norm_sq = sum(
+            (g ** 2).sum() for g in grads.values()
+        )
+        total_norm = total_norm_sq.sqrt()
+
+        # Clip if needed
+        clip_coef = max_norm / (total_norm + 1e-6)
+        clip_coef = torch.clamp(clip_coef, max=1.0)
+
+        return {name: g * clip_coef for name, g in grads.items()}
 
     def _compute_gradients_batched(
         self,
@@ -690,6 +728,9 @@ class NeuralMemory(nn.Module):
         Surprise = -grad(Loss) w.r.t. MLP weights
         Update: weights += lr * momentum(surprise) (with decay)
 
+        From nested_learning: Skip updates when surprise is below threshold.
+        This prevents memory pollution from predictable tokens.
+
         Uses:
         - Aggregated gradients (fast path): sums gradients over T, avoiding [B,T,H,C] tensor
         - Batched matmul (fallback): per-token gradients with exact momentum
@@ -708,6 +749,23 @@ class NeuralMemory(nn.Module):
         x_detached = x.detach().contiguous()
         keys = self.key_proj(x_detached).contiguous()  # [B, T, C]
         values = self.value_proj(x_detached).contiguous()  # [B, T, C]
+
+        # Surprise threshold check (from nested_learning)
+        # Skip update if prediction error is below threshold - saves compute and prevents
+        # memory pollution from predictable tokens
+        if self.surprise_threshold > 0:
+            with torch.no_grad():
+                # Quick forward pass to estimate surprise (MSE as proxy for grad norm)
+                pred = self._batched_forward_bmm(keys, state.weights)
+                mse = F.mse_loss(pred, values)
+                if mse.item() < self.surprise_threshold:
+                    # Low surprise - skip update but still store segment for causality
+                    return MemoryState(
+                        weights=state.weights,
+                        last_momentum=state.last_momentum,
+                        last_segment_output=x.detach().contiguous(),
+                        step=state.step + 1,
+                    )
 
         # Compute adaptive parameters if enabled
         if self.adaptive:
@@ -780,6 +838,10 @@ class NeuralMemory(nn.Module):
                     for name, w in state.weights.items()
                 }
                 all_grads = self._batched_grad_fn(params_for_grad, keys, values)
+
+        # Apply per-level gradient clipping (from nested_learning)
+        if self.grad_clip > 0 and all_grads is not None:
+            all_grads = self._clip_gradients(all_grads, self.grad_clip)
 
         # Apply updates with parallel momentum
         # Check if we can use the batched Triton kernel (single kernel for all params)
