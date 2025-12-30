@@ -7,8 +7,6 @@ using gated residual integration (HOPE-style).
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 from torch import nn
 
@@ -20,9 +18,9 @@ from nanogpt_titans.qwen_titans.mal_decoder_layer import MALQwenDecoderLayer
 
 def patch_qwen_with_titans(
     model: nn.Module,
-    titans_config: Optional[TitansQwenConfig] = None,
-    layer_indices: Optional[list[int]] = None,
-    variant: Optional[str] = None,
+    titans_config: TitansQwenConfig | None = None,
+    layer_indices: list[int] | None = None,
+    variant: str | None = None,
 ) -> nn.Module:
     """
     Patch a Qwen2 model with Titans memory layers.
@@ -98,16 +96,16 @@ def patch_qwen_with_titans(
     num_layers = len(layers)
     for idx in layer_indices:
         if idx < 0 or idx >= num_layers:
-            raise ValueError(
-                f"Layer index {idx} out of range. Model has {num_layers} layers."
-            )
+            raise ValueError(f"Layer index {idx} out of range. Model has {num_layers} layers.")
 
     # Replace specified layers with Titans-enhanced versions
     for idx in layer_indices:
         original_layer = layers[idx]
 
         # Check if already a Titans layer
-        if isinstance(original_layer, (TitansQwenDecoderLayer, MAGQwenDecoderLayer, MALQwenDecoderLayer)):
+        if isinstance(
+            original_layer, (TitansQwenDecoderLayer, MAGQwenDecoderLayer, MALQwenDecoderLayer)
+        ):
             print(f"Layer {idx} is already a Titans layer, skipping")
             continue
 
@@ -169,9 +167,7 @@ def freeze_base_model(model: nn.Module) -> dict[str, int]:
         >>> print(f"Trainable: {stats['trainable']:,} ({stats['percent']:.2f}%)")
     """
     if not hasattr(model, "_titans_layer_indices"):
-        raise ValueError(
-            "Model must be patched with patch_qwen_with_titans before freezing"
-        )
+        raise ValueError("Model must be patched with patch_qwen_with_titans before freezing")
 
     # First freeze everything
     for param in model.parameters():
@@ -189,7 +185,9 @@ def freeze_base_model(model: nn.Module) -> dict[str, int]:
     for idx in model._titans_layer_indices:
         layer = layers[idx]
 
-        if not isinstance(layer, (TitansQwenDecoderLayer, MAGQwenDecoderLayer, MALQwenDecoderLayer)):
+        if not isinstance(
+            layer, (TitansQwenDecoderLayer, MAGQwenDecoderLayer, MALQwenDecoderLayer)
+        ):
             print(f"Warning: Layer {idx} is not a Titans layer")
             continue
 
@@ -258,7 +256,7 @@ def freeze_base_model(model: nn.Module) -> dict[str, int]:
         "percent": 100.0 * trainable / total if total > 0 else 0,
     }
 
-    print(f"Parameter freeze stats:")
+    print("Parameter freeze stats:")
     print(f"  Total:       {total:,}")
     print(f"  Trainable:   {trainable:,} ({stats['percent']:.2f}%)")
     print(f"  Frozen:      {frozen:,}")
@@ -293,7 +291,9 @@ def get_titans_layers(model: nn.Module) -> list[nn.Module]:
     return [
         layers[idx]
         for idx in model._titans_layer_indices
-        if isinstance(layers[idx], (TitansQwenDecoderLayer, MAGQwenDecoderLayer, MALQwenDecoderLayer))
+        if isinstance(
+            layers[idx], (TitansQwenDecoderLayer, MAGQwenDecoderLayer, MALQwenDecoderLayer)
+        )
     ]
 
 
@@ -441,10 +441,14 @@ def load_titans_state(model: nn.Module, path: str) -> None:
             # Modulation scale and bias
             scale_key = f"{layer_key}.modulation_scale"
             if scale_key in titans_state:
-                layer.modulation_scale.data.copy_(titans_state[scale_key].to(layer.modulation_scale.dtype))
+                layer.modulation_scale.data.copy_(
+                    titans_state[scale_key].to(layer.modulation_scale.dtype)
+                )
             bias_key = f"{layer_key}.modulation_bias"
             if bias_key in titans_state:
-                layer.modulation_bias.data.copy_(titans_state[bias_key].to(layer.modulation_bias.dtype))
+                layer.modulation_bias.data.copy_(
+                    titans_state[bias_key].to(layer.modulation_bias.dtype)
+                )
         elif isinstance(layer, MALQwenDecoderLayer):
             # MAL: mem_proj and scalar gate
             for name, param in layer.mem_proj.named_parameters():

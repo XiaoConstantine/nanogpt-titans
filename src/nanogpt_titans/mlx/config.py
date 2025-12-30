@@ -7,7 +7,6 @@ Compatible with PyTorch TitansQwenConfig for unified training workflows.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Tuple, List
 
 
 @dataclass
@@ -15,7 +14,7 @@ class MLXTitansConfig:
     """Configuration for MLX TITANS training - matches PyTorch TitansQwenConfig."""
 
     model_name: str = "Qwen/Qwen2-0.5B"
-    memory_layers: List[int] = field(default_factory=lambda: [12])  # Can be multiple layers
+    memory_layers: list[int] = field(default_factory=lambda: [12])  # Can be multiple layers
 
     # Memory config
     segment_len: int = 512
@@ -26,7 +25,7 @@ class MLXTitansConfig:
     # CMS (Continuum Memory System) config
     use_cms: bool = True
     num_cms_levels: int = 3
-    cms_update_frequencies: Tuple[int, ...] = (1, 4, 16)  # Fast, medium, slow
+    cms_update_frequencies: tuple[int, ...] = (1, 4, 16)  # Fast, medium, slow
 
     # Gate config - match PyTorch: sigmoid(0) = 0.5 for gradient flow
     gate_init_bias: float = 0.0
@@ -51,9 +50,10 @@ class MLXTitansConfig:
     gate_min_value: float = 0.15  # Matches PyTorch default
     gate_reg_weight: float = 1.0  # Regularization weight
 
-    # Internal loss (for memory to learn independently of gate)
-    use_internal_loss: bool = False
-    internal_loss_weight: float = 1e-4  # Small weight to not dominate LM loss
+    # Internal loss (CRITICAL: teaches template weights to store/retrieve patterns)
+    # Must be True for memory to learn during training!
+    use_internal_loss: bool = True
+    internal_loss_weight: float = 0.1  # Increased from 1e-4 for stronger signal
 
     # Output
     output_dir: str = "out-mlx-titans"
@@ -62,6 +62,11 @@ class MLXTitansConfig:
     # This prevents MLX's lazy evaluation from building huge graphs
     # Default True for best performance; set False for debugging
     eager_eval: bool = True
+
+    # Backbone unfreezing: train layers adjacent to TITANS layers
+    # Per "Titans Revisited": frozen backbone causes mismatch with evolving memory
+    # Setting > 0 unfreezes N layers before/after each TITANS layer
+    unfreeze_backbone_layers: int = 0  # 0 = fully frozen, 1-2 recommended if memory not helping
 
 
 def config_to_mlx(pytorch_config) -> MLXTitansConfig:
@@ -75,30 +80,33 @@ def config_to_mlx(pytorch_config) -> MLXTitansConfig:
         MLXTitansConfig with equivalent settings
     """
     # Handle both TitansQwenConfig and QwenTitansTrainConfig
-    memory_layers = getattr(pytorch_config, 'memory_layers', [12])
+    memory_layers = getattr(pytorch_config, "memory_layers", [12])
     if not isinstance(memory_layers, list):
         memory_layers = [memory_layers]
 
     return MLXTitansConfig(
-        model_name=getattr(pytorch_config, 'model_name', "Qwen/Qwen2-0.5B"),
+        model_name=getattr(pytorch_config, "model_name", "Qwen/Qwen2-0.5B"),
         memory_layers=memory_layers,
-        segment_len=getattr(pytorch_config, 'segment_len', 512),
-        memory_depth=getattr(pytorch_config, 'memory_depth', 2),
-        memory_expansion=getattr(pytorch_config, 'memory_expansion', 2),
-        num_longterm_mem=getattr(pytorch_config, 'num_longterm_mem', 16),
-        use_cms=getattr(pytorch_config, 'use_cms', True),
-        num_cms_levels=getattr(pytorch_config, 'num_cms_levels', 3),
-        cms_update_frequencies=tuple(getattr(pytorch_config, 'cms_update_frequencies', [1, 4, 16])),
-        gate_init_bias=getattr(pytorch_config, 'gate_init_bias', 0.0),
-        adaptive_memory=getattr(pytorch_config, 'adaptive_memory', True),
-        memory_lr_max=getattr(pytorch_config, 'memory_lr_max', 0.01),
-        learning_rate=getattr(pytorch_config, 'learning_rate', 1e-4),
-        gate_lr_scale=getattr(pytorch_config, 'gate_lr_scale', 50.0),
-        batch_size=getattr(pytorch_config, 'batch_size', 2),
-        gradient_accumulation_steps=getattr(pytorch_config, 'gradient_accumulation_steps', 4),
-        max_steps=getattr(pytorch_config, 'max_steps', 100),
-        warmup_steps=getattr(pytorch_config, 'warmup_steps', 100),
-        max_length=getattr(pytorch_config, 'max_length', 1024),
-        gate_warmup_steps=getattr(pytorch_config, 'gate_warmup_steps', 0),
-        output_dir=getattr(pytorch_config, 'output_dir', "out-mlx-titans"),
+        segment_len=getattr(pytorch_config, "segment_len", 512),
+        memory_depth=getattr(pytorch_config, "memory_depth", 2),
+        memory_expansion=getattr(pytorch_config, "memory_expansion", 2),
+        num_longterm_mem=getattr(pytorch_config, "num_longterm_mem", 16),
+        use_cms=getattr(pytorch_config, "use_cms", True),
+        num_cms_levels=getattr(pytorch_config, "num_cms_levels", 3),
+        cms_update_frequencies=tuple(getattr(pytorch_config, "cms_update_frequencies", [1, 4, 16])),
+        gate_init_bias=getattr(pytorch_config, "gate_init_bias", 0.0),
+        adaptive_memory=getattr(pytorch_config, "adaptive_memory", True),
+        memory_lr_max=getattr(pytorch_config, "memory_lr_max", 0.01),
+        learning_rate=getattr(pytorch_config, "learning_rate", 1e-4),
+        gate_lr_scale=getattr(pytorch_config, "gate_lr_scale", 50.0),
+        batch_size=getattr(pytorch_config, "batch_size", 2),
+        gradient_accumulation_steps=getattr(pytorch_config, "gradient_accumulation_steps", 4),
+        max_steps=getattr(pytorch_config, "max_steps", 100),
+        warmup_steps=getattr(pytorch_config, "warmup_steps", 100),
+        max_length=getattr(pytorch_config, "max_length", 1024),
+        gate_warmup_steps=getattr(pytorch_config, "gate_warmup_steps", 0),
+        output_dir=getattr(pytorch_config, "output_dir", "out-mlx-titans"),
+        use_internal_loss=getattr(pytorch_config, "use_internal_loss", True),
+        internal_loss_weight=getattr(pytorch_config, "internal_loss_weight", 0.1),
+        unfreeze_backbone_layers=getattr(pytorch_config, "unfreeze_backbone_layers", 0),
     )

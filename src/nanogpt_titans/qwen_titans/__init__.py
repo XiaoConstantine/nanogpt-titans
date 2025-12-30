@@ -18,39 +18,39 @@ Usage:
 """
 
 from nanogpt_titans.qwen_titans.config import TitansQwenConfig
-from nanogpt_titans.qwen_titans.memory_adapter import NeuralMemoryAdapter
 from nanogpt_titans.qwen_titans.decoder_layer import TitansQwenDecoderLayer
-from nanogpt_titans.qwen_titans.mag_decoder_layer import MAGQwenDecoderLayer
-from nanogpt_titans.qwen_titans.patcher import (
-    patch_qwen_with_titans,
-    freeze_base_model,
-    get_trainable_param_count,
-    get_titans_layers,
-    get_gate_statistics,
-    get_internal_losses,
-    enable_memory_updates,
-    save_titans_state,
-    load_titans_state,
-)
 from nanogpt_titans.qwen_titans.generation import (
     TitansStateManager,
     titans_generate,
 )
+from nanogpt_titans.qwen_titans.mag_decoder_layer import MAGQwenDecoderLayer
+from nanogpt_titans.qwen_titans.memory_adapter import NeuralMemoryAdapter
+from nanogpt_titans.qwen_titans.patcher import (
+    enable_memory_updates,
+    freeze_base_model,
+    get_gate_statistics,
+    get_internal_losses,
+    get_titans_layers,
+    get_trainable_param_count,
+    load_titans_state,
+    patch_qwen_with_titans,
+    save_titans_state,
+)
 
 __all__ = [
-    "TitansQwenConfig",
-    "NeuralMemoryAdapter",
-    "TitansQwenDecoderLayer",
     "MAGQwenDecoderLayer",
-    "patch_qwen_with_titans",
+    "NeuralMemoryAdapter",
+    "TitansQwenConfig",
+    "TitansQwenDecoderLayer",
+    "TitansStateManager",
+    "enable_memory_updates",
     "freeze_base_model",
-    "get_trainable_param_count",
-    "get_titans_layers",
     "get_gate_statistics",
     "get_internal_losses",
-    "enable_memory_updates",
-    "save_titans_state",
+    "get_titans_layers",
+    "get_trainable_param_count",
     "load_titans_state",
-    "TitansStateManager",
+    "patch_qwen_with_titans",
+    "save_titans_state",
     "titans_generate",
 ]

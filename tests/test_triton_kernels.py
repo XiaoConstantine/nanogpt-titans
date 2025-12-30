@@ -30,12 +30,14 @@ if CUDA_AVAILABLE:
             triton_fused_weight_update,
             triton_momentum_update,
         )
+
         TRITON_AVAILABLE = True
     except ImportError:
         pass
 
 
 # --- Triton Momentum Kernel Tests ---
+
 
 @pytest.mark.skipif(not TRITON_AVAILABLE, reason="Triton not available")
 class TestTritonMomentumKernel:
@@ -117,6 +119,7 @@ class TestTritonMomentumKernel:
 
 # --- Fused Weight Update Kernel Tests ---
 
+
 @pytest.mark.skipif(not TRITON_AVAILABLE, reason="Triton not available")
 class TestFusedWeightUpdateKernel:
     """Tests for the fused momentum + weight update kernel."""
@@ -171,8 +174,7 @@ class TestFusedWeightUpdateKernel:
         )
 
         # With positive grads and subtraction, weights should decrease
-        assert (weights_out < weights_in).all(), \
-            "Weights should decrease with positive gradients"
+        assert (weights_out < weights_in).all(), "Weights should decrease with positive gradients"
 
     def test_decay_shrinks_weights(self):
         """Verify decay factor shrinks weights."""
@@ -195,6 +197,7 @@ class TestFusedWeightUpdateKernel:
 
 
 # --- Batched Weight Update Kernel Tests ---
+
 
 @pytest.mark.skipif(not TRITON_AVAILABLE, reason="Triton not available")
 class TestBatchedWeightUpdateKernel:
@@ -302,6 +305,7 @@ class TestBatchedWeightUpdateKernel:
 
 # --- Weight Update Equivalence Tests ---
 
+
 class TestWeightUpdateEquivalence:
     """
     Tests verifying the weight update formula change is mathematically equivalent.
@@ -345,6 +349,7 @@ class TestWeightUpdateEquivalence:
 
 # --- NeuralMemory Integration Tests ---
 
+
 class TestNeuralMemoryTritonIntegration:
     """Tests for NeuralMemory using Triton kernels when available."""
 
@@ -384,6 +389,7 @@ class TestNeuralMemoryTritonIntegration:
 
 
 # --- Segment Length Tests ---
+
 
 class TestSegmentLength:
     """Tests related to segment_len=128 default."""
@@ -434,7 +440,9 @@ if CUDA_AVAILABLE:
         pass
 
 
-@pytest.mark.skipif(not TRITON_AVAILABLE or triton_cross_entropy is None, reason="Triton not available")
+@pytest.mark.skipif(
+    not TRITON_AVAILABLE or triton_cross_entropy is None, reason="Triton not available"
+)
 class TestTritonCrossEntropy:
     """Tests for the Triton fused cross-entropy kernel."""
 
@@ -489,9 +497,7 @@ class TestTritonCrossEntropy:
         targets = torch.randint(0, V, (B, T), device="cuda")
 
         # PyTorch reference (need to flatten)
-        loss_ref = torch.nn.functional.cross_entropy(
-            logits.view(-1, V), targets.view(-1)
-        )
+        loss_ref = torch.nn.functional.cross_entropy(logits.view(-1, V), targets.view(-1))
 
         # Triton (handles flattening internally)
         loss_triton = triton_cross_entropy(logits, targets)
@@ -499,7 +505,9 @@ class TestTritonCrossEntropy:
         torch.testing.assert_close(loss_ref, loss_triton, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.skipif(not TRITON_AVAILABLE or triton_layer_norm is None, reason="Triton not available")
+@pytest.mark.skipif(
+    not TRITON_AVAILABLE or triton_layer_norm is None, reason="Triton not available"
+)
 class TestTritonLayerNorm:
     """Tests for the Triton fused layer norm kernel."""
 
@@ -557,7 +565,9 @@ class TestTritonLayerNorm:
         torch.testing.assert_close(y_ref, y_triton, rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.skipif(not TRITON_AVAILABLE or triton_linear_silu is None, reason="Triton not available")
+@pytest.mark.skipif(
+    not TRITON_AVAILABLE or triton_linear_silu is None, reason="Triton not available"
+)
 class TestTritonLinearSiLU:
     """Tests for the Triton fused linear + SiLU kernel."""
 
@@ -661,8 +671,7 @@ class TestTritonMSEGrad:
             grad_triton = triton_mse_grad(pred.detach(), target)
 
             torch.testing.assert_close(
-                grad_ref, grad_triton, rtol=1e-4, atol=1e-4,
-                msg=f"Shape {shape} failed"
+                grad_ref, grad_triton, rtol=1e-4, atol=1e-4, msg=f"Shape {shape} failed"
             )
 
 

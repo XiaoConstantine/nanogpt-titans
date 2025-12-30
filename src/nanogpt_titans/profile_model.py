@@ -28,6 +28,7 @@ from nanogpt_titans.model import TitansConfig, TitansGPT
 _BITSANDBYTES_AVAILABLE = False
 try:
     from bitsandbytes.optim import AdamW8bit
+
     _BITSANDBYTES_AVAILABLE = True
 except ImportError:
     AdamW8bit = None  # type: ignore[misc, assignment]
@@ -36,14 +37,16 @@ except ImportError:
 _TRANSFORMERS_AVAILABLE = False
 try:
     from transformers import AutoModelForCausalLM, AutoTokenizer
+
     from nanogpt_titans.qwen_titans import (
         TitansQwenConfig,
-        patch_qwen_with_titans,
         freeze_base_model,
-        get_titans_layers,
         get_gate_statistics,
         get_internal_losses,
+        get_titans_layers,
+        patch_qwen_with_titans,
     )
+
     _TRANSFORMERS_AVAILABLE = True
 except ImportError:
     pass
@@ -93,9 +96,7 @@ def profile_training_iteration(
     for _ in range(warmup_iters):
         memory_states = model.init_memory_states(batch_size, device)
         with ctx:
-            _logits, loss, memory_states = model(
-                x, targets=targets, memory_states=memory_states
-            )
+            _logits, loss, memory_states = model(x, targets=targets, memory_states=memory_states)
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
@@ -121,9 +122,7 @@ def profile_training_iteration(
         t0 = time.perf_counter()
 
         with ctx:
-            _logits, loss, memory_states = model(
-                x, targets=targets, memory_states=memory_states
-            )
+            _logits, loss, memory_states = model(x, targets=targets, memory_states=memory_states)
 
         torch.cuda.synchronize()
         t1 = time.perf_counter()
@@ -270,7 +269,13 @@ def profile_with_torch_profiler(
 
         key = e.key.lower()
         # Categorize by operation type
-        if "attention" in key or "softmax" in key or "flash" in key or "sdpa" in key or "flex" in key:
+        if (
+            "attention" in key
+            or "softmax" in key
+            or "flash" in key
+            or "sdpa" in key
+            or "flex" in key
+        ):
             categories["attention"] += cuda_time
         elif "gemm" in key or "matmul" in key or "::mm" in key or "addmm" in key or "bmm" in key:
             categories["matmul/gemm"] += cuda_time
@@ -280,7 +285,13 @@ def profile_with_torch_profiler(
             categories["triton/fused"] += cuda_time
         elif "copy" in key or "memcpy" in key or "memset" in key or "to_copy" in key:
             categories["memory_ops"] += cuda_time
-        elif "elementwise" in key or "add_" in key or "mul_" in key or "foreach" in key or "vectorized" in key:
+        elif (
+            "elementwise" in key
+            or "add_" in key
+            or "mul_" in key
+            or "foreach" in key
+            or "vectorized" in key
+        ):
             categories["elementwise"] += cuda_time
         else:
             categories["other"] += cuda_time
@@ -301,7 +312,7 @@ def profile_with_torch_profiler(
         print("\nTop operations in 'other' category:")
         other_ops.sort(key=lambda x: -x[1])
         for op_name, op_time in other_ops[:10]:  # Top 10
-            print(f"  {op_time/1000:>8.2f} ms  {op_name[:60]}")
+            print(f"  {op_time / 1000:>8.2f} ms  {op_name[:60]}")
 
 
 # =============================================================================
@@ -333,7 +344,6 @@ def diagnose_gradient_flow(
         raise ImportError("Requires: pip install transformers")
 
     from nanogpt_titans.qwen_titans import TitansStateManager
-    from nanogpt_titans.qwen_titans.decoder_layer import TitansQwenDecoderLayer
 
     dtype_map = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
     dtype = dtype_map[dtype_str]
@@ -370,7 +380,7 @@ def diagnose_gradient_flow(
     )
 
     model = patch_qwen_with_titans(model, titans_config, variant="hope")
-    param_stats = freeze_base_model(model)
+    freeze_base_model(model)
     titans_layers = get_titans_layers(model)
 
     model.to(device)
@@ -387,7 +397,6 @@ def diagnose_gradient_flow(
     print(f"\nTracking {len(initial_values)} trainable parameters")
 
     # Key parameters to watch
-    key_params = ["mem_scale", "gate.gate_mlp.2.bias", "gate.gate_mlp.0.weight"]
 
     print("\n" + "-" * 70)
     print("INITIAL VALUES:")
@@ -395,11 +404,11 @@ def diagnose_gradient_flow(
     for layer in titans_layers:
         layer_key = f"layer_{layer.layer_idx}"
         print(f"\n{layer_key}:")
-        if hasattr(layer, 'mem_scale'):
+        if hasattr(layer, "mem_scale"):
             val = torch.sigmoid(layer.mem_scale).item()
             print(f"  mem_scale (sigmoid): {val:.6f}")
             print(f"  mem_scale (raw):     {layer.mem_scale.item():.6f}")
-        if hasattr(layer, 'gate') and hasattr(layer.gate, 'gate_mlp'):
+        if hasattr(layer, "gate") and hasattr(layer.gate, "gate_mlp"):
             bias = layer.gate.gate_mlp[2].bias.item()
             print(f"  gate bias (raw):     {bias:.6f}")
             print(f"  gate bias (sigmoid): {torch.sigmoid(torch.tensor(bias)).item():.6f}")
@@ -409,7 +418,9 @@ def diagnose_gradient_flow(
     optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate)
 
     print(f"\nOptimizer param groups: {len(optimizer.param_groups)}")
-    print(f"Total trainable params in optimizer: {sum(p.numel() for g in optimizer.param_groups for p in g['params'])}")
+    print(
+        f"Total trainable params in optimizer: {sum(p.numel() for g in optimizer.param_groups for p in g['params'])}"
+    )
 
     # State manager
     state_manager = TitansStateManager(model)
@@ -426,7 +437,11 @@ def diagnose_gradient_flow(
     model.train()
 
     device_type = "cuda" if device.type == "cuda" else "cpu"
-    ctx = torch.amp.autocast(device_type=device_type, dtype=dtype) if device_type == "cuda" else nullcontext()
+    ctx = (
+        torch.amp.autocast(device_type=device_type, dtype=dtype)
+        if device_type == "cuda"
+        else nullcontext()
+    )
 
     grad_history = []
 
@@ -464,7 +479,7 @@ def diagnose_gradient_flow(
             layer_key = f"layer_{layer.layer_idx}"
 
             # mem_scale
-            if hasattr(layer, 'mem_scale'):
+            if hasattr(layer, "mem_scale"):
                 param = layer.mem_scale
                 if param.grad is not None:
                     step_grads["grads"][f"{layer_key}.mem_scale"] = param.grad.item()
@@ -473,7 +488,7 @@ def diagnose_gradient_flow(
                 step_grads["values"][f"{layer_key}.mem_scale"] = param.item()
 
             # gate bias
-            if hasattr(layer, 'gate') and hasattr(layer.gate, 'gate_mlp'):
+            if hasattr(layer, "gate") and hasattr(layer.gate, "gate_mlp"):
                 param = layer.gate.gate_mlp[2].bias
                 if param.grad is not None:
                     step_grads["grads"][f"{layer_key}.gate_bias"] = param.grad.item()
@@ -482,7 +497,7 @@ def diagnose_gradient_flow(
                 step_grads["values"][f"{layer_key}.gate_bias"] = param.item()
 
             # gate weight norm
-            if hasattr(layer, 'gate') and hasattr(layer.gate, 'gate_mlp'):
+            if hasattr(layer, "gate") and hasattr(layer.gate, "gate_mlp"):
                 param = layer.gate.gate_mlp[2].weight
                 if param.grad is not None:
                     step_grads["grads"][f"{layer_key}.gate_weight_norm"] = param.grad.norm().item()
@@ -490,10 +505,12 @@ def diagnose_gradient_flow(
                     step_grads["grads"][f"{layer_key}.gate_weight_norm"] = None
 
             # mem_proj weight norm
-            if hasattr(layer, 'mem_proj'):
+            if hasattr(layer, "mem_proj"):
                 for name, param in layer.mem_proj.named_parameters():
                     if param.grad is not None:
-                        step_grads["grads"][f"{layer_key}.mem_proj.{name}"] = param.grad.norm().item()
+                        step_grads["grads"][f"{layer_key}.mem_proj.{name}"] = (
+                            param.grad.norm().item()
+                        )
 
         grad_history.append(step_grads)
 
@@ -522,14 +539,16 @@ def diagnose_gradient_flow(
         layer_key = f"layer_{layer.layer_idx}"
         print(f"\n{layer_key}:")
 
-        if hasattr(layer, 'mem_scale'):
+        if hasattr(layer, "mem_scale"):
             init_val = initial_values.get(f"{layer_key}.mem_scale", torch.tensor(0.0)).item()
             final_val = layer.mem_scale.item()
             delta = final_val - init_val
             print(f"  mem_scale: {init_val:.6f} → {final_val:.6f} (Δ={delta:+.6f})")
-            print(f"  mem_scale (sigmoid): {torch.sigmoid(torch.tensor(init_val)).item():.4f} → {torch.sigmoid(layer.mem_scale).item():.4f}")
+            print(
+                f"  mem_scale (sigmoid): {torch.sigmoid(torch.tensor(init_val)).item():.4f} → {torch.sigmoid(layer.mem_scale).item():.4f}"
+            )
 
-        if hasattr(layer, 'gate') and hasattr(layer.gate, 'gate_mlp'):
+        if hasattr(layer, "gate") and hasattr(layer.gate, "gate_mlp"):
             init_key = f"{layer_key}.gate.gate_mlp.2.bias"
             if init_key in initial_values:
                 init_val = initial_values[init_key].item()
@@ -554,7 +573,7 @@ def diagnose_gradient_flow(
         print(f"  Non-zero gradients: {len(non_zero)}")
         if non_zero:
             print(f"  Gradient range: [{min(non_zero):.2e}, {max(non_zero):.2e}]")
-            print(f"  Gradient mean: {sum(non_zero)/len(non_zero):.2e}")
+            print(f"  Gradient mean: {sum(non_zero) / len(non_zero):.2e}")
         else:
             print("  ⚠️  NO GRADIENTS FLOWING TO THIS PARAMETER!")
 
@@ -582,7 +601,7 @@ def diagnose_gradient_flow(
     # Check if values changed
     for layer in titans_layers:
         layer_key = f"layer_{layer.layer_idx}"
-        if hasattr(layer, 'mem_scale'):
+        if hasattr(layer, "mem_scale"):
             init = initial_values.get(f"{layer_key}.mem_scale", torch.tensor(0.0)).item()
             final = layer.mem_scale.item()
             if abs(final - init) < 1e-5:
@@ -610,7 +629,9 @@ def diagnose_gradient_flow(
 
     return {
         "grad_history": grad_history,
-        "initial_values": {k: v.item() if v.numel() == 1 else v.tolist() for k, v in initial_values.items()},
+        "initial_values": {
+            k: v.item() if v.numel() == 1 else v.tolist() for k, v in initial_values.items()
+        },
         "issues": issues,
     }
 
@@ -635,7 +656,7 @@ def profile_qwen_training(
 ) -> dict[str, float]:
     """
     Profile Qwen-Titans training iteration.
-    
+
     Args:
         use_segments: If True, profile segment-by-segment processing (matches actual training).
                      If False, profile single forward pass (faster but less accurate).
@@ -695,7 +716,9 @@ def profile_qwen_training(
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total params: {total_params / 1e6:.1f}M")
-    print(f"Trainable params: {trainable_params / 1e6:.1f}M ({100*trainable_params/total_params:.2f}%)")
+    print(
+        f"Trainable params: {trainable_params / 1e6:.1f}M ({100 * trainable_params / total_params:.2f}%)"
+    )
 
     # Setup optimizer
     optimizer = torch.optim.AdamW(
@@ -731,13 +754,13 @@ def profile_qwen_training(
         optimizer.zero_grad(set_to_none=True)
         state_manager.reset()
         state_manager.init_states(batch_size, device)
-        
+
         if use_segments:
             for start in range(0, seq_len, segment_len):
                 end = min(start + segment_len, seq_len)
                 seg_input = input_ids[:, start:end]
                 seg_labels = labels[:, start:end]
-                
+
                 state_manager.sync_to_layers()
                 with ctx:
                     outputs = model(seg_input, labels=seg_labels, use_cache=False)
@@ -755,7 +778,7 @@ def profile_qwen_training(
                     if int_loss is not None:
                         loss = loss + 0.01 * int_loss
             scaler.scale(loss).backward()
-        
+
         scaler.step(optimizer)
         scaler.update()
 
@@ -764,25 +787,30 @@ def profile_qwen_training(
 
     # Timed runs with detailed segment breakdown
     print(f"Profiling ({num_iters} iterations)...")
-    
+
     if use_segments:
         # Detailed segment-by-segment profiling
         timings = {
-            "state_init": [], "sync_to": [], "forward": [], 
-            "backward": [], "sync_from": [], "optimizer": [], "total": []
+            "state_init": [],
+            "sync_to": [],
+            "forward": [],
+            "backward": [],
+            "sync_from": [],
+            "optimizer": [],
+            "total": [],
         }
         segment_times: list[list[dict]] = []  # Per-iteration segment breakdown
-        
+
         num_segments = seq_len // segment_len
-        
-        for i in range(num_iters):
+
+        for _i in range(num_iters):
             optimizer.zero_grad(set_to_none=True)
             iter_segment_times = []
-            
+
             if device.type == "cuda":
                 torch.cuda.synchronize()
             t_start = time.perf_counter()
-            
+
             # State init
             t0 = time.perf_counter()
             state_manager.reset()
@@ -790,18 +818,18 @@ def profile_qwen_training(
             if device.type == "cuda":
                 torch.cuda.synchronize()
             timings["state_init"].append(time.perf_counter() - t0)
-            
+
             # Process segments
             total_sync_to = 0.0
             total_forward = 0.0
             total_backward = 0.0
             total_sync_from = 0.0
-            
+
             for seg_idx, start in enumerate(range(0, seq_len, segment_len)):
                 end = min(start + segment_len, seq_len)
                 seg_input = input_ids[:, start:end]
                 seg_labels = labels[:, start:end]
-                
+
                 # Sync to layers
                 t0 = time.perf_counter()
                 state_manager.sync_to_layers()
@@ -809,7 +837,7 @@ def profile_qwen_training(
                     torch.cuda.synchronize()
                 t_sync_to = time.perf_counter() - t0
                 total_sync_to += t_sync_to
-                
+
                 # Forward
                 t0 = time.perf_counter()
                 with ctx:
@@ -822,7 +850,7 @@ def profile_qwen_training(
                     torch.cuda.synchronize()
                 t_fwd = time.perf_counter() - t0
                 total_forward += t_fwd
-                
+
                 # Backward
                 t0 = time.perf_counter()
                 scaler.scale(loss).backward()
@@ -830,7 +858,7 @@ def profile_qwen_training(
                     torch.cuda.synchronize()
                 t_bwd = time.perf_counter() - t0
                 total_backward += t_bwd
-                
+
                 # Sync from layers
                 t0 = time.perf_counter()
                 state_manager.sync_from_layers()
@@ -838,20 +866,22 @@ def profile_qwen_training(
                     torch.cuda.synchronize()
                 t_sync_from = time.perf_counter() - t0
                 total_sync_from += t_sync_from
-                
-                iter_segment_times.append({
-                    "seg": seg_idx,
-                    "sync_to": t_sync_to * 1000,
-                    "forward": t_fwd * 1000,
-                    "backward": t_bwd * 1000,
-                    "sync_from": t_sync_from * 1000,
-                })
-            
+
+                iter_segment_times.append(
+                    {
+                        "seg": seg_idx,
+                        "sync_to": t_sync_to * 1000,
+                        "forward": t_fwd * 1000,
+                        "backward": t_bwd * 1000,
+                        "sync_from": t_sync_from * 1000,
+                    }
+                )
+
             timings["sync_to"].append(total_sync_to)
             timings["forward"].append(total_forward)
             timings["backward"].append(total_backward)
             timings["sync_from"].append(total_sync_from)
-            
+
             # Optimizer
             t0 = time.perf_counter()
             scaler.step(optimizer)
@@ -859,17 +889,17 @@ def profile_qwen_training(
             if device.type == "cuda":
                 torch.cuda.synchronize()
             timings["optimizer"].append(time.perf_counter() - t0)
-            
+
             timings["total"].append(time.perf_counter() - t_start)
             segment_times.append(iter_segment_times)
-        
+
         # Compute results
         results = {}
         for name, times in timings.items():
             results[f"{name}_ms"] = 1000 * sum(times) / len(times)
         results["tokens_per_sec"] = batch_size * seq_len / (results["total_ms"] / 1000)
         results["num_segments"] = num_segments
-        
+
         # Print results
         print("\n" + "=" * 70)
         print("TRAINING ITERATION TIMING (segment-by-segment)")
@@ -886,8 +916,10 @@ def profile_qwen_training(
         print()
         print(f"Throughput: {results['tokens_per_sec']:,.0f} tokens/sec")
         print(f"Segments per sequence: {num_segments}")
-        print(f"Avg time per segment: {(results['forward_ms'] + results['backward_ms']) / num_segments:.2f} ms")
-        
+        print(
+            f"Avg time per segment: {(results['forward_ms'] + results['backward_ms']) / num_segments:.2f} ms"
+        )
+
         # Per-segment breakdown (last iteration)
         if segment_times:
             print("\n" + "=" * 70)
@@ -897,38 +929,42 @@ def profile_qwen_training(
             print("-" * 45)
             last_iter = segment_times[-1]
             for st in last_iter[:5]:  # First 5
-                print(f"{st['seg']:<5} {st['sync_to']:<10.2f} {st['forward']:<10.2f} {st['backward']:<10.2f} {st['sync_from']:<10.2f}")
+                print(
+                    f"{st['seg']:<5} {st['sync_to']:<10.2f} {st['forward']:<10.2f} {st['backward']:<10.2f} {st['sync_from']:<10.2f}"
+                )
             if len(last_iter) > 5:
                 print("...")
                 st = last_iter[-1]
-                print(f"{st['seg']:<5} {st['sync_to']:<10.2f} {st['forward']:<10.2f} {st['backward']:<10.2f} {st['sync_from']:<10.2f}")
-            
+                print(
+                    f"{st['seg']:<5} {st['sync_to']:<10.2f} {st['forward']:<10.2f} {st['backward']:<10.2f} {st['sync_from']:<10.2f}"
+                )
+
             # Bottleneck analysis
-            avg_fwd = sum(s['forward'] for s in last_iter) / len(last_iter)
-            avg_bwd = sum(s['backward'] for s in last_iter) / len(last_iter)
-            avg_sync = sum(s['sync_to'] + s['sync_from'] for s in last_iter) / len(last_iter)
-            
+            avg_fwd = sum(s["forward"] for s in last_iter) / len(last_iter)
+            avg_bwd = sum(s["backward"] for s in last_iter) / len(last_iter)
+            avg_sync = sum(s["sync_to"] + s["sync_from"] for s in last_iter) / len(last_iter)
+
             print("\n" + "=" * 70)
             print("BOTTLENECK ANALYSIS")
             print("=" * 70)
             print(f"Avg forward/segment:  {avg_fwd:.2f} ms")
             print(f"Avg backward/segment: {avg_bwd:.2f} ms")
             print(f"Avg sync/segment:     {avg_sync:.2f} ms")
-            
+
             if avg_fwd > avg_bwd and avg_fwd > avg_sync:
-                print(f"\n→ FORWARD is the bottleneck")
+                print("\n→ FORWARD is the bottleneck")
                 print("  Consider: larger segment_len, fewer memory layers, flash attention")
             elif avg_bwd > avg_fwd and avg_bwd > avg_sync:
-                print(f"\n→ BACKWARD is the bottleneck")
+                print("\n→ BACKWARD is the bottleneck")
                 print("  Consider: gradient checkpointing, reduce memory layers")
             else:
-                print(f"\n→ SYNC overhead is significant")
+                print("\n→ SYNC overhead is significant")
                 print("  Consider: batch state updates, reduce memory layers")
     else:
         # Original non-segment profiling
         timings = {"forward": [], "backward": [], "optimizer": [], "total": []}
-        
-        for i in range(num_iters):
+
+        for _i in range(num_iters):
             optimizer.zero_grad(set_to_none=True)
 
             if device.type == "cuda":
@@ -1004,7 +1040,9 @@ def profile_qwen_training(
     if device.type == "cuda":
         mem_allocated = torch.cuda.max_memory_allocated() / 1e9
         mem_reserved = torch.cuda.max_memory_reserved() / 1e9
-        print(f"\nPeak GPU memory: {mem_allocated:.2f} GB allocated, {mem_reserved:.2f} GB reserved")
+        print(
+            f"\nPeak GPU memory: {mem_allocated:.2f} GB allocated, {mem_reserved:.2f} GB reserved"
+        )
 
     return results
 
@@ -1016,13 +1054,28 @@ def main() -> None:
     )
 
     # Model selection
-    parser.add_argument("--qwen", action="store_true", help="Profile Qwen-Titans instead of TitansGPT")
-    parser.add_argument("--diagnose", action="store_true", help="Diagnose gradient flow for mem_scale/gate (use with --qwen)")
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2-0.5B", help="Qwen model name (for --qwen)")
-    parser.add_argument("--memory_layers", type=str, default=None, help="Memory layer indices, comma-separated (for --qwen)")
+    parser.add_argument(
+        "--qwen", action="store_true", help="Profile Qwen-Titans instead of TitansGPT"
+    )
+    parser.add_argument(
+        "--diagnose",
+        action="store_true",
+        help="Diagnose gradient flow for mem_scale/gate (use with --qwen)",
+    )
+    parser.add_argument(
+        "--model_name", type=str, default="Qwen/Qwen2-0.5B", help="Qwen model name (for --qwen)"
+    )
+    parser.add_argument(
+        "--memory_layers",
+        type=str,
+        default=None,
+        help="Memory layer indices, comma-separated (for --qwen)",
+    )
 
     # Profiling options
-    parser.add_argument("--detailed", action="store_true", help="Use torch.profiler for kernel analysis")
+    parser.add_argument(
+        "--detailed", action="store_true", help="Use torch.profiler for kernel analysis"
+    )
     parser.add_argument("--export-trace", action="store_true", help="Export Chrome trace file")
     parser.add_argument("--num-iters", type=int, default=10, help="Number of iterations to profile")
 
@@ -1038,11 +1091,22 @@ def main() -> None:
     # Training config
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
     parser.add_argument("--seq_len", type=int, default=512, help="Sequence length (for --qwen)")
-    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16", "float16"])
+    parser.add_argument(
+        "--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16", "float16"]
+    )
     parser.add_argument("--compile", action="store_true", help="Use torch.compile()")
-    parser.add_argument("--8bit", dest="use_8bit", action="store_true", help="Use 8-bit AdamW (requires bitsandbytes)")
-    parser.add_argument("--no-segments", dest="use_segments", action="store_false", 
-                        help="Profile single forward pass instead of segment-by-segment (faster but less accurate)")
+    parser.add_argument(
+        "--8bit",
+        dest="use_8bit",
+        action="store_true",
+        help="Use 8-bit AdamW (requires bitsandbytes)",
+    )
+    parser.add_argument(
+        "--no-segments",
+        dest="use_segments",
+        action="store_false",
+        help="Profile single forward pass instead of segment-by-segment (faster but less accurate)",
+    )
 
     args = parser.parse_args()
 
@@ -1134,14 +1198,22 @@ def main() -> None:
 
     if args.detailed:
         profile_with_torch_profiler(
-            model, x, targets, device, dtype,
+            model,
+            x,
+            targets,
+            device,
+            dtype,
             num_iters=args.num_iters,
             export_trace=args.export_trace,
             use_8bit=args.use_8bit,
         )
     else:
         results = profile_training_iteration(
-            model, x, targets, device, dtype,
+            model,
+            x,
+            targets,
+            device,
+            dtype,
             num_iters=args.num_iters,
             use_8bit=args.use_8bit,
         )
@@ -1164,7 +1236,9 @@ def main() -> None:
         if device.type == "cuda":
             mem_allocated = torch.cuda.max_memory_allocated() / 1e9
             mem_reserved = torch.cuda.max_memory_reserved() / 1e9
-            print(f"Peak GPU memory: {mem_allocated:.2f} GB allocated, {mem_reserved:.2f} GB reserved")
+            print(
+                f"Peak GPU memory: {mem_allocated:.2f} GB allocated, {mem_reserved:.2f} GB reserved"
+            )
 
 
 if __name__ == "__main__":

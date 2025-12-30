@@ -23,6 +23,7 @@ from nanogpt_titans.model import (
 
 # --- Fixtures ---
 
+
 @pytest.fixture
 def small_config():
     """Small config for fast testing."""
@@ -47,6 +48,7 @@ def model(small_config):
 
 
 # --- Compiler Disable Decorator Tests ---
+
 
 class TestCompilerDisableDecorators:
     """Tests that @torch.compiler.disable decorators work correctly."""
@@ -137,6 +139,7 @@ class TestCompilerDisableDecorators:
 
 # --- Training Mode Behavior Tests ---
 
+
 class TestTrainingModeBehavior:
     """Tests for training vs eval mode behavior."""
 
@@ -196,6 +199,7 @@ class TestTrainingModeBehavior:
 
 
 # --- Memory Operations Correctness ---
+
 
 class TestMemoryOperationsCorrectness:
     """Tests that memory operations produce correct results after changes."""
@@ -257,6 +261,7 @@ class TestMemoryOperationsCorrectness:
 
 # --- torch.compile Tests (CUDA only) ---
 
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for compile tests")
 class TestTorchCompile:
     """Tests for torch.compile compatibility (requires CUDA)."""
@@ -308,7 +313,7 @@ class TestTorchCompile:
             optimizer.step()
 
         # All losses should be valid
-        assert all(l > 0 and not float('inf') == l for l in losses)
+        assert all(l > 0 and not float("inf") == l for l in losses)
 
     def test_compile_with_different_sequence_lengths(self, small_config):
         """Test compiled model with varying sequence lengths."""
@@ -324,6 +329,7 @@ class TestTorchCompile:
 
 
 # --- Regression Tests ---
+
 
 class TestRegressions:
     """Regression tests for specific issues."""

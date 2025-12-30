@@ -20,14 +20,14 @@ try:
     import mlx.core as mx
     import mlx.nn as nn
     from mlx.utils import tree_flatten
+
     MLX_AVAILABLE = True
 except ImportError:
     MLX_AVAILABLE = False
 
 # Skip all tests in this module if MLX is not available
 pytestmark = pytest.mark.skipif(
-    not MLX_AVAILABLE,
-    reason="MLX not available (requires Apple Silicon)"
+    not MLX_AVAILABLE, reason="MLX not available (requires Apple Silicon)"
 )
 
 
@@ -55,6 +55,7 @@ if MLX_AVAILABLE:
 # =============================================================================
 # Fixtures
 # =============================================================================
+
 
 @pytest.fixture
 def small_dim():
@@ -131,6 +132,7 @@ def titans_layer(small_dim):
 # MLXNeuralMemory Tests
 # =============================================================================
 
+
 class TestMLXNeuralMemory:
     """Tests for MLXNeuralMemory module."""
 
@@ -145,18 +147,18 @@ class TestMLXNeuralMemory:
 
         # Check weight shapes
         H = small_dim * 2  # expansion=2
-        assert 'w0' in state.weights
-        assert 'w1' in state.weights
-        assert state.weights['w0'].shape == (B, H, small_dim)
-        assert state.weights['w1'].shape == (B, small_dim, H)
+        assert "w0" in state.weights
+        assert "w1" in state.weights
+        assert state.weights["w0"].shape == (B, H, small_dim)
+        assert state.weights["w1"].shape == (B, small_dim, H)
 
         # Check momentum shapes
-        assert state.last_momentum['w0'].shape == state.weights['w0'].shape
-        assert state.last_momentum['w1'].shape == state.weights['w1'].shape
+        assert state.last_momentum["w0"].shape == state.weights["w0"].shape
+        assert state.last_momentum["w1"].shape == state.weights["w1"].shape
 
         # Momentum should be initialized to zeros
-        assert mx.allclose(state.last_momentum['w0'], mx.zeros_like(state.last_momentum['w0']))
-        assert mx.allclose(state.last_momentum['w1'], mx.zeros_like(state.last_momentum['w1']))
+        assert mx.allclose(state.last_momentum["w0"], mx.zeros_like(state.last_momentum["w0"]))
+        assert mx.allclose(state.last_momentum["w1"], mx.zeros_like(state.last_momentum["w1"]))
 
     def test_batched_mlp_forward_shapes(self, neural_memory, small_dim):
         """Test _batched_mlp_forward produces correct shapes."""
@@ -181,12 +183,12 @@ class TestMLXNeuralMemory:
         grads = neural_memory._compute_gradients(keys, values, state.weights)
 
         # Gradients should have same shape as weights
-        assert 'w0' in grads
-        assert 'w1' in grads
-        assert grads['w0'].shape == (B, H, small_dim)
-        assert grads['w1'].shape == (B, small_dim, H)
-        assert not mx.any(mx.isnan(grads['w0']))
-        assert not mx.any(mx.isnan(grads['w1']))
+        assert "w0" in grads
+        assert "w1" in grads
+        assert grads["w0"].shape == (B, H, small_dim)
+        assert grads["w1"].shape == (B, small_dim, H)
+        assert not mx.any(mx.isnan(grads["w0"]))
+        assert not mx.any(mx.isnan(grads["w1"]))
 
     def test_internal_loss_uses_template_weights(self, neural_memory, small_dim):
         """Test compute_internal_loss uses template weights (trainable)."""
@@ -233,11 +235,13 @@ class TestMLXNeuralMemory:
         assert new_state.step == 1
 
         # Weights should change
-        assert not mx.allclose(new_state.weights['w0'], state.weights['w0'])
-        assert not mx.allclose(new_state.weights['w1'], state.weights['w1'])
+        assert not mx.allclose(new_state.weights["w0"], state.weights["w0"])
+        assert not mx.allclose(new_state.weights["w1"], state.weights["w1"])
 
         # Momentum should be non-zero now
-        assert not mx.allclose(new_state.last_momentum['w0'], mx.zeros_like(new_state.last_momentum['w0']))
+        assert not mx.allclose(
+            new_state.last_momentum["w0"], mx.zeros_like(new_state.last_momentum["w0"])
+        )
 
         # Last segment output should be stored
         assert new_state.last_segment_output is not None
@@ -255,10 +259,10 @@ class TestMLXNeuralMemory:
             state = neural_memory.update(x, state)
 
         # Weights should be clipped
-        assert mx.all(state.weights['w0'] >= -10.0)
-        assert mx.all(state.weights['w0'] <= 10.0)
-        assert mx.all(state.weights['w1'] >= -10.0)
-        assert mx.all(state.weights['w1'] <= 10.0)
+        assert mx.all(state.weights["w0"] >= -10.0)
+        assert mx.all(state.weights["w0"] <= 10.0)
+        assert mx.all(state.weights["w1"] >= -10.0)
+        assert mx.all(state.weights["w1"] <= 10.0)
 
     def test_retrieval_uses_previous_segment(self, neural_memory, small_dim):
         """Test __call__ uses previous segment for causal retrieval."""
@@ -293,9 +297,9 @@ class TestMLXNeuralMemory:
         )
 
         # Should have adaptive projection layers
-        assert hasattr(memory, 'to_lr')
-        assert hasattr(memory, 'to_momentum')
-        assert hasattr(memory, 'to_decay')
+        assert hasattr(memory, "to_lr")
+        assert hasattr(memory, "to_momentum")
+        assert hasattr(memory, "to_decay")
         assert isinstance(memory.to_lr, nn.Linear)
 
     def test_non_adaptive_memory(self, small_dim):
@@ -319,6 +323,7 @@ class TestMLXNeuralMemory:
 # =============================================================================
 # MLXContinuumMemorySystem Tests
 # =============================================================================
+
 
 class TestMLXContinuumMemorySystem:
     """Tests for MLXContinuumMemorySystem module."""
@@ -372,11 +377,8 @@ class TestMLXContinuumMemorySystem:
             return {k: mx.array(v) for k, v in weights_dict.items()}
 
         # Track weight changes at each level
-        initial_weights = [
-            copy_weights(level_state.weights)
-            for level_state in state.level_states
-        ]
-        mx.eval(*[w['w0'] for w in initial_weights])
+        initial_weights = [copy_weights(level_state.weights) for level_state in state.level_states]
+        mx.eval(*[w["w0"] for w in initial_weights])
 
         # First update (step=0): ALL levels update (0%1=0, 0%4=0, 0%16=0)
         state = cms.update(x, state)
@@ -385,17 +387,15 @@ class TestMLXContinuumMemorySystem:
 
         # All levels should have updated
         for i in range(3):
-            assert not mx.allclose(
-                state.level_states[i].weights['w0'],
-                initial_weights[i]['w0']
-            ), f"Level {i} should have updated at step 0"
+            assert not mx.allclose(state.level_states[i].weights["w0"], initial_weights[i]["w0"]), (
+                f"Level {i} should have updated at step 0"
+            )
 
         # Store weights after first update
         weights_after_step0 = [
-            copy_weights(level_state.weights)
-            for level_state in state.level_states
+            copy_weights(level_state.weights) for level_state in state.level_states
         ]
-        mx.eval(*[w['w0'] for w in weights_after_step0])
+        mx.eval(*[w["w0"] for w in weights_after_step0])
 
         # Second update (step=1): Only level 0 updates (1%1=0, 1%4≠0, 1%16≠0)
         state = cms.update(x, state)
@@ -403,20 +403,11 @@ class TestMLXContinuumMemorySystem:
         assert state.step == 2
 
         # Level 0 should have updated
-        assert not mx.allclose(
-            state.level_states[0].weights['w0'],
-            weights_after_step0[0]['w0']
-        )
+        assert not mx.allclose(state.level_states[0].weights["w0"], weights_after_step0[0]["w0"])
         # Level 1 should NOT have updated
-        assert mx.allclose(
-            state.level_states[1].weights['w0'],
-            weights_after_step0[1]['w0']
-        )
+        assert mx.allclose(state.level_states[1].weights["w0"], weights_after_step0[1]["w0"])
         # Level 2 should NOT have updated
-        assert mx.allclose(
-            state.level_states[2].weights['w0'],
-            weights_after_step0[2]['w0']
-        )
+        assert mx.allclose(state.level_states[2].weights["w0"], weights_after_step0[2]["w0"])
 
         # Continue to step=4 where level 1 should update again
         state = cms.update(x, state)  # step=2
@@ -425,17 +416,16 @@ class TestMLXContinuumMemorySystem:
 
         # Store weights before step=4
         weights_before_step4 = copy_weights(state.level_states[1].weights)
-        mx.eval(weights_before_step4['w0'])
+        mx.eval(weights_before_step4["w0"])
 
         state = cms.update(x, state)  # step=4, checks if 4%4==0 (yes!)
         mx.eval(state)
         assert state.step == 5
 
         # Level 1 should have updated at step=4
-        assert not mx.allclose(
-            state.level_states[1].weights['w0'],
-            weights_before_step4['w0']
-        ), "Level 1 should update when step=4 (4%4==0)"
+        assert not mx.allclose(state.level_states[1].weights["w0"], weights_before_step4["w0"]), (
+            "Level 1 should update when step=4 (4%4==0)"
+        )
 
     def test_internal_loss_uses_first_level(self, cms, small_dim):
         """Test compute_internal_loss uses the fastest (first) memory level."""
@@ -453,6 +443,7 @@ class TestMLXContinuumMemorySystem:
 # =============================================================================
 # MLXPositionDependentGate Tests
 # =============================================================================
+
 
 class TestMLXPositionDependentGate:
     """Tests for MLXPositionDependentGate module."""
@@ -510,6 +501,7 @@ class TestMLXPositionDependentGate:
 # MLXTitansLayer Tests
 # =============================================================================
 
+
 class TestMLXTitansLayer:
     """Tests for MLXTitansLayer module."""
 
@@ -534,12 +526,12 @@ class TestMLXTitansLayer:
         x = mx.random.normal((B, T, small_dim))
         state = titans_layer.init_state(B)
 
-        initial_step = state.step if hasattr(state, 'step') else state.level_states[0].step
+        initial_step = state.step if hasattr(state, "step") else state.level_states[0].step
 
         output, new_state = titans_layer(x, state)
 
         # For CMS, check the first level's step
-        if hasattr(new_state, 'level_states'):
+        if hasattr(new_state, "level_states"):
             new_step = new_state.step
         else:
             new_step = new_state.step
@@ -587,6 +579,7 @@ class TestMLXTitansLayer:
 # Gate Regularization Tests
 # =============================================================================
 
+
 class TestGateRegularization:
     """Tests for gate regularization function."""
 
@@ -631,6 +624,7 @@ class TestGateRegularization:
 # Training Component Tests
 # =============================================================================
 
+
 class TestTrainingComponents:
     """Tests for training utility functions."""
 
@@ -638,97 +632,102 @@ class TestTrainingComponents:
         """Test gradient masking keeps gate/scale params when specified."""
         # Create mock gradient structure
         grads = {
-            'memory': {
-                'w0': mx.ones((small_dim, small_dim)),
-                'w1': mx.ones((small_dim, small_dim)),
+            "memory": {
+                "w0": mx.ones((small_dim, small_dim)),
+                "w1": mx.ones((small_dim, small_dim)),
             },
-            'gate': {
-                'linear1': {'weight': mx.ones((small_dim // 4, small_dim))},
-                'linear2': {'weight': mx.ones((1, small_dim // 4))},
+            "gate": {
+                "linear1": {"weight": mx.ones((small_dim // 4, small_dim))},
+                "linear2": {"weight": mx.ones((1, small_dim // 4))},
             },
-            'mem_scale': mx.ones((1,)),
+            "mem_scale": mx.ones((1,)),
         }
 
         masked = create_masked_grads(grads, keep_gate_scale=True)
 
         # Gate and scale should be preserved
-        assert mx.allclose(masked['gate']['linear1']['weight'], grads['gate']['linear1']['weight'])
-        assert mx.allclose(masked['mem_scale'], grads['mem_scale'])
+        assert mx.allclose(masked["gate"]["linear1"]["weight"], grads["gate"]["linear1"]["weight"])
+        assert mx.allclose(masked["mem_scale"], grads["mem_scale"])
 
         # Memory should be zeroed
-        assert mx.allclose(masked['memory']['w0'], mx.zeros_like(grads['memory']['w0']))
+        assert mx.allclose(masked["memory"]["w0"], mx.zeros_like(grads["memory"]["w0"]))
 
     def test_create_masked_grads_keeps_memory(self, small_dim):
         """Test gradient masking keeps memory params when specified."""
         grads = {
-            'memory': {
-                'w0': mx.ones((small_dim, small_dim)),
+            "memory": {
+                "w0": mx.ones((small_dim, small_dim)),
             },
-            'gate': {
-                'linear2': {'bias': mx.ones((1,))},
+            "gate": {
+                "linear2": {"bias": mx.ones((1,))},
             },
         }
 
         masked = create_masked_grads(grads, keep_gate_scale=False)
 
         # Memory should be preserved
-        assert mx.allclose(masked['memory']['w0'], grads['memory']['w0'])
+        assert mx.allclose(masked["memory"]["w0"], grads["memory"]["w0"])
 
         # Gate should be zeroed
-        assert mx.allclose(masked['gate']['linear2']['bias'], mx.zeros_like(grads['gate']['linear2']['bias']))
+        assert mx.allclose(
+            masked["gate"]["linear2"]["bias"], mx.zeros_like(grads["gate"]["linear2"]["bias"])
+        )
 
     def test_create_masked_grads_freeze_gate(self, small_dim):
         """Test gradient masking can freeze gate during warmup."""
         grads = {
-            'gate': {
-                'linear2': {'weight': mx.ones((1, small_dim // 4))},
+            "gate": {
+                "linear2": {"weight": mx.ones((1, small_dim // 4))},
             },
-            'mem_scale': mx.ones((1,)),
+            "mem_scale": mx.ones((1,)),
         }
 
         masked = create_masked_grads(grads, keep_gate_scale=True, freeze_gate=True)
 
         # Gate should be zeroed (frozen)
-        assert mx.allclose(masked['gate']['linear2']['weight'], mx.zeros_like(grads['gate']['linear2']['weight']))
+        assert mx.allclose(
+            masked["gate"]["linear2"]["weight"], mx.zeros_like(grads["gate"]["linear2"]["weight"])
+        )
 
         # Scale should be preserved (not frozen, just gate)
-        assert mx.allclose(masked['mem_scale'], grads['mem_scale'])
+        assert mx.allclose(masked["mem_scale"], grads["mem_scale"])
 
     def test_scale_grads_recursive(self):
         """Test gradient scaling works recursively."""
         grads = {
-            'layer1': {
-                'weight': mx.array([1.0, 2.0, 3.0]),
+            "layer1": {
+                "weight": mx.array([1.0, 2.0, 3.0]),
             },
-            'layer2': mx.array([4.0, 5.0]),
+            "layer2": mx.array([4.0, 5.0]),
         }
 
         scaled = scale_grads_recursive(grads, factor=0.5)
 
-        assert mx.allclose(scaled['layer1']['weight'], mx.array([0.5, 1.0, 1.5]))
-        assert mx.allclose(scaled['layer2'], mx.array([2.0, 2.5]))
+        assert mx.allclose(scaled["layer1"]["weight"], mx.array([0.5, 1.0, 1.5]))
+        assert mx.allclose(scaled["layer2"], mx.array([2.0, 2.5]))
 
     def test_accumulate_grads(self):
         """Test gradient accumulation."""
         grads1 = {
-            'weight': mx.array([1.0, 2.0]),
+            "weight": mx.array([1.0, 2.0]),
         }
         grads2 = {
-            'weight': mx.array([3.0, 4.0]),
+            "weight": mx.array([3.0, 4.0]),
         }
 
         # First accumulation (from None)
         accum = accumulate_grads(None, grads1)
-        assert mx.allclose(accum['weight'], mx.array([1.0, 2.0]))
+        assert mx.allclose(accum["weight"], mx.array([1.0, 2.0]))
 
         # Second accumulation
         accum = accumulate_grads(accum, grads2)
-        assert mx.allclose(accum['weight'], mx.array([4.0, 6.0]))
+        assert mx.allclose(accum["weight"], mx.array([4.0, 6.0]))
 
 
 # =============================================================================
 # Integration Tests
 # =============================================================================
+
 
 class TestIntegration:
     """Integration tests for complete workflows."""
@@ -744,7 +743,7 @@ class TestIntegration:
             # Apply params to layer temporarily
             titans_layer.update(params)
             output, _ = titans_layer(x, state)
-            return mx.mean(output ** 2)
+            return mx.mean(output**2)
 
         # Get initial parameters
         params = titans_layer.trainable_parameters()
@@ -775,13 +774,13 @@ class TestIntegration:
             mx.eval(state)  # Force evaluation
 
         # State should evolve over time
-        if hasattr(states_history[0], 'level_states'):
+        if hasattr(states_history[0], "level_states"):
             # CMS mode
-            first_weights = states_history[0].level_states[0].weights['w0']
-            last_weights = states_history[-1].level_states[0].weights['w0']
+            first_weights = states_history[0].level_states[0].weights["w0"]
+            last_weights = states_history[-1].level_states[0].weights["w0"]
         else:
-            first_weights = states_history[0].weights['w0']
-            last_weights = states_history[-1].weights['w0']
+            first_weights = states_history[0].weights["w0"]
+            last_weights = states_history[-1].weights["w0"]
 
         assert not mx.allclose(first_weights, last_weights)
 
@@ -841,6 +840,7 @@ class TestIntegration:
 # =============================================================================
 # Edge Cases
 # =============================================================================
+
 
 class TestEdgeCases:
     """Tests for edge cases and potential failure modes."""
@@ -905,6 +905,7 @@ class TestEdgeCases:
 # Regression Tests
 # =============================================================================
 
+
 class TestRegression:
     """Regression tests for previously fixed issues."""
 
@@ -932,7 +933,7 @@ class TestRegression:
 
         # Template weights should have non-zero gradients
         flat_grads = dict(tree_flatten(grads))
-        has_template_grads = any('_template_mlp' in k for k in flat_grads.keys())
+        has_template_grads = any("_template_mlp" in k for k in flat_grads.keys())
         assert has_template_grads, "Template weights should receive gradients"
 
 

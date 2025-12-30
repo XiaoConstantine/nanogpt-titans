@@ -125,14 +125,12 @@ def get_batch(
     data = np.memmap(data_file, dtype=np.uint16, mode="r")
 
     ix = torch.randint(len(data) - config.block_size, (config.batch_size,))
-    x = torch.stack([
-        torch.from_numpy(data[i:i + config.block_size].astype(np.int64))
-        for i in ix
-    ])
-    y = torch.stack([
-        torch.from_numpy(data[i + 1:i + 1 + config.block_size].astype(np.int64))
-        for i in ix
-    ])
+    x = torch.stack(
+        [torch.from_numpy(data[i : i + config.block_size].astype(np.int64)) for i in ix]
+    )
+    y = torch.stack(
+        [torch.from_numpy(data[i + 1 : i + 1 + config.block_size].astype(np.int64)) for i in ix]
+    )
 
     x = x.pin_memory().to(device, non_blocking=True)
     y = y.pin_memory().to(device, non_blocking=True)
@@ -167,10 +165,7 @@ class SequentialDataIterator:
 
         # This rank's batch items start at offset positions
         base_offset = rank * config.batch_size * stream_spacing
-        self.positions = [
-            base_offset + i * stream_spacing
-            for i in range(config.batch_size)
-        ]
+        self.positions = [base_offset + i * stream_spacing for i in range(config.batch_size)]
 
     def get_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Get next contiguous batch, advancing positions."""
@@ -183,8 +178,8 @@ class SequentialDataIterator:
                 pos = pos % (self.data_len - block_size - 1)
                 self.positions[i] = pos
 
-            x = torch.from_numpy(self.data[pos:pos + block_size].astype(np.int64))
-            y = torch.from_numpy(self.data[pos + 1:pos + 1 + block_size].astype(np.int64))
+            x = torch.from_numpy(self.data[pos : pos + block_size].astype(np.int64))
+            y = torch.from_numpy(self.data[pos + 1 : pos + 1 + block_size].astype(np.int64))
             xs.append(x)
             ys.append(y)
 
@@ -325,7 +320,7 @@ def train(config: TrainConfig) -> None:
         unwanted_prefix = "_orig_mod."
         for k in list(state_dict.keys()):
             if k.startswith(unwanted_prefix):
-                state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+                state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
         model.load_state_dict(state_dict)
         iter_num = checkpoint["iter_num"]
         best_val_loss = checkpoint["best_val_loss"]
@@ -363,6 +358,7 @@ def train(config: TrainConfig) -> None:
     # Logging
     if config.wandb_log and master_process:
         import wandb
+
         wandb.init(project=config.wandb_project, name=config.wandb_run_name, config=vars(config))
 
     # Training with sequential data (contiguous sequences like the Titans paper)
@@ -393,15 +389,19 @@ def train(config: TrainConfig) -> None:
         # Eval
         if iter_num % config.eval_interval == 0 and master_process:
             losses = estimate_loss(wrapped_model, config, data_dir, ctx)  # type: ignore[arg-type]
-            print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            print(
+                f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
+            )
 
             if config.wandb_log:
-                wandb.log({
-                    "iter": iter_num,
-                    "train/loss": losses["train"],
-                    "val/loss": losses["val"],
-                    "lr": lr,
-                })
+                wandb.log(
+                    {
+                        "iter": iter_num,
+                        "train/loss": losses["train"],
+                        "val/loss": losses["val"],
+                        "lr": lr,
+                    }
+                )
 
             if losses["val"] < best_val_loss or config.always_save_checkpoint:
                 best_val_loss = losses["val"]
@@ -423,7 +423,9 @@ def train(config: TrainConfig) -> None:
 
         for micro_step in range(config.gradient_accumulation_steps):
             if ddp:
-                wrapped_model.require_backward_grad_sync = (micro_step == config.gradient_accumulation_steps - 1)  # type: ignore[union-attr]
+                wrapped_model.require_backward_grad_sync = (
+                    micro_step == config.gradient_accumulation_steps - 1
+                )  # type: ignore[union-attr]
 
             with ctx:
                 # Memory persists across micro-steps (contiguous sequence)
@@ -487,8 +489,9 @@ def main() -> None:
     parser.add_argument("--memory_lr", type=float, default=0.01)
     parser.add_argument("--memory_depth", type=int, default=2)
     parser.add_argument("--memory_expansion", type=int, default=2)
-    parser.add_argument("--memory_layer", type=int, default=-1,
-                       help="Which layer has memory (-1=middle, -2=all)")
+    parser.add_argument(
+        "--memory_layer", type=int, default=-1, help="Which layer has memory (-1=middle, -2=all)"
+    )
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--learning_rate", type=float, default=6e-4)
     parser.add_argument("--max_iters", type=int, default=10000)

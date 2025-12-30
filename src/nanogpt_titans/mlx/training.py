@@ -9,14 +9,15 @@ Provides training loop components for MLX backend:
 from __future__ import annotations
 
 import math
-from typing import Optional, Dict, Any
+from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten
 
-from nanogpt_titans.mlx.config import MLXTitansConfig
 from nanogpt_titans.mlx.decoder_layer import MLXTitansLayer, TitansLayerState
+
+if TYPE_CHECKING:
+    from nanogpt_titans.mlx.config import MLXTitansConfig
 
 
 class CombinedModel(nn.Module):
@@ -32,9 +33,9 @@ class CombinedModel(nn.Module):
     def __init__(
         self,
         base_model,
-        titans_layers: Dict[int, MLXTitansLayer],
+        titans_layers: dict[int, MLXTitansLayer],
         use_internal_loss: bool = False,
-        internal_loss_weight: float = 1e-4
+        internal_loss_weight: float = 1e-4,
     ):
         """
         Initialize combined model with multiple TITANS layers.
@@ -53,15 +54,13 @@ class CombinedModel(nn.Module):
         self.internal_loss_weight = internal_loss_weight
 
         # Get inner model reference
-        self._inner_model = base_model.model if hasattr(base_model, 'model') else base_model
+        self._inner_model = base_model.model if hasattr(base_model, "model") else base_model
 
         # Memory states per layer (initialized on first forward)
-        self._memory_states: Dict[int, Optional[TitansLayerState]] = {
-            idx: None for idx in self.memory_layer_indices
-        }
+        self._memory_states: dict[int, TitansLayerState | None] = dict.fromkeys(self.memory_layer_indices)
 
         # Store internal loss from last forward (for logging)
-        self._last_internal_loss: Optional[mx.array] = None
+        self._last_internal_loss: mx.array | None = None
 
     def init_memory_state(self, batch_size: int):
         """Initialize memory state for all TITANS layers."""
@@ -70,7 +69,7 @@ class CombinedModel(nn.Module):
 
     def reset_memory_state(self):
         """Reset memory state to None (will be re-initialized on next forward)."""
-        self._memory_states = {idx: None for idx in self.memory_layer_indices}
+        self._memory_states = dict.fromkeys(self.memory_layer_indices)
 
     def __call__(self, input_ids: mx.array) -> mx.array:
         """Forward pass through base model with TITANS integration and memory updates."""
@@ -90,8 +89,8 @@ class CombinedModel(nn.Module):
         mask = mask.astype(h.dtype)
 
         # Track hidden states and states for internal loss
-        h_at_memory_layers: Dict[int, mx.array] = {}
-        states_before_update: Dict[int, TitansLayerState] = {}
+        h_at_memory_layers: dict[int, mx.array] = {}
+        states_before_update: dict[int, TitansLayerState] = {}
 
         # Forward through transformer layers with TITANS integration
         for i, layer in enumerate(self._inner_model.layers):
@@ -125,16 +124,16 @@ class CombinedModel(nn.Module):
         h = self._inner_model.norm(h)
 
         # Project to vocabulary
-        if hasattr(self.base_model, 'lm_head'):
+        if hasattr(self.base_model, "lm_head"):
             logits = self.base_model.lm_head(h)
-        elif hasattr(self._inner_model, 'lm_head'):
+        elif hasattr(self._inner_model, "lm_head"):
             logits = self._inner_model.lm_head(h)
         else:
             logits = h @ self._inner_model.embed_tokens.weight.T
 
         return logits
 
-    def get_internal_loss(self) -> Optional[mx.array]:
+    def get_internal_loss(self) -> mx.array | None:
         """Get the internal loss from the last forward pass."""
         return self._last_internal_loss
 
@@ -144,7 +143,7 @@ class CombinedModel(nn.Module):
         """Get the first TITANS layer (for backward compatibility)."""
         return self.titans_layers[self.memory_layer_indices[0]]
 
-    def get_layer_stats(self) -> Dict[int, Dict[str, float]]:
+    def get_layer_stats(self) -> dict[int, dict[str, float]]:
         """Get stats for all TITANS layers."""
         stats = {}
         for idx in self.memory_layer_indices:
@@ -182,8 +181,7 @@ def compute_gate_regularization(titans_layer: MLXTitansLayer, min_value: float =
 
 
 def compute_multi_layer_gate_regularization(
-    titans_layers: Dict[int, MLXTitansLayer],
-    min_value: float = 0.15
+    titans_layers: dict[int, MLXTitansLayer], min_value: float = 0.15
 ) -> mx.array:
     """
     Compute gate regularization for multiple TITANS layers.
@@ -205,13 +203,16 @@ def compute_multi_layer_gate_regularization(
     return mx.mean(mx.stack(penalties))
 
 
-def create_loss_fn(combined_model: CombinedModel, gate_min_value: float = 0.0, gate_reg_weight: float = 0.0):
+def create_loss_fn(
+    _combined_model: CombinedModel, gate_min_value: float = 0.0, gate_reg_weight: float = 0.0
+):
     """Create a loss function for the combined model."""
-    def loss_fn(combined_model, input_ids: mx.array, target_ids: mx.array):
+
+    def loss_fn(combined_model: CombinedModel, input_ids: mx.array, target_ids: mx.array):
         logits = combined_model(input_ids)
 
         # Language modeling loss
-        B, T, V = logits.shape
+        _B, _T, V = logits.shape
         logits_flat = logits.reshape(-1, V)
         targets_flat = target_ids.reshape(-1)
         lm_loss = mx.mean(nn.losses.cross_entropy(logits_flat, targets_flat))
@@ -235,7 +236,7 @@ def create_loss_fn(combined_model: CombinedModel, gate_min_value: float = 0.0, g
     return loss_fn
 
 
-def filter_titans_grads(grads: Dict[str, Any]) -> Dict[str, Any]:
+def filter_titans_grads(grads: dict[str, Any]) -> dict[str, Any]:
     """
     Filter gradients to only include TITANS layer gradients.
 
@@ -248,16 +249,16 @@ def filter_titans_grads(grads: Dict[str, Any]) -> Dict[str, Any]:
         Filtered dict with only titans_layer gradients
     """
     # Fast path: direct key lookup
-    if 'titans_layers' in grads:
-        return {'titans_layers': grads['titans_layers']}
-    if 'titans_layer' in grads:
-        return {'titans_layer': grads['titans_layer']}
+    if "titans_layers" in grads:
+        return {"titans_layers": grads["titans_layers"]}
+    if "titans_layer" in grads:
+        return {"titans_layer": grads["titans_layer"]}
 
     # Fallback: filter by keyword (slower)
     filtered = {}
     for key, value in grads.items():
         key_lower = key.lower()
-        if 'titans' in key_lower or 'memory' in key_lower or 'gate' in key_lower:
+        if "titans" in key_lower or "memory" in key_lower or "gate" in key_lower:
             filtered[key] = value
     return filtered if filtered else grads
 
@@ -287,11 +288,8 @@ def get_lr(step: int, config: MLXTitansConfig, use_linear: bool = False) -> floa
 
 
 def create_masked_grads(
-    grads: Dict[str, Any],
-    keep_gate_scale: bool,
-    path: str = "",
-    freeze_gate: bool = False
-) -> Dict[str, Any]:
+    grads: dict[str, Any], keep_gate_scale: bool, path: str = "", freeze_gate: bool = False
+) -> dict[str, Any]:
     """
     Create grads with zeros for non-target params.
 
@@ -310,10 +308,15 @@ def create_masked_grads(
             for k, v in grads.items()
         }
     elif isinstance(grads, mx.array):
-        is_gate = 'gate' in path
-        is_scale_adaptive = ('mem_scale' in path or 'mem_ln' in path or
-                            'level_weights' in path or 'to_lr' in path or
-                            'to_momentum' in path or 'to_decay' in path)
+        is_gate = "gate" in path
+        is_scale_adaptive = (
+            "mem_scale" in path
+            or "mem_ln" in path
+            or "level_weights" in path
+            or "to_lr" in path
+            or "to_momentum" in path
+            or "to_decay" in path
+        )
         is_gate_scale = is_gate or is_scale_adaptive
 
         # During gate warmup, freeze gate params
@@ -338,7 +341,7 @@ def scale_grads_recursive(grad_tree: Any, factor: float) -> Any:
         return grad_tree
 
 
-def accumulate_grads(accum_grads: Optional[Dict], new_grads: Dict) -> Dict:
+def accumulate_grads(accum_grads: dict | None, new_grads: dict) -> dict:
     """Add new gradients to accumulated gradients."""
     if accum_grads is None:
         return new_grads
@@ -357,11 +360,11 @@ def accumulate_grads(accum_grads: Optional[Dict], new_grads: Dict) -> Dict:
 def create_titans_layer_from_model(model, config: MLXTitansConfig) -> MLXTitansLayer:
     """Create a TITANS layer matching model dimensions."""
     # Get hidden size from model
-    if hasattr(model, 'model') and hasattr(model.model, 'layers'):
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
         sample_layer = model.model.layers[0]
-        if hasattr(sample_layer, 'hidden_size'):
+        if hasattr(sample_layer, "hidden_size"):
             dim = sample_layer.hidden_size
-        elif hasattr(sample_layer.self_attn, 'hidden_size'):
+        elif hasattr(sample_layer.self_attn, "hidden_size"):
             dim = sample_layer.self_attn.hidden_size
         else:
             dim = sample_layer.self_attn.q_proj.weight.shape[0]

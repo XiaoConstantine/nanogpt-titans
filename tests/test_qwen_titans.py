@@ -39,6 +39,7 @@ from nanogpt_titans.qwen_titans.patcher import (
 
 # --- Fixtures ---
 
+
 @pytest.fixture
 def small_config():
     """Small config for fast testing."""
@@ -133,6 +134,7 @@ def batch_hidden():
 
 # --- PositionDependentGate Tests ---
 
+
 class TestPositionDependentGate:
     """Tests for PositionDependentGate (new fixed implementation)."""
 
@@ -148,7 +150,7 @@ class TestPositionDependentGate:
         gate = PositionDependentGate(dim=64, init_bias=-2.0)
         x = torch.randn(2, 10, 64)
         out = gate(x)
-        
+
         # sigmoid(-2) ≈ 0.12, should be close to that initially
         mean_gate = out.mean().item()
         assert 0.05 < mean_gate < 0.25
@@ -158,7 +160,7 @@ class TestPositionDependentGate:
         gate = PositionDependentGate(dim=64, init_bias=0.0)
         x = torch.randn(2, 10, 64)
         out = gate(x)
-        
+
         # All values should be in [0, 1]
         assert (out >= 0).all()
         assert (out <= 1).all()
@@ -166,14 +168,14 @@ class TestPositionDependentGate:
     def test_position_dependent(self):
         """Test different positions can have different gate values after training."""
         gate = PositionDependentGate(dim=64, init_bias=-2.0)
-        
+
         # Create input with very different values at different positions
         x = torch.zeros(2, 10, 64)
         x[:, 0, :] = 10.0  # First position very different
         x[:, -1, :] = -10.0  # Last position very different
-        
+
         out = gate(x)
-        
+
         # After some training, positions should have different gates
         # (initially they may be similar due to zero init)
         # This test mainly ensures the MLP structure is correct
@@ -210,8 +212,12 @@ class TestPositionDependentGate:
         assert w1_grad is not None
         assert w2_grad is not None
         # Critical: gradients must be non-zero for learning to occur
-        assert w1_grad.abs().sum() > 0, "First layer weights have zero gradient - gate cannot learn!"
-        assert w2_grad.abs().sum() > 0, "Second layer weights have zero gradient - gate cannot learn!"
+        assert w1_grad.abs().sum() > 0, (
+            "First layer weights have zero gradient - gate cannot learn!"
+        )
+        assert w2_grad.abs().sum() > 0, (
+            "Second layer weights have zero gradient - gate cannot learn!"
+        )
 
     def test_weights_update_after_optimizer_step(self):
         """Test gate weights actually change after optimizer step."""
@@ -238,6 +244,7 @@ class TestPositionDependentGate:
 
 
 # --- SelfModifyingLinear Tests ---
+
 
 class TestSelfModifyingLinear:
     """Tests for SelfModifyingLinear."""
@@ -289,6 +296,7 @@ class TestSelfModifyingLinear:
 
 # --- SelfModifyingGate Tests ---
 
+
 class TestSelfModifyingGate:
     """Tests for SelfModifyingGate."""
 
@@ -335,13 +343,14 @@ class TestSelfModifyingGate:
 
 # --- ContinuumMemorySystem Tests ---
 
+
 class TestContinuumMemorySystem:
     """Tests for ContinuumMemorySystem."""
 
     def test_init_state(self, cms_config):
         """Test state initialization."""
         cms = ContinuumMemorySystem(cms_config)
-        state = cms.init_state(batch_size=2, device=torch.device('cpu'))
+        state = cms.init_state(batch_size=2, device=torch.device("cpu"))
 
         assert isinstance(state, ContinuumMemoryState)
         assert len(state.level_states) == 3
@@ -350,7 +359,7 @@ class TestContinuumMemorySystem:
     def test_forward_shape(self, cms_config):
         """Test output shape."""
         cms = ContinuumMemorySystem(cms_config)
-        state = cms.init_state(2, torch.device('cpu'))
+        state = cms.init_state(2, torch.device("cpu"))
         x = torch.randn(2, 32, 64)
 
         out = cms(x, state)
@@ -359,7 +368,7 @@ class TestContinuumMemorySystem:
     def test_update_frequencies(self, cms_config):
         """Test different levels update at different frequencies."""
         cms = ContinuumMemorySystem(cms_config)
-        state = cms.init_state(2, torch.device('cpu'))
+        state = cms.init_state(2, torch.device("cpu"))
         x = torch.randn(2, 32, 64)
 
         # Update 16 times
@@ -376,6 +385,7 @@ class TestContinuumMemorySystem:
 
 
 # --- WarmStartEncoder Tests ---
+
 
 class TestWarmStartEncoder:
     """Tests for WarmStartEncoder."""
@@ -419,6 +429,7 @@ class TestWarmStartEncoder:
 
 
 # --- DeepMomentumUpdate Tests ---
+
 
 class TestDeepMomentumUpdate:
     """Tests for DeepMomentumUpdate."""
@@ -465,20 +476,21 @@ class TestDeepMomentumUpdate:
 
 # --- NeuralMemoryAdapter Tests ---
 
+
 class TestNeuralMemoryAdapter:
     """Tests for NeuralMemoryAdapter."""
 
     def test_init_state(self, small_config):
         """Test state initialization."""
         adapter = NeuralMemoryAdapter(small_config)
-        state = adapter.init_state(2, torch.device('cpu'))
+        state = adapter.init_state(2, torch.device("cpu"))
 
         assert state is not None
 
     def test_forward_shape(self, small_config, batch_hidden):
         """Test retrieval shape."""
         adapter = NeuralMemoryAdapter(small_config)
-        state = adapter.init_state(2, torch.device('cpu'))
+        state = adapter.init_state(2, torch.device("cpu"))
 
         out = adapter(batch_hidden, state)
         assert out.shape == (2, small_config.num_longterm_mem, 64)
@@ -486,7 +498,7 @@ class TestNeuralMemoryAdapter:
     def test_update_returns_new_state(self, small_config, batch_hidden):
         """Test update returns new state."""
         adapter = NeuralMemoryAdapter(small_config)
-        state = adapter.init_state(2, torch.device('cpu'))
+        state = adapter.init_state(2, torch.device("cpu"))
 
         new_state = adapter.update(batch_hidden, state)
         assert new_state is not None
@@ -494,12 +506,14 @@ class TestNeuralMemoryAdapter:
 
 # --- TitansQwenDecoderLayer Tests ---
 
+
 class TestTitansQwenDecoderLayer:
     """Tests for TitansQwenDecoderLayer."""
 
     @pytest.fixture
     def mock_qwen_layer(self):
         """Create a mock Qwen decoder layer."""
+
         class MockQwenLayer(nn.Module):
             def __init__(self, hidden_size=64):
                 super().__init__()
@@ -582,59 +596,59 @@ class TestTitansQwenDecoderLayer:
         layer.enable_memory_updates(False)
 
         assert layer.update_memory is False
-    
+
     def test_noop_mode_matches_original(self, small_config, mock_qwen_layer):
         """Test no-op mode returns same output as original layer."""
         layer = TitansQwenDecoderLayer(mock_qwen_layer, 0, small_config)
         layer.set_noop_mode()
-        
+
         x = torch.randn(2, 32, 64)
-        
+
         # Get output from Titans layer in no-op mode
         out_titans = layer(x)
         if isinstance(out_titans, tuple):
             out_titans = out_titans[0]
-        
+
         # Get output from original layer
         out_original = mock_qwen_layer(x)
         if isinstance(out_original, tuple):
             out_original = out_original[0]
-        
+
         # Should be identical
         assert torch.allclose(out_titans, out_original)
-    
+
     def test_memory_enabled_flag(self, small_config, mock_qwen_layer):
         """Test memory can be enabled/disabled."""
         layer = TitansQwenDecoderLayer(mock_qwen_layer, 0, small_config)
-        
+
         assert layer.memory_enabled is True
-        
+
         layer.set_memory_enabled(False)
         assert layer.memory_enabled is False
-        
+
         layer.set_memory_enabled(True)
         assert layer.memory_enabled is True
 
     def test_all_hope_params_trainable_and_update(self, small_config, mock_qwen_layer):
         """Test mem_scale, mem_ln, and gate are trainable and update during training."""
         layer = TitansQwenDecoderLayer(mock_qwen_layer, 0, small_config)
-        
+
         # Check all critical params exist and are trainable after proper setup
         assert hasattr(layer, "mem_scale")
         assert hasattr(layer, "mem_ln")
         assert hasattr(layer, "gate")
-        
+
         # Store initial values
         initial_mem_scale = layer.mem_scale.clone().detach()
         initial_gate_bias = layer.gate.gate_mlp[2].bias.clone().detach()
         initial_mem_ln_weight = layer.mem_ln.weight.clone().detach()
-        
+
         # Set to training mode
         layer.train()
-        
+
         # Create optimizer with only the layer's parameters
         optimizer = torch.optim.AdamW(layer.parameters(), lr=1e-2)
-        
+
         # Run a few training steps
         for _ in range(5):
             optimizer.zero_grad()
@@ -645,14 +659,19 @@ class TestTitansQwenDecoderLayer:
             loss = out.mean()
             loss.backward()
             optimizer.step()
-        
+
         # Check values changed
         assert not torch.allclose(initial_mem_scale, layer.mem_scale), "mem_scale should update"
-        assert not torch.allclose(initial_gate_bias, layer.gate.gate_mlp[2].bias), "gate should update"
-        assert not torch.allclose(initial_mem_ln_weight, layer.mem_ln.weight), "mem_ln should update"
+        assert not torch.allclose(initial_gate_bias, layer.gate.gate_mlp[2].bias), (
+            "gate should update"
+        )
+        assert not torch.allclose(initial_mem_ln_weight, layer.mem_ln.weight), (
+            "mem_ln should update"
+        )
 
 
 # --- Config Tests ---
+
 
 class TestTitansQwenConfig:
     """Tests for TitansQwenConfig."""
@@ -690,11 +709,13 @@ class TestTitansQwenConfig:
 
 # --- Integration Tests ---
 
+
 class TestIntegration:
     """Integration tests for full pipeline."""
 
     def test_full_forward_backward(self, small_config):
         """Test full forward and backward pass."""
+
         # Create mock layer
         class MockQwenLayer(nn.Module):
             def __init__(self):
@@ -720,6 +741,7 @@ class TestIntegration:
 
     def test_cms_with_decoder_layer(self, cms_config):
         """Test CMS works with decoder layer."""
+
         class MockQwenLayer(nn.Module):
             def __init__(self):
                 super().__init__()

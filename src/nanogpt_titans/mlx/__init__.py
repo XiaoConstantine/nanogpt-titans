@@ -24,62 +24,58 @@ Usage:
 """
 
 # Check MLX availability
-_MLX_AVAILABLE = False
-try:
-    import mlx.core as mx
-    import mlx.nn as nn
-    _MLX_AVAILABLE = True
-except ImportError:
-    pass
+import importlib.util
+
+_MLX_AVAILABLE = importlib.util.find_spec("mlx") is not None
 
 if _MLX_AVAILABLE:
     from nanogpt_titans.mlx.config import MLXTitansConfig, config_to_mlx
-    from nanogpt_titans.mlx.memory import (
-        MLXMemoryState,
-        MLXCMSState,
-        MLXNeuralMemory,
-        MLXContinuumMemorySystem,
-    )
     from nanogpt_titans.mlx.decoder_layer import (
         MLXPositionDependentGate,
         MLXTitansLayer,
         TitansLayerState,
     )
+    from nanogpt_titans.mlx.memory import (
+        MLXCMSState,
+        MLXContinuumMemorySystem,
+        MLXMemoryState,
+        MLXNeuralMemory,
+    )
     from nanogpt_titans.mlx.training import (
         CombinedModel,
+        accumulate_grads,
         create_loss_fn,
+        create_masked_grads,
+        create_titans_layer_from_model,
         filter_titans_grads,
         get_lr,
-        create_masked_grads,
         scale_grads_recursive,
-        accumulate_grads,
-        create_titans_layer_from_model,
     )
 
     __all__ = [
-        # Config
-        "MLXTitansConfig",
-        "config_to_mlx",
-        # Memory
-        "MLXMemoryState",
-        "MLXCMSState",
-        "MLXNeuralMemory",
-        "MLXContinuumMemorySystem",
-        # Decoder layer
-        "MLXPositionDependentGate",
-        "MLXTitansLayer",
-        "TitansLayerState",
-        # Training
-        "CombinedModel",
-        "create_loss_fn",
-        "filter_titans_grads",
-        "get_lr",
-        "create_masked_grads",
-        "scale_grads_recursive",
-        "accumulate_grads",
-        "create_titans_layer_from_model",
         # Availability flag
         "_MLX_AVAILABLE",
+        # Training
+        "CombinedModel",
+        "MLXCMSState",
+        "MLXContinuumMemorySystem",
+        # Memory
+        "MLXMemoryState",
+        "MLXNeuralMemory",
+        # Decoder layer
+        "MLXPositionDependentGate",
+        # Config
+        "MLXTitansConfig",
+        "MLXTitansLayer",
+        "TitansLayerState",
+        "accumulate_grads",
+        "config_to_mlx",
+        "create_loss_fn",
+        "create_masked_grads",
+        "create_titans_layer_from_model",
+        "filter_titans_grads",
+        "get_lr",
+        "scale_grads_recursive",
     ]
 else:
     __all__ = ["_MLX_AVAILABLE"]

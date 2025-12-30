@@ -16,6 +16,7 @@ from nanogpt_titans.packed_data import PackedDataLoader, PackedBatch
 
 # --- Fixtures ---
 
+
 @pytest.fixture
 def temp_data_file():
     """Create a temporary data file with known content."""
@@ -58,6 +59,7 @@ def packed_loader(temp_data_file):
 
 # --- PackedBatch Tests ---
 
+
 class TestPackedBatch:
     """Tests for PackedBatch structure."""
 
@@ -94,6 +96,7 @@ class TestPackedBatch:
 
 # --- Document Boundary Tests ---
 
+
 class TestDocumentBoundaries:
     """Tests for document boundary handling."""
 
@@ -117,6 +120,7 @@ class TestDocumentBoundaries:
 
 
 # --- Attention Mask Tests ---
+
 
 class TestAttentionMask:
     """Tests for attention mask correctness."""
@@ -149,7 +153,7 @@ class TestAttentionMask:
             # Find document boundaries (where position resets to 0)
             boundaries = []
             for i in range(1, len(pos)):
-                if pos[i] == 0 and pos[i-1] != 0:
+                if pos[i] == 0 and pos[i - 1] != 0:
                     boundaries.append(i)
 
             # For each boundary, check no attention crosses it
@@ -164,6 +168,7 @@ class TestAttentionMask:
 
 
 # --- Utilization Tests ---
+
 
 class TestUtilization:
     """Tests for packing efficiency."""
@@ -188,6 +193,7 @@ class TestUtilization:
 
 
 # --- Target Alignment Tests ---
+
 
 class TestTargetAlignment:
     """Tests for input/target alignment."""
@@ -223,6 +229,7 @@ class TestTargetAlignment:
 
 
 # --- Edge Cases ---
+
 
 class TestEdgeCases:
     """Tests for edge cases."""
@@ -311,6 +318,7 @@ class TestEdgeCases:
 
 
 # --- Device Tests ---
+
 
 class TestDevice:
     """Tests for device handling."""

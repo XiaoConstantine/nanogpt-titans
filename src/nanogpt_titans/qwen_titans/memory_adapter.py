@@ -13,15 +13,16 @@ Also includes HOPE-inspired components:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from nanogpt_titans.model import MemoryState, NeuralMemory
-from nanogpt_titans.qwen_titans.config import TitansQwenConfig
 
+if TYPE_CHECKING:
+    from nanogpt_titans.qwen_titans.config import TitansQwenConfig
 
 # =============================================================================
 # Self-Modifying Components (from Nested Learning / HOPE)
@@ -151,9 +152,9 @@ class SelfModifyingGate(nn.Module):
 
         # Update statistics
         with torch.no_grad():
-            self._mean_gate = (
-                self._mean_gate * self._gate_count + gate.mean()
-            ) / (self._gate_count + 1)
+            self._mean_gate = (self._mean_gate * self._gate_count + gate.mean()) / (
+                self._gate_count + 1
+            )
             self._gate_count += 1
 
         # Gated combination
@@ -216,9 +217,7 @@ class ContinuumMemorySystem(nn.Module):
         self.update_frequencies = config.cms_update_frequencies
 
         # Create a memory module for each level
-        self.memories = nn.ModuleList([
-            NeuralMemoryAdapter(config) for _ in range(self.num_levels)
-        ])
+        self.memories = nn.ModuleList([NeuralMemoryAdapter(config) for _ in range(self.num_levels)])
 
         # Projection to combine outputs from all levels
         self.combine_proj = nn.Linear(
@@ -262,10 +261,13 @@ class ContinuumMemorySystem(nn.Module):
 
         # Fused retrieval: stack outputs and apply weights in one operation
         # This reduces Python loop overhead and enables better GPU utilization
-        level_outputs = torch.stack([
-            mem(hidden_states, level_state)
-            for mem, level_state in zip(self.memories, state.level_states)
-        ], dim=0)  # [num_levels, B, num_longterm_mem, C]
+        level_outputs = torch.stack(
+            [
+                mem(hidden_states, level_state)
+                for mem, level_state in zip(self.memories, state.level_states)
+            ],
+            dim=0,
+        )  # [num_levels, B, num_longterm_mem, C]
 
         # Apply weights: [num_levels, 1, 1, 1] * [num_levels, B, T, C] -> weighted sum
         weights_expanded = weights.view(-1, 1, 1, 1)
@@ -297,10 +299,7 @@ class ContinuumMemorySystem(nn.Module):
             count = state.segment_counts[i] + 1
 
             # Update only if segment count is multiple of frequency
-            if count % freq == 0:
-                new_state = mem.update(hidden_states, level_state)
-            else:
-                new_state = level_state
+            new_state = mem.update(hidden_states, level_state) if count % freq == 0 else level_state
 
             new_level_states.append(new_state)
             new_segment_counts.append(count)

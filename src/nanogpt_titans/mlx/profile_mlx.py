@@ -17,29 +17,29 @@ from __future__ import annotations
 
 import argparse
 import time
-from typing import Dict, Any
 from dataclasses import dataclass
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
-from mlx.utils import tree_flatten
 
 from nanogpt_titans.mlx.config import MLXTitansConfig
 from nanogpt_titans.mlx.decoder_layer import MLXTitansLayer
 from nanogpt_titans.mlx.training import (
     CombinedModel,
-    create_loss_fn,
-    filter_titans_grads,
-    create_masked_grads,
-    scale_grads_recursive,
     accumulate_grads,
+    create_loss_fn,
+    create_masked_grads,
+    filter_titans_grads,
+    scale_grads_recursive,
 )
 
 
 @dataclass
 class TimingResult:
     """Stores timing results for a profiled operation."""
+
     name: str
     mean_ms: float
     std_ms: float
@@ -50,7 +50,7 @@ class TimingResult:
 
 def time_operation(fn, num_iters: int = 10, warmup: int = 3) -> TimingResult:
     """Time an operation with warmup."""
-    name = fn.__name__ if hasattr(fn, '__name__') else "operation"
+    name = fn.__name__ if hasattr(fn, "__name__") else "operation"
 
     # Warmup
     for _ in range(warmup):
@@ -66,6 +66,7 @@ def time_operation(fn, num_iters: int = 10, warmup: int = 3) -> TimingResult:
         times.append((time.perf_counter() - t0) * 1000)
 
     import statistics
+
     return TimingResult(
         name=name,
         mean_ms=statistics.mean(times),
@@ -82,7 +83,7 @@ def profile_memory_operations(dim: int = 896, batch_size: int = 2, seq_len: int 
     print("MEMORY OPERATIONS PROFILING")
     print("=" * 60)
 
-    from nanogpt_titans.mlx.memory import MLXNeuralMemory, MLXContinuumMemorySystem
+    from nanogpt_titans.mlx.memory import MLXContinuumMemorySystem, MLXNeuralMemory
 
     # Create memory modules
     single_mem = MLXNeuralMemory(dim, depth=2, expansion=2, adaptive=True)
@@ -102,6 +103,7 @@ def profile_memory_operations(dim: int = 896, batch_size: int = 2, seq_len: int 
     # Profile single memory retrieval
     def single_retrieve():
         return single_mem(x, single_state)
+
     result = time_operation(single_retrieve)
     results["single_mem_retrieve"] = result
     print(f"  Single memory retrieval: {result.mean_ms:.2f} ms (std={result.std_ms:.2f})")
@@ -109,6 +111,7 @@ def profile_memory_operations(dim: int = 896, batch_size: int = 2, seq_len: int 
     # Profile single memory update
     def single_update():
         return single_mem.update(x, single_state)
+
     result = time_operation(single_update)
     results["single_mem_update"] = result
     print(f"  Single memory update:    {result.mean_ms:.2f} ms (std={result.std_ms:.2f})")
@@ -116,6 +119,7 @@ def profile_memory_operations(dim: int = 896, batch_size: int = 2, seq_len: int 
     # Profile CMS retrieval
     def cms_retrieve():
         return cms(x, cms_state)
+
     result = time_operation(cms_retrieve)
     results["cms_retrieve"] = result
     print(f"  CMS retrieval (3 levels):{result.mean_ms:.2f} ms (std={result.std_ms:.2f})")
@@ -123,6 +127,7 @@ def profile_memory_operations(dim: int = 896, batch_size: int = 2, seq_len: int 
     # Profile CMS update
     def cms_update():
         return cms.update(x, cms_state)
+
     result = time_operation(cms_update)
     results["cms_update"] = result
     print(f"  CMS update (3 levels):   {result.mean_ms:.2f} ms (std={result.std_ms:.2f})")
@@ -132,6 +137,7 @@ def profile_memory_operations(dim: int = 896, batch_size: int = 2, seq_len: int 
         keys = single_mem.key_proj(x)
         values = single_mem.value_proj(x)
         return single_mem._compute_gradients(keys, values, single_state.weights)
+
     result = time_operation(compute_grads)
     results["gradient_computation"] = result
     print(f"  Gradient computation:    {result.mean_ms:.2f} ms (std={result.std_ms:.2f})")
@@ -139,6 +145,7 @@ def profile_memory_operations(dim: int = 896, batch_size: int = 2, seq_len: int 
     # Profile internal loss
     def compute_internal_loss():
         return single_mem.compute_internal_loss(x, single_state)
+
     result = time_operation(compute_internal_loss)
     results["internal_loss"] = result
     print(f"  Internal loss:           {result.mean_ms:.2f} ms (std={result.std_ms:.2f})")
@@ -170,6 +177,7 @@ def profile_titans_layer(dim: int = 896, batch_size: int = 2, seq_len: int = 512
     # Profile full forward pass
     def full_forward():
         return layer(x, state)
+
     result = time_operation(full_forward)
     results["titans_layer_forward"] = result
     print(f"  Full forward pass:       {result.mean_ms:.2f} ms (std={result.std_ms:.2f})")
@@ -177,6 +185,7 @@ def profile_titans_layer(dim: int = 896, batch_size: int = 2, seq_len: int = 512
     # Profile gate computation
     def gate_compute():
         return layer.gate(x)
+
     result = time_operation(gate_compute)
     results["gate_compute"] = result
     print(f"  Gate computation:        {result.mean_ms:.2f} ms (std={result.std_ms:.2f})")
@@ -186,6 +195,7 @@ def profile_titans_layer(dim: int = 896, batch_size: int = 2, seq_len: int = 512
         mem_retrieved = layer.memory(x, state)
         mem_pooled = mx.mean(mem_retrieved, axis=1, keepdims=True)
         return layer.mem_proj(mem_pooled)
+
     result = time_operation(mem_projection)
     results["mem_projection"] = result
     print(f"  Memory projection:       {result.mean_ms:.2f} ms (std={result.std_ms:.2f})")
@@ -207,7 +217,7 @@ def profile_training_step(config: MLXTitansConfig):
         return {}
 
     print(f"Loading {config.model_name}...")
-    model, tokenizer = mlx_load(config.model_name)
+    model, _tokenizer = mlx_load(config.model_name)
 
     # Get model dimensions
     dim = model.model.layers[0].self_attn.q_proj.weight.shape[0]
@@ -231,7 +241,8 @@ def profile_training_step(config: MLXTitansConfig):
 
     # Create combined model
     combined_model = CombinedModel(
-        model, titans_layers,
+        model,
+        titans_layers,
         use_internal_loss=config.use_internal_loss,
     )
 
@@ -254,6 +265,7 @@ def profile_training_step(config: MLXTitansConfig):
     def forward_pass():
         combined_model.reset_memory_state()
         return combined_model(input_ids)
+
     result = time_operation(forward_pass, num_iters=5, warmup=2)
     results["forward_pass"] = result
     print(f"  Forward pass:            {result.mean_ms:.2f} ms (std={result.std_ms:.2f})")
@@ -263,22 +275,27 @@ def profile_training_step(config: MLXTitansConfig):
         combined_model.reset_memory_state()
         loss, grads = loss_and_grad_fn(combined_model, input_ids, target_ids)
         return loss, grads
+
     result = time_operation(forward_backward, num_iters=5, warmup=2)
     results["forward_backward"] = result
     print(f"  Forward + backward:      {result.mean_ms:.2f} ms (std={result.std_ms:.2f})")
 
     # Profile gradient filtering
     _, full_grads = loss_and_grad_fn(combined_model, input_ids, target_ids)
+
     def grad_filter():
         return filter_titans_grads(full_grads)
+
     result = time_operation(grad_filter)
     results["grad_filtering"] = result
     print(f"  Gradient filtering:      {result.mean_ms:.2f} ms (std={result.std_ms:.2f})")
 
     # Profile gradient masking
     filtered_grads = filter_titans_grads(full_grads)
+
     def grad_masking():
         return create_masked_grads(filtered_grads, keep_gate_scale=True)
+
     result = time_operation(grad_masking)
     results["grad_masking"] = result
     print(f"  Gradient masking:        {result.mean_ms:.2f} ms (std={result.std_ms:.2f})")
@@ -288,9 +305,13 @@ def profile_training_step(config: MLXTitansConfig):
     gate_grads = create_masked_grads(filtered_grads, keep_gate_scale=True)
 
     # We need to extract the titans layer grads
-    if 'titans_layers' in memory_grads:
-        layer_memory_grads = memory_grads['titans_layers'].get(str(layer_idx), memory_grads['titans_layers'].get(layer_idx, {}))
-        layer_gate_grads = gate_grads['titans_layers'].get(str(layer_idx), gate_grads['titans_layers'].get(layer_idx, {}))
+    if "titans_layers" in memory_grads:
+        layer_memory_grads = memory_grads["titans_layers"].get(
+            str(layer_idx), memory_grads["titans_layers"].get(layer_idx, {})
+        )
+        layer_gate_grads = gate_grads["titans_layers"].get(
+            str(layer_idx), gate_grads["titans_layers"].get(layer_idx, {})
+        )
     else:
         layer_memory_grads = memory_grads
         layer_gate_grads = gate_grads
@@ -298,6 +319,7 @@ def profile_training_step(config: MLXTitansConfig):
     def optimizer_step():
         optimizer_memory.update(titans_layer, layer_memory_grads)
         optimizer_gate.update(titans_layer, layer_gate_grads)
+
     result = time_operation(optimizer_step, num_iters=5)
     results["optimizer_step"] = result
     print(f"  Optimizer step:          {result.mean_ms:.2f} ms (std={result.std_ms:.2f})")
@@ -305,6 +327,7 @@ def profile_training_step(config: MLXTitansConfig):
     # Profile mx.eval
     def eval_params():
         mx.eval(titans_layer.parameters())
+
     result = time_operation(eval_params)
     results["mx_eval"] = result
     print(f"  mx.eval (parameters):    {result.mean_ms:.2f} ms (std={result.std_ms:.2f})")
@@ -348,6 +371,7 @@ def profile_gradient_accumulation(config: MLXTitansConfig, num_accum_steps: int 
     def single_fwd_bwd():
         combined_model.reset_memory_state()
         return loss_and_grad_fn(combined_model, input_ids, target_ids)
+
     result = time_operation(single_fwd_bwd, num_iters=5, warmup=2)
     results["single_step"] = result
     print(f"  Single forward+backward: {result.mean_ms:.2f} ms")
@@ -357,24 +381,25 @@ def profile_gradient_accumulation(config: MLXTitansConfig, num_accum_steps: int 
         combined_model.reset_memory_state()
         accumulated_grads = None
         for _ in range(num_accum_steps):
-            loss, grads = loss_and_grad_fn(combined_model, input_ids, target_ids)
+            _loss, grads = loss_and_grad_fn(combined_model, input_ids, target_ids)
             filtered = filter_titans_grads(grads)
             scaled = scale_grads_recursive(filtered, 1.0 / num_accum_steps)
             accumulated_grads = accumulate_grads(accumulated_grads, scaled)
         return accumulated_grads
+
     result = time_operation(accumulated_steps, num_iters=3, warmup=1)
     results["accumulated_steps"] = result
     print(f"  {num_accum_steps}x accumulated steps:   {result.mean_ms:.2f} ms")
 
     # Overhead per step
     overhead = result.mean_ms - (results["single_step"].mean_ms * num_accum_steps)
-    print(f"  Accumulation overhead:   {overhead:.2f} ms ({overhead/result.mean_ms*100:.1f}%)")
+    print(f"  Accumulation overhead:   {overhead:.2f} ms ({overhead / result.mean_ms * 100:.1f}%)")
     results["accumulation_overhead_ms"] = overhead
 
     return results
 
 
-def identify_bottlenecks(all_results: Dict[str, Dict[str, Any]]):
+def identify_bottlenecks(all_results: dict[str, dict[str, Any]]):
     """Analyze results and identify bottlenecks."""
     print("\n" + "=" * 60)
     print("BOTTLENECK ANALYSIS")
@@ -409,7 +434,9 @@ def identify_bottlenecks(all_results: Dict[str, Dict[str, Any]]):
         if cms_time > 10:
             print(f"  - CMS retrieval is slow ({cms_time:.1f}ms) - consider reducing num_levels")
         if cms_update > 10:
-            print(f"  - CMS update is slow ({cms_update:.1f}ms) - consider higher update_frequencies")
+            print(
+                f"  - CMS update is slow ({cms_update:.1f}ms) - consider higher update_frequencies"
+            )
         if grad_time > 5:
             print(f"  - Gradient computation is slow ({grad_time:.1f}ms) - batching could help")
 

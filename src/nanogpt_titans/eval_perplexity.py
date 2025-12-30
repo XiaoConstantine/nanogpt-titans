@@ -1,5 +1,5 @@
 """
-Perplexity evaluation for TitansGPT and Qwen-Titans.
+Perplexity evaluation for TitansGPT, Qwen-Titans, and MLX-Titans.
 
 This script evaluates perplexity at different positions in sequences
 to demonstrate the benefit of the Titans memory mechanism.
@@ -13,8 +13,11 @@ Usage:
     # TitansGPT (nanoGPT-based)
     uv run python -m nanogpt_titans.eval_perplexity --checkpoint=out-titans/ckpt.pt --dataset=wikitext103
 
-    # Qwen-Titans
+    # Qwen-Titans (PyTorch)
     uv run python -m nanogpt_titans.eval_perplexity --qwen --model_name=Qwen/Qwen2-0.5B --titans_state=out-qwen-titans/titans_state_final.pt
+
+    # MLX-Titans (Apple Silicon)
+    uv run python -m nanogpt_titans.eval_perplexity --mlx --model_name=Qwen/Qwen2-0.5B --titans_weights=out-mlx-titans/titans_weights.npz
 
     # Base Qwen (no memory, for comparison)
     uv run python -m nanogpt_titans.eval_perplexity --qwen --model_name=Qwen/Qwen2-0.5B
@@ -55,7 +58,7 @@ def load_model(checkpoint_path: str, device: str) -> TitansGPT:
     unwanted_prefix = "_orig_mod."
     for k in list(state_dict.keys()):
         if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+            state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
 
     model.load_state_dict(state_dict)
     model.to(device)
@@ -94,15 +97,13 @@ def evaluate_perplexity_by_position(
         # Get random starting positions
         ix = torch.randint(len(data) - block_size - 1, (batch_size,))
 
-        x = torch.stack([
-            torch.from_numpy(data[i:i + block_size].astype(np.int64))
-            for i in ix
-        ]).to(device)
+        x = torch.stack(
+            [torch.from_numpy(data[i : i + block_size].astype(np.int64)) for i in ix]
+        ).to(device)
 
-        y = torch.stack([
-            torch.from_numpy(data[i + 1:i + 1 + block_size].astype(np.int64))
-            for i in ix
-        ]).to(device)
+        y = torch.stack(
+            [torch.from_numpy(data[i + 1 : i + 1 + block_size].astype(np.int64)) for i in ix]
+        ).to(device)
 
         with torch.no_grad(), ctx:
             # Process and get per-token losses
@@ -135,9 +136,7 @@ def evaluate_perplexity_by_position(
 
                 # Compute per-token loss for this segment
                 loss = torch.nn.functional.cross_entropy(
-                    logits.reshape(-1, logits.size(-1)),
-                    seg_y.reshape(-1),
-                    reduction='none'
+                    logits.reshape(-1, logits.size(-1)), seg_y.reshape(-1), reduction="none"
                 ).reshape(batch_size, segment_len)
 
                 segment_losses[seg_idx].append(loss.mean().item())
@@ -211,8 +210,8 @@ def print_results(results: dict[str, Any], model_name: str = "Model") -> None:
     print(f"  Middle segments: {results['by_position']['middle']:.2f}")
     print(f"  Late segments:   {results['by_position']['late']:.2f}")
 
-    early_ppl = results['by_position']['early']
-    late_ppl = results['by_position']['late']
+    early_ppl = results["by_position"]["early"]
+    late_ppl = results["by_position"]["late"]
     if early_ppl > 0:
         improvement = (early_ppl - late_ppl) / early_ppl * 100
         print(f"\n  Improvement (early->late): {improvement:.1f}%")
@@ -248,8 +247,8 @@ def load_qwen_model(
 
     from nanogpt_titans.qwen_titans import (
         TitansQwenConfig,
-        patch_qwen_with_titans,
         load_titans_state,
+        patch_qwen_with_titans,
     )
 
     print(f"Loading {model_name}...")
@@ -336,7 +335,7 @@ def evaluate_qwen_perplexity_by_position(
                 end = min(start + segment_len, seq_len - 1)
 
                 seg_input = input_ids[:, start:end]
-                seg_labels = input_ids[:, start + 1:end + 1]
+                seg_labels = input_ids[:, start + 1 : end + 1]
 
                 if seg_input.size(1) != seg_labels.size(1):
                     continue
@@ -359,7 +358,7 @@ def evaluate_qwen_perplexity_by_position(
 
         # Categorize by position
         num_segs = len(segment_losses)
-        for i, (seg_idx, loss) in enumerate(segment_losses):
+        for i, (_seg_idx, loss) in enumerate(segment_losses):
             total_losses.append(loss)
 
             if num_segs <= 2:
@@ -377,7 +376,9 @@ def evaluate_qwen_perplexity_by_position(
 
     # Compute perplexities
     if not total_losses:
-        return {"error": f"No valid losses computed. Skipped {skipped_short} short sequences (need >= {segment_len * 2} tokens)"}
+        return {
+            "error": f"No valid losses computed. Skipped {skipped_short} short sequences (need >= {segment_len * 2} tokens)"
+        }
 
     overall_loss = float(np.mean(total_losses))
     overall_ppl = math.exp(overall_loss)
@@ -399,48 +400,328 @@ def evaluate_qwen_perplexity_by_position(
     }
 
 
+# =============================================================================
+# MLX-Titans Support
+# =============================================================================
+
+
+def evaluate_mlx_perplexity(
+    model_name: str,
+    titans_weights: str | None,
+    memory_layers: list[int],
+    segment_len: int,
+    texts: list[str],
+    num_samples: int = 50,
+) -> dict[str, Any]:
+    """
+    Evaluate perplexity for MLX-Titans model.
+
+    Args:
+        model_name: HuggingFace model name
+        titans_weights: Path to saved TITANS weights (optional)
+        memory_layers: Layer indices for TITANS
+        segment_len: Segment length for processing
+        texts: List of text samples
+        num_samples: Max samples to evaluate
+
+    Returns:
+        Dictionary with perplexity metrics
+    """
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from mlx_lm import load as mlx_load
+
+    from nanogpt_titans.mlx import CombinedModel, MLXTitansLayer
+
+    print(f"Loading {model_name} with MLX...")
+    model, tokenizer = mlx_load(model_name)
+
+    # Get model dimensions
+    dim = model.model.layers[0].self_attn.q_proj.weight.shape[0]
+    num_layers = len(model.model.layers)
+
+    # Create TITANS layers
+    titans_layers = {}
+    for layer_idx in memory_layers:
+        idx = min(layer_idx, num_layers - 1)
+        titans_layers[idx] = MLXTitansLayer(
+            dim=dim,
+            use_cms=True,
+            num_cms_levels=3,
+            cms_update_frequencies=(1, 4, 16),
+        )
+
+
+    if titans_weights:
+        # Load saved weights (supports .safetensors and .npz)
+        print(f"Loading TITANS weights from {titans_weights}...")
+        if titans_weights.endswith(".safetensors"):
+            weights = mx.load(titans_weights)
+        else:
+            weights = dict(mx.load(titans_weights))
+
+        for layer_idx, layer in titans_layers.items():
+            prefix = f"layer_{layer_idx}."
+            # Get weights for this layer with string keys (e.g., 'gate.linear1.weight')
+            layer_weights = [
+                (k[len(prefix) :], v) for k, v in weights.items() if k.startswith(prefix)
+            ]
+
+            if layer_weights:
+                # load_weights expects list of (key_string, value) tuples
+                layer.load_weights(layer_weights)
+                print(f"  Loaded {len(layer_weights)} weights for layer {layer_idx}")
+
+        mx.eval(
+            *[p for layer in titans_layers.values() for _, p in tree_flatten(layer.parameters())]
+        )
+
+    # Create combined model
+    combined_model = CombinedModel(model, titans_layers)
+
+    # Track losses by position
+    position_losses: dict[str, list[float]] = {"early": [], "middle": [], "late": []}
+    total_losses: list[float] = []
+
+    print(f"Evaluating on {min(len(texts), num_samples)} samples...")
+
+    for i, text in enumerate(texts[:num_samples]):
+        if i % 10 == 0:
+            print(f"  Processing sample {i}/{min(len(texts), num_samples)}...")
+
+        # Tokenize
+        tokens = tokenizer.encode(text)
+        if len(tokens) < segment_len * 2:
+            continue
+
+        input_ids = mx.array(tokens)
+        seq_len = len(tokens)
+        num_segments = seq_len // segment_len
+
+        # Reset memory state
+        combined_model.reset_memory_state()
+
+        segment_losses = []
+
+        for seg_idx in range(num_segments - 1):  # -1 because we need labels
+            start = seg_idx * segment_len
+            end = start + segment_len
+
+            seg_input = input_ids[start:end].reshape(1, -1)
+            seg_labels = input_ids[start + 1 : end + 1].reshape(1, -1)
+
+            if seg_input.shape[1] != seg_labels.shape[1]:
+                continue
+
+            # Forward pass
+            logits = combined_model(seg_input)
+
+            # Compute cross-entropy loss
+            _B, _T, V = logits.shape
+            logits_flat = logits.reshape(-1, V)
+            labels_flat = seg_labels.reshape(-1)
+            loss = mx.mean(nn.losses.cross_entropy(logits_flat, labels_flat))
+            mx.eval(loss)
+
+            loss_val = float(loss.item())
+            if not math.isnan(loss_val) and loss_val < 100:  # Skip invalid losses
+                segment_losses.append((seg_idx, loss_val))
+
+        if not segment_losses:
+            continue
+
+        # Categorize by position
+        num_segs = len(segment_losses)
+        for j, (_seg_idx, loss) in enumerate(segment_losses):
+            total_losses.append(loss)
+
+            if num_segs <= 2:
+                if j == 0:
+                    position_losses["early"].append(loss)
+                else:
+                    position_losses["late"].append(loss)
+            else:
+                if j < num_segs // 3:
+                    position_losses["early"].append(loss)
+                elif j < 2 * num_segs // 3:
+                    position_losses["middle"].append(loss)
+                else:
+                    position_losses["late"].append(loss)
+
+    # Compute perplexities
+    if not total_losses:
+        return {"error": "No valid losses computed"}
+
+    overall_loss = float(np.mean(total_losses))
+    overall_ppl = math.exp(overall_loss)
+
+    by_position: dict[str, float] = {}
+    for pos in ["early", "middle", "late"]:
+        if position_losses[pos]:
+            avg_loss = float(np.mean(position_losses[pos]))
+            by_position[pos] = math.exp(avg_loss)
+        else:
+            by_position[pos] = 0.0
+
+    return {
+        "overall_perplexity": overall_ppl,
+        "overall_loss": overall_loss,
+        "by_position": by_position,
+        "num_samples": min(len(texts), num_samples),
+        "num_valid_losses": len(total_losses),
+    }
+
+
 def main() -> None:
     """Entry point."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Evaluate TitansGPT or Qwen-Titans perplexity")
+    parser = argparse.ArgumentParser(
+        description="Evaluate TitansGPT, Qwen-Titans, or MLX-Titans perplexity"
+    )
     # Model selection
-    parser.add_argument("--qwen", action="store_true", help="Use Qwen-Titans instead of TitansGPT")
+    parser.add_argument("--qwen", action="store_true", help="Use Qwen-Titans (PyTorch)")
+    parser.add_argument("--mlx", action="store_true", help="Use MLX-Titans (Apple Silicon)")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2-0.5B", help="Qwen model name")
-    parser.add_argument("--titans_state", type=str, default=None, help="Path to Titans state for Qwen")
-    parser.add_argument("--memory_layers", type=str, default="12", help="Memory layer indices (comma-separated)")
-    parser.add_argument("--segment_len", type=int, default=256, help="Segment length for Qwen")
+    parser.add_argument(
+        "--titans_state", type=str, default=None, help="Path to Titans state for Qwen (PyTorch)"
+    )
+    parser.add_argument(
+        "--titans_weights",
+        type=str,
+        default=None,
+        help="Path to Titans weights for MLX (.npz or .safetensors)",
+    )
+    parser.add_argument(
+        "--memory_layers", type=str, default="12", help="Memory layer indices (comma-separated)"
+    )
+    parser.add_argument("--segment_len", type=int, default=256, help="Segment length")
 
     # TitansGPT args
     parser.add_argument("--checkpoint", type=str, default="out-titans/ckpt.pt")
 
     # Common args
-    parser.add_argument("--dataset", type=str, default="wikitext",
-                       choices=["shakespeare", "wikitext103", "openwebtext", "wikitext"])
-    parser.add_argument("--block_size", type=int, default=None,
-                       help="Override block size (default: use model's)")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="wikitext",
+        choices=["shakespeare", "wikitext103", "openwebtext", "wikitext"],
+    )
+    parser.add_argument(
+        "--block_size", type=int, default=None, help="Override block size (default: use model's)"
+    )
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_batches", type=int, default=100)
-    parser.add_argument("--num_samples", type=int, default=50, help="Number of samples for Qwen eval")
-    parser.add_argument("--device", type=str,
-                       default="cuda" if torch.cuda.is_available()
-                       else "mps" if torch.backends.mps.is_available()
-                       else "cpu")
+    parser.add_argument(
+        "--num_samples", type=int, default=50, help="Number of samples for Qwen eval"
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda"
+        if torch.cuda.is_available()
+        else "mps"
+        if torch.backends.mps.is_available()
+        else "cpu",
+    )
     parser.add_argument("--dtype", type=str, default="bfloat16")
 
     args = parser.parse_args()
     memory_layers = [int(x.strip()) for x in args.memory_layers.split(",")]
 
-    # Setup
+    # =========================================================================
+    # MLX-Titans evaluation (Apple Silicon)
+    # =========================================================================
+    if args.mlx:
+        from datasets import load_dataset
+
+        # Load text data
+        print(f"\nLoading {args.dataset} dataset...")
+        segment_len = args.segment_len
+
+        if args.dataset == "wikitext":
+            dataset = load_dataset("wikitext", "wikitext-103-v1", split="test")
+            all_text = "\n\n".join([t for t in dataset["text"] if t.strip()])
+
+            min_chars = segment_len * 8 * 4
+            texts = []
+            for i in range(0, len(all_text), min_chars):
+                chunk = all_text[i : i + min_chars]
+                if len(chunk) > segment_len * 2 * 4:
+                    texts.append(chunk)
+                if len(texts) >= args.num_samples:
+                    break
+            print(f"Created {len(texts)} long text chunks (~{min_chars} chars each)")
+        else:
+            dataset = load_dataset("wikitext", "wikitext-103-v1", split="test")
+            min_chars = segment_len * 8 * 4
+            texts = []
+            for i in range(
+                0, len("\n\n".join([t for t in dataset["text"] if t.strip()])), min_chars
+            ):
+                chunk = "\n\n".join([t for t in dataset["text"] if t.strip()])[i : i + min_chars]
+                if len(chunk) > segment_len * 2 * 4:
+                    texts.append(chunk)
+                if len(texts) >= args.num_samples:
+                    break
+
+        results = evaluate_mlx_perplexity(
+            model_name=args.model_name,
+            titans_weights=args.titans_weights,
+            memory_layers=memory_layers,
+            segment_len=segment_len,
+            texts=texts,
+            num_samples=args.num_samples,
+        )
+
+        # Print results
+        model_label = f"MLX-Titans ({args.model_name})"
+        print(f"\n{'=' * 60}")
+        print(f"PERPLEXITY EVALUATION: {model_label}")
+        print("=" * 60)
+
+        if "error" in results:
+            print(f"Error: {results['error']}")
+            return
+
+        print(f"\nOverall Perplexity: {results['overall_perplexity']:.2f}")
+        print(f"Overall Loss: {results['overall_loss']:.4f}")
+        print(f"Samples evaluated: {results['num_samples']}")
+        print(f"Valid losses: {results['num_valid_losses']}")
+
+        print("\nPerplexity by Position:")
+        for pos in ["early", "middle", "late"]:
+            ppl = results["by_position"].get(pos, 0)
+            if ppl > 0:
+                print(f"  {pos.capitalize():8s}: {ppl:.2f}")
+
+        early_ppl = results["by_position"].get("early", 0)
+        late_ppl = results["by_position"].get("late", 0)
+        if early_ppl > 0 and late_ppl > 0:
+            improvement = (early_ppl - late_ppl) / early_ppl * 100
+            print(f"\n  Improvement (early->late): {improvement:.1f}%")
+            if improvement > 0:
+                print("  ✓ Memory is helping with later positions")
+            else:
+                print("  ✗ Memory not showing benefit (may need more training)")
+
+        return
+
+    # Setup for PyTorch backends
     device = torch.device(args.device)
     device_type = "cuda" if "cuda" in args.device else "cpu"
 
     dtype_map = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
     ptdtype = dtype_map.get(args.dtype, torch.bfloat16)
-    ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+    ctx = (
+        nullcontext()
+        if device_type == "cpu"
+        else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+    )
 
     # =========================================================================
-    # Qwen-Titans evaluation
+    # Qwen-Titans evaluation (PyTorch)
     # =========================================================================
     if args.qwen:
         model, tokenizer, segment_len = load_qwen_model(
@@ -453,7 +734,9 @@ def main() -> None:
         )
 
         use_titans = args.titans_state is not None
-        model_name = f"Qwen-Titans ({args.model_name})" if use_titans else f"Base Qwen ({args.model_name})"
+        model_name = (
+            f"Qwen-Titans ({args.model_name})" if use_titans else f"Base Qwen ({args.model_name})"
+        )
 
         # Load text data from HuggingFace datasets
         print(f"\nLoading {args.dataset} dataset...")
@@ -464,12 +747,12 @@ def main() -> None:
             # Concatenate texts to create long sequences
             # WikiText articles are short, so we join them
             all_text = "\n\n".join([t for t in dataset["text"] if t.strip()])
-            
+
             # Split into chunks of ~8K tokens (~32K chars)
             min_chars = segment_len * 8 * 4  # 8 segments worth
             texts = []
             for i in range(0, len(all_text), min_chars):
-                chunk = all_text[i:i + min_chars]
+                chunk = all_text[i : i + min_chars]
                 if len(chunk) > segment_len * 2 * 4:  # At least 2 segments
                     texts.append(chunk)
                 if len(texts) >= args.num_samples:
@@ -483,13 +766,15 @@ def main() -> None:
                 data = np.memmap(val_path, dtype=np.uint16, mode="r")
                 # Convert to text - use longer chunks for proper eval
                 chunk_size = segment_len * 4  # 4 segments worth
-                texts = [tokenizer.decode(data[i:i+chunk_size].tolist()) 
-                         for i in range(0, min(len(data), args.num_samples * chunk_size), chunk_size)]
+                texts = [
+                    tokenizer.decode(data[i : i + chunk_size].tolist())
+                    for i in range(0, min(len(data), args.num_samples * chunk_size), chunk_size)
+                ]
             else:
                 print(f"Dataset {args.dataset} not found. Using wikitext.")
                 dataset = load_dataset("wikitext", "wikitext-103-v1", split="test")
                 min_chars = segment_len * 2 * 4
-                texts = [t for t in dataset["text"] if len(t) > min_chars][:args.num_samples]
+                texts = [t for t in dataset["text"] if len(t) > min_chars][: args.num_samples]
 
         print(f"Evaluating on {len(texts)} samples...")
 
@@ -519,12 +804,12 @@ def main() -> None:
 
         print("\nPerplexity by Position:")
         for pos in ["early", "middle", "late"]:
-            ppl = results['by_position'].get(pos, 0)
+            ppl = results["by_position"].get(pos, 0)
             if ppl > 0:
                 print(f"  {pos.capitalize():8s}: {ppl:.2f}")
 
-        early_ppl = results['by_position'].get('early', 0)
-        late_ppl = results['by_position'].get('late', 0)
+        early_ppl = results["by_position"].get("early", 0)
+        late_ppl = results["by_position"].get("late", 0)
         if early_ppl > 0 and late_ppl > 0:
             improvement = (early_ppl - late_ppl) / early_ppl * 100
             print(f"\n  Improvement (early->late): {improvement:.1f}%")

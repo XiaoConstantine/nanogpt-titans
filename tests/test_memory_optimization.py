@@ -63,10 +63,10 @@ def memory_weights():
     """Create sample memory MLP weights for testing."""
     B, C, H = 2, 64, 128
     return {
-        'layers.0.weight': torch.randn(B, H, C) * 0.02,
-        'layers.1.weight': torch.randn(B, C, H) * 0.02,
-        'layers.0.bias': torch.zeros(B, H),
-        'layers.1.bias': torch.zeros(B, C),
+        "layers.0.weight": torch.randn(B, H, C) * 0.02,
+        "layers.1.weight": torch.randn(B, C, H) * 0.02,
+        "layers.0.bias": torch.zeros(B, H),
+        "layers.1.bias": torch.zeros(B, C),
     }
 
 
@@ -75,10 +75,10 @@ def memory_momentum():
     """Create sample momentum state for testing."""
     B, C, H = 2, 64, 128
     return {
-        'layers.0.weight': torch.zeros(B, H, C),
-        'layers.1.weight': torch.zeros(B, C, H),
-        'layers.0.bias': torch.zeros(B, H),
-        'layers.1.bias': torch.zeros(B, C),
+        "layers.0.weight": torch.zeros(B, H, C),
+        "layers.1.weight": torch.zeros(B, C, H),
+        "layers.0.bias": torch.zeros(B, H),
+        "layers.1.bias": torch.zeros(B, C),
     }
 
 
@@ -95,8 +95,7 @@ class TestAggregatedGradientUpdate:
         values = torch.randn(B, T, C)
 
         new_weights, new_momentum = aggregated_gradient_memory_update(
-            keys, values, memory_weights, memory_momentum,
-            lr=0.01, mom_coef=0.9, decay=0.001
+            keys, values, memory_weights, memory_momentum, lr=0.01, mom_coef=0.9, decay=0.001
         )
 
         # Check all weights have same shapes
@@ -110,15 +109,14 @@ class TestAggregatedGradientUpdate:
         keys = torch.randn(B, T, C)
         values = torch.randn(B, T, C)
 
-        original_w0 = memory_weights['layers.0.weight'].clone()
+        original_w0 = memory_weights["layers.0.weight"].clone()
 
         new_weights, _ = aggregated_gradient_memory_update(
-            keys, values, memory_weights, memory_momentum,
-            lr=0.01, mom_coef=0.9, decay=0.001
+            keys, values, memory_weights, memory_momentum, lr=0.01, mom_coef=0.9, decay=0.001
         )
 
         # Weights should be different
-        assert not torch.allclose(new_weights['layers.0.weight'], original_w0)
+        assert not torch.allclose(new_weights["layers.0.weight"], original_w0)
 
     def test_momentum_accumulates(self, memory_weights, memory_momentum):
         """Test that momentum accumulates correctly."""
@@ -128,14 +126,12 @@ class TestAggregatedGradientUpdate:
 
         # First update
         _, new_momentum1 = aggregated_gradient_memory_update(
-            keys, values, memory_weights, memory_momentum,
-            lr=0.01, mom_coef=0.9, decay=0.001
+            keys, values, memory_weights, memory_momentum, lr=0.01, mom_coef=0.9, decay=0.001
         )
 
         # Momentum should no longer be zero
         assert not torch.allclose(
-            new_momentum1['layers.0.weight'],
-            torch.zeros_like(new_momentum1['layers.0.weight'])
+            new_momentum1["layers.0.weight"], torch.zeros_like(new_momentum1["layers.0.weight"])
         )
 
     def test_zero_lr_no_weight_change(self, memory_weights, memory_momentum):
@@ -144,15 +140,20 @@ class TestAggregatedGradientUpdate:
         keys = torch.randn(B, T, C)
         values = torch.randn(B, T, C)
 
-        original_w0 = memory_weights['layers.0.weight'].clone()
+        original_w0 = memory_weights["layers.0.weight"].clone()
 
         new_weights, _ = aggregated_gradient_memory_update(
-            keys, values, memory_weights, memory_momentum,
-            lr=0.0, mom_coef=0.9, decay=0.0  # No lr, no decay
+            keys,
+            values,
+            memory_weights,
+            memory_momentum,
+            lr=0.0,
+            mom_coef=0.9,
+            decay=0.0,  # No lr, no decay
         )
 
         # With lr=0 and decay=0, weights should be unchanged
-        torch.testing.assert_close(new_weights['layers.0.weight'], original_w0)
+        torch.testing.assert_close(new_weights["layers.0.weight"], original_w0)
 
     def test_high_decay_shrinks_weights(self, memory_weights, memory_momentum):
         """Test that high decay shrinks weights toward zero."""
@@ -161,16 +162,21 @@ class TestAggregatedGradientUpdate:
         values = torch.randn(B, T, C)
 
         # Set weights to known values
-        memory_weights['layers.0.weight'] = torch.ones(2, 128, 64)
+        memory_weights["layers.0.weight"] = torch.ones(2, 128, 64)
 
         new_weights, _ = aggregated_gradient_memory_update(
-            keys, values, memory_weights, memory_momentum,
-            lr=0.0, mom_coef=0.9, decay=0.5  # High decay, no lr
+            keys,
+            values,
+            memory_weights,
+            memory_momentum,
+            lr=0.0,
+            mom_coef=0.9,
+            decay=0.5,  # High decay, no lr
         )
 
         # Weights should shrink (multiplied by 0.5)
         expected = 0.5 * torch.ones(2, 128, 64)
-        torch.testing.assert_close(new_weights['layers.0.weight'], expected)
+        torch.testing.assert_close(new_weights["layers.0.weight"], expected)
 
     def test_without_bias(self):
         """Test update works without bias terms."""
@@ -179,22 +185,21 @@ class TestAggregatedGradientUpdate:
         values = torch.randn(B, T, C)
 
         weights = {
-            'layers.0.weight': torch.randn(B, H, C) * 0.02,
-            'layers.1.weight': torch.randn(B, C, H) * 0.02,
+            "layers.0.weight": torch.randn(B, H, C) * 0.02,
+            "layers.1.weight": torch.randn(B, C, H) * 0.02,
         }
         momentum = {
-            'layers.0.weight': torch.zeros(B, H, C),
-            'layers.1.weight': torch.zeros(B, C, H),
+            "layers.0.weight": torch.zeros(B, H, C),
+            "layers.1.weight": torch.zeros(B, C, H),
         }
 
         new_weights, _new_momentum = aggregated_gradient_memory_update(
-            keys, values, weights, momentum,
-            lr=0.01, mom_coef=0.9, decay=0.001
+            keys, values, weights, momentum, lr=0.01, mom_coef=0.9, decay=0.001
         )
 
-        assert 'layers.0.weight' in new_weights
-        assert 'layers.1.weight' in new_weights
-        assert 'layers.0.bias' not in new_weights
+        assert "layers.0.weight" in new_weights
+        assert "layers.1.weight" in new_weights
+        assert "layers.0.bias" not in new_weights
 
     def test_adaptive_tensor_params(self, memory_weights, memory_momentum):
         """Test update with adaptive tensor parameters."""
@@ -208,8 +213,13 @@ class TestAggregatedGradientUpdate:
         decay_tensor = torch.full((B, T, 1), 0.001)
 
         new_weights, _new_momentum = aggregated_gradient_memory_update(
-            keys, values, memory_weights, memory_momentum,
-            lr=lr_tensor, mom_coef=mom_tensor, decay=decay_tensor
+            keys,
+            values,
+            memory_weights,
+            memory_momentum,
+            lr=lr_tensor,
+            mom_coef=mom_tensor,
+            decay=decay_tensor,
         )
 
         # Should produce valid outputs
@@ -229,14 +239,17 @@ class TestAggregatedGradientUpdate:
         lr_tensor[1] = 0.001
 
         new_weights, _ = aggregated_gradient_memory_update(
-            keys, values, memory_weights, memory_momentum,
-            lr=lr_tensor, mom_coef=0.9, decay=0.001
+            keys, values, memory_weights, memory_momentum, lr=lr_tensor, mom_coef=0.9, decay=0.001
         )
 
         # First batch should have larger weight changes
         # (This is approximate due to aggregation)
-        w0_change_b0 = (new_weights['layers.0.weight'][0] - memory_weights['layers.0.weight'][0]).abs().mean()
-        w0_change_b1 = (new_weights['layers.0.weight'][1] - memory_weights['layers.0.weight'][1]).abs().mean()
+        w0_change_b0 = (
+            (new_weights["layers.0.weight"][0] - memory_weights["layers.0.weight"][0]).abs().mean()
+        )
+        w0_change_b1 = (
+            (new_weights["layers.0.weight"][1] - memory_weights["layers.0.weight"][1]).abs().mean()
+        )
 
         # With higher lr, expect larger changes (not always true due to gradient direction)
         # Just verify both batches updated
@@ -252,12 +265,11 @@ class TestAggregatedGradientUpdate:
         values = torch.randn(B, T, C) * 1e-6
 
         new_weights, _new_momentum = aggregated_gradient_memory_update(
-            keys, values, memory_weights, memory_momentum,
-            lr=0.01, mom_coef=0.9, decay=0.001
+            keys, values, memory_weights, memory_momentum, lr=0.01, mom_coef=0.9, decay=0.001
         )
 
-        assert not torch.isnan(new_weights['layers.0.weight']).any()
-        assert not torch.isinf(new_weights['layers.0.weight']).any()
+        assert not torch.isnan(new_weights["layers.0.weight"]).any()
+        assert not torch.isinf(new_weights["layers.0.weight"]).any()
 
 
 class TestChunkedGradientUpdate:
@@ -276,22 +288,21 @@ class TestChunkedGradientUpdate:
         momentum2 = {k: v.clone() for k, v in memory_momentum.items()}
 
         new_w1, _ = aggregated_gradient_memory_update(
-            keys, values, weights1, momentum1,
-            lr=0.01, mom_coef=0.9, decay=0.001
+            keys, values, weights1, momentum1, lr=0.01, mom_coef=0.9, decay=0.001
         )
 
         new_w2, _ = chunked_gradient_memory_update(
-            keys, values, weights2, momentum2,
-            lr=0.01, mom_coef=0.9, decay=0.001,
-            chunk_size=16
+            keys, values, weights2, momentum2, lr=0.01, mom_coef=0.9, decay=0.001, chunk_size=16
         )
 
         # Results should be similar (not exact due to momentum approximation)
         for name in weights1:
             torch.testing.assert_close(
-                new_w1[name], new_w2[name],
-                rtol=0.1, atol=0.01,
-                msg=f"Chunked and aggregated differ for {name}"
+                new_w1[name],
+                new_w2[name],
+                rtol=0.1,
+                atol=0.01,
+                msg=f"Chunked and aggregated differ for {name}",
             )
 
 
@@ -305,9 +316,9 @@ class TestAdaptiveMemoryParameters:
         """Test adaptive projection layers are created."""
         memory = NeuralMemory(small_config)
 
-        assert hasattr(memory, 'to_lr')
-        assert hasattr(memory, 'to_momentum')
-        assert hasattr(memory, 'to_decay')
+        assert hasattr(memory, "to_lr")
+        assert hasattr(memory, "to_momentum")
+        assert hasattr(memory, "to_decay")
         assert isinstance(memory.to_lr, nn.Linear)
         assert isinstance(memory.to_momentum, nn.Linear)
         assert isinstance(memory.to_decay, nn.Linear)
@@ -316,9 +327,9 @@ class TestAdaptiveMemoryParameters:
         """Test adaptive projections are not created when disabled."""
         memory = NeuralMemory(small_config_non_adaptive)
 
-        assert not hasattr(memory, 'to_lr')
-        assert not hasattr(memory, 'to_momentum')
-        assert not hasattr(memory, 'to_decay')
+        assert not hasattr(memory, "to_lr")
+        assert not hasattr(memory, "to_momentum")
+        assert not hasattr(memory, "to_decay")
 
     def test_projection_output_shapes(self, small_config):
         """Test projection layers produce correct output shapes."""
@@ -356,19 +367,21 @@ class TestAdaptiveMemoryParameters:
         """Test bias is initialized for reasonable defaults when using TitansGPT."""
         model = TitansGPT(small_config)
 
-        for block in model.transformer['h']:
+        for block in model.transformer["h"]:
             if block.has_memory:
                 mem = block.memory
                 # Check bias values
                 assert abs(mem.to_lr.bias.item() - 0.0) < 1e-5, "to_lr bias should be ~0"
-                assert abs(mem.to_momentum.bias.item() - 2.0) < 1e-5, "to_momentum bias should be ~2"
+                assert abs(mem.to_momentum.bias.item() - 2.0) < 1e-5, (
+                    "to_momentum bias should be ~2"
+                )
                 assert abs(mem.to_decay.bias.item() - (-4.0)) < 1e-5, "to_decay bias should be ~-4"
 
     def test_default_parameter_values(self, small_config):
         """Test default adaptive parameter values with zero input."""
         model = TitansGPT(small_config)
 
-        for block in model.transformer['h']:
+        for block in model.transformer["h"]:
             if block.has_memory:
                 mem = block.memory
                 x = torch.zeros(1, 1, small_config.n_embd)
@@ -383,7 +396,9 @@ class TestAdaptiveMemoryParameters:
                 # decay: sigmoid(-4) ≈ 0.018
                 assert abs(lr.item() - 0.005) < 0.001, f"Expected lr ~0.005, got {lr.item()}"
                 assert abs(mom.item() - 0.88) < 0.02, f"Expected momentum ~0.88, got {mom.item()}"
-                assert abs(decay.item() - 0.018) < 0.005, f"Expected decay ~0.018, got {decay.item()}"
+                assert abs(decay.item() - 0.018) < 0.005, (
+                    f"Expected decay ~0.018, got {decay.item()}"
+                )
 
     def test_set_adaptive_toggle(self, small_config):
         """Test set_adaptive method toggles adaptive mode."""
@@ -413,13 +428,15 @@ class TestAdaptiveMemoryParameters:
         # Modify projection weights to produce distinct outputs
         with torch.no_grad():
             memory.to_lr.weight.fill_(0.1)  # Non-zero weight
-            memory.to_lr.bias.fill_(5.0)    # High bias -> high sigmoid -> high lr
+            memory.to_lr.bias.fill_(5.0)  # High bias -> high sigmoid -> high lr
 
         # Update should use the high learning rate
         new_state = memory.update(x, state)
 
         # With high lr, weights should change significantly
-        weight_change = (new_state.weights['layers.0.weight'] - state.weights['layers.0.weight']).abs().mean()
+        weight_change = (
+            (new_state.weights["layers.0.weight"] - state.weights["layers.0.weight"]).abs().mean()
+        )
         assert weight_change > 1e-4, "Adaptive lr should cause weight changes"
 
 
@@ -470,7 +487,7 @@ class TestMemoryOptimizationIntegration:
         assert loss.item() > 0
 
         # Adaptive projections should exist and have requires_grad=True
-        for block in model.transformer['h']:
+        for block in model.transformer["h"]:
             if block.has_memory:
                 assert block.memory.to_lr.weight.requires_grad
                 assert block.memory.to_momentum.weight.requires_grad
@@ -543,8 +560,9 @@ class TestMemoryOptimizationIntegration:
         expected_extra = 3 * (small_config.n_embd + 1)  # 3 projections
         actual_extra = params_adaptive - params_fixed
 
-        assert actual_extra == expected_extra, \
+        assert actual_extra == expected_extra, (
             f"Expected {expected_extra} extra params, got {actual_extra}"
+        )
 
 
 # --- Edge Cases ---

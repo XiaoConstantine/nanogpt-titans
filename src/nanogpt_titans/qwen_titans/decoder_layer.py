@@ -13,32 +13,34 @@ Key fixes for pre-trained model compatibility:
 
 from __future__ import annotations
 
-from typing import Optional, Tuple, Any, Union
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from nanogpt_titans.model import MemoryState
-from nanogpt_titans.qwen_titans.config import TitansQwenConfig
 from nanogpt_titans.qwen_titans.memory_adapter import (
-    NeuralMemoryAdapter,
-    ContinuumMemorySystem,
     ContinuumMemoryState,
-    SelfModifyingLinear,
+    ContinuumMemorySystem,
+    NeuralMemoryAdapter,
     SelfModifyingGate,
+    SelfModifyingLinear,
     WarmStartEncoder,
 )
+
+if TYPE_CHECKING:
+    from nanogpt_titans.model import MemoryState
+    from nanogpt_titans.qwen_titans.config import TitansQwenConfig
 
 
 class PositionDependentGate(nn.Module):
     """
     Position-dependent gate that produces per-token gate values.
-    
+
     Unlike global gates, this allows the model to decide per-token
     whether to use memory, which is critical for tasks like needle-in-haystack.
     """
-    
+
     def __init__(self, dim: int, init_bias: float = -2.0) -> None:
         super().__init__()
         # Small MLP: hidden_states -> gate value per token
@@ -53,14 +55,14 @@ class PositionDependentGate(nn.Module):
         nn.init.zeros_(self.gate_mlp[0].bias)
         nn.init.normal_(self.gate_mlp[2].weight, std=0.01)
         nn.init.constant_(self.gate_mlp[2].bias, init_bias)  # sigmoid(-2) ≈ 0.12
-        
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
         Compute per-token gate values.
-        
+
         Args:
             hidden_states: [B, T, C]
-            
+
         Returns:
             gate values: [B, T, 1] in range (0, 1)
         """
@@ -141,7 +143,7 @@ class TitansQwenDecoderLayer(nn.Module):
         # Learned scale: start at sigmoid(0) = 0.5 for stronger gradients
         # Conservative init (-2.0 -> 0.12) caused gradient starvation
         self.mem_scale = nn.Parameter(torch.tensor(0.0))  # sigmoid(0) = 0.5
-        
+
         # === FIX 2: Position-dependent gate (per-token, not global) ===
         # This allows the model to decide per-token whether to use memory
         if titans_config.use_self_mod_gate:
@@ -168,16 +170,16 @@ class TitansQwenDecoderLayer(nn.Module):
 
         # Flag to control memory updates
         self.update_memory = True
-        
+
         # Flag to completely disable memory (for no-op baseline testing)
         self.memory_enabled = True
 
         # Store memory state during forward
-        self._current_memory_state: Optional[Union[MemoryState, ContinuumMemoryState]] = None
-        self._updated_memory_state: Optional[Union[MemoryState, ContinuumMemoryState]] = None
+        self._current_memory_state: MemoryState | ContinuumMemoryState | None = None
+        self._updated_memory_state: MemoryState | ContinuumMemoryState | None = None
 
         # Internal loss for self-supervised memory signal
-        self._internal_loss: Optional[torch.Tensor] = None
+        self._internal_loss: torch.Tensor | None = None
 
         # Cache isinstance checks for faster forward pass
         self._use_self_mod_proj = isinstance(self.mem_proj, SelfModifyingLinear)
@@ -198,16 +200,16 @@ class TitansQwenDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Any] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Any | None = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        memory_state: Optional[Union[MemoryState, ContinuumMemoryState]] = None,
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        memory_state: MemoryState | ContinuumMemoryState | None = None,
         **kwargs,
-    ) -> Tuple[torch.Tensor, ...]:
+    ) -> tuple[torch.Tensor, ...]:
         """
         Forward with gated memory integration.
 
@@ -232,7 +234,7 @@ class TitansQwenDecoderLayer(nn.Module):
         Returns:
             Tuple of (hidden_states, ...) matching original layer format
         """
-        B, T, C = hidden_states.shape
+        B, T, _C = hidden_states.shape
         device = hidden_states.device
 
         # 1. Forward through original layer (UNCHANGED - preserves pre-trained behavior)
@@ -261,7 +263,7 @@ class TitansQwenDecoderLayer(nn.Module):
             self._updated_memory_state = None
             self._internal_loss = None
             if other_outputs:
-                return (attn_output,) + other_outputs
+                return (attn_output, *other_outputs)
             return attn_output
 
         # Use provided state or stored state
@@ -273,7 +275,7 @@ class TitansQwenDecoderLayer(nn.Module):
             memory_state = self.memory.init_state(B, device)
 
             # Warm start: initialize memory from input
-            if self.warm_start is not None and T >= self.config.warm_start_prefix_len:
+            if self.warm_start is not None and self.config.warm_start_prefix_len <= T:
                 _ = self.warm_start(hidden_states)
                 # TODO: Use warm start output to initialize memory state
 
@@ -327,18 +329,18 @@ class TitansQwenDecoderLayer(nn.Module):
 
         # Return in HuggingFace-compatible format
         if other_outputs:
-            return (output,) + other_outputs
+            return (output, *other_outputs)
         return attn_output if not self.memory_enabled else output
 
-    def set_memory_state(self, state: Optional[Union[MemoryState, ContinuumMemoryState]]) -> None:
+    def set_memory_state(self, state: MemoryState | ContinuumMemoryState | None) -> None:
         """Set the memory state to use for next forward pass."""
         self._current_memory_state = state
 
-    def get_memory_state(self) -> Optional[Union[MemoryState, ContinuumMemoryState]]:
+    def get_memory_state(self) -> MemoryState | ContinuumMemoryState | None:
         """Get the memory state after last forward pass."""
         return self._updated_memory_state
 
-    def get_internal_loss(self) -> Optional[torch.Tensor]:
+    def get_internal_loss(self) -> torch.Tensor | None:
         """Get the internal loss for this layer (if enabled)."""
         return self._internal_loss
 
@@ -359,19 +361,19 @@ class TitansQwenDecoderLayer(nn.Module):
         else:
             stats["gate_bias"] = self.gate[0].bias.item()
         return stats
-    
+
     def set_memory_enabled(self, enabled: bool) -> None:
         """
         Enable or disable memory completely (for no-op baseline testing).
-        
+
         When disabled, the layer acts exactly like the original Qwen layer.
         """
         self.memory_enabled = enabled
-        
+
     def set_noop_mode(self) -> None:
         """
         Set layer to complete no-op mode for baseline testing.
-        
+
         This ensures the wrapper doesn't affect model output at all.
         Use this to verify the wrapper itself doesn't cause regression.
         """
@@ -391,7 +393,6 @@ class TitansQwenDecoderLayer(nn.Module):
         Returns:
             Scalar loss tensor
         """
-        import torch.nn.functional as F
 
         # Get the underlying NeuralMemory (handle CMS case)
         if self._use_cms:
@@ -409,7 +410,7 @@ class TitansQwenDecoderLayer(nn.Module):
         x = x / x_norm * torch.clamp(x_norm, max=max_input_norm)
 
         # Project to keys and values (what memory would store)
-        keys = mem.key_proj(x)      # [B, T, C]
+        keys = mem.key_proj(x)  # [B, T, C]
         values = mem.value_proj(x)  # [B, T, C]
 
         # Clip projected values for stability

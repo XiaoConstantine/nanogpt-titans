@@ -23,7 +23,6 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-
 # =============================================================================
 # Compile-friendly Memory State (NamedTuples instead of dicts)
 # =============================================================================
@@ -36,10 +35,12 @@ class MemoryWeights(NamedTuple):
     Using NamedTuple instead of dict avoids graph breaks in torch.compile.
     Supports 2-layer MLP with optional bias.
     """
+
     w0: torch.Tensor  # [B, H, C] - layer 0 weight
     b0: torch.Tensor | None  # [B, H] - layer 0 bias (optional)
     w1: torch.Tensor  # [B, C, H] - layer 1 weight
     b1: torch.Tensor | None  # [B, C] - layer 1 bias (optional)
+
 
 # FlexAttention imports (available in PyTorch 2.5+)
 # Works on L4, A100, H100. Fails on T4 (Triton register limit).
@@ -82,6 +83,7 @@ _AGGREGATED_UPDATE_AVAILABLE = False
 aggregated_gradient_memory_update = None  # type: ignore[assignment]
 try:
     from nanogpt_titans.triton_memory_fused import aggregated_gradient_memory_update
+
     _AGGREGATED_UPDATE_AVAILABLE = True
 except ImportError:
     pass
@@ -91,6 +93,7 @@ _BITSANDBYTES_AVAILABLE = False
 bnb_AdamW8bit = None  # type: ignore[assignment]
 try:
     from bitsandbytes.optim import AdamW8bit as bnb_AdamW8bit
+
     _BITSANDBYTES_AVAILABLE = True
 except ImportError:
     pass
@@ -423,7 +426,9 @@ class NeuralMemory(nn.Module):
 
         for name, param in self.memory_mlp.named_parameters():
             # Expand weights to [B, *param_shape] and clone - ensure contiguous
-            expanded = param.detach().unsqueeze(0).expand(batch_size, *param.shape).clone().contiguous()
+            expanded = (
+                param.detach().unsqueeze(0).expand(batch_size, *param.shape).clone().contiguous()
+            )
             weights[name] = expanded.to(device)
             # Last momentum starts at zero - already contiguous
             last_momentum[name] = torch.zeros_like(expanded)
@@ -471,7 +476,7 @@ class NeuralMemory(nn.Module):
         - Uses fixed hyperparameters (memory_lr, memory_momentum, memory_decay)
         - Simpler, may be more stable for debugging
         """
-        if enabled and not hasattr(self, 'to_lr'):
+        if enabled and not hasattr(self, "to_lr"):
             raise ValueError(
                 "Adaptive mode requires projection layers. "
                 "Set adaptive_memory=True in config when creating the model."
@@ -504,20 +509,20 @@ class NeuralMemory(nn.Module):
             Gradients {name: [B, T, *param_shape]} or None if keys don't match expected structure
         """
         # Check for expected 2-layer MLP structure (with or without bias)
-        required_keys = {'layers.0.weight', 'layers.1.weight'}
+        required_keys = {"layers.0.weight", "layers.1.weight"}
         if not required_keys.issubset(weights.keys()):
             return None  # Fall back to vmap
 
         _B, _T, C = keys.shape
 
         # Extract weights (PyTorch Linear: weight is [out, in])
-        W0 = weights['layers.0.weight']  # [B, H, C]
-        W1 = weights['layers.1.weight']  # [B, C, H]
+        W0 = weights["layers.0.weight"]  # [B, H, C]
+        W1 = weights["layers.1.weight"]  # [B, C, H]
 
         # Bias is optional
-        has_bias = 'layers.0.bias' in weights
-        b0 = weights.get('layers.0.bias')  # [B, H] or None
-        b1 = weights.get('layers.1.bias')  # [B, C] or None
+        has_bias = "layers.0.bias" in weights
+        b0 = weights.get("layers.0.bias")  # [B, H] or None
+        b1 = weights.get("layers.1.bias")  # [B, C] or None
 
         # Forward pass using bmm (faster than einsum)
         # h1_pre = keys @ W0.T = [B, T, C] @ [B, C, H] = [B, T, H]
@@ -539,7 +544,7 @@ class NeuralMemory(nn.Module):
 
         # Backprop through output layer using einsum (memory-efficient)
         # dW1[b,t,c,h] = d_pred[b,t,c] * h1[b,t,h]
-        dW1 = torch.einsum('btc,bth->btch', d_pred, h1)  # [B, T, C, H]
+        dW1 = torch.einsum("btc,bth->btch", d_pred, h1)  # [B, T, C, H]
 
         # dh1 = d_pred @ W1 = [B, T, C] @ [B, C, H] = [B, T, H]
         dh1 = torch.bmm(d_pred, W1)
@@ -550,16 +555,16 @@ class NeuralMemory(nn.Module):
 
         # Backprop through input layer using einsum (memory-efficient)
         # dW0[b,t,h,c] = dh1_pre[b,t,h] * keys[b,t,c]
-        dW0 = torch.einsum('bth,btc->bthc', dh1_pre, keys)  # [B, T, H, C]
+        dW0 = torch.einsum("bth,btc->bthc", dh1_pre, keys)  # [B, T, H, C]
 
         # Build result dict
         result = {
-            'layers.0.weight': dW0,
-            'layers.1.weight': dW1,
+            "layers.0.weight": dW0,
+            "layers.1.weight": dW1,
         }
         if has_bias:
-            result['layers.0.bias'] = dh1_pre  # [B, T, H]
-            result['layers.1.bias'] = d_pred   # [B, T, C]
+            result["layers.0.bias"] = dh1_pre  # [B, T, H]
+            result["layers.1.bias"] = d_pred  # [B, T, C]
 
         return result
 
@@ -594,12 +599,11 @@ class NeuralMemory(nn.Module):
         Returns:
             output: [B, T, C]
         """
-        W0 = weights['layers.0.weight']  # [B, H, C]
-        W1 = weights['layers.1.weight']  # [B, C, H]
+        W0 = weights["layers.0.weight"]  # [B, H, C]
+        W1 = weights["layers.1.weight"]  # [B, C, H]
 
-        has_bias = 'layers.0.bias' in weights
-        b0 = weights.get('layers.0.bias')  # [B, H] or None
-        b1 = weights.get('layers.1.bias')  # [B, C] or None
+        b0 = weights.get("layers.0.bias")  # [B, H] or None
+        b1 = weights.get("layers.1.bias")  # [B, C] or None
 
         # Layer 0: h1 = silu(x @ W0.T + b0)
         # x: [B, T, C], W0: [B, H, C] -> W0.T: [B, C, H]
@@ -710,8 +714,8 @@ class NeuralMemory(nn.Module):
             # Per-token adaptive parameters via learned projections
             # Each projection outputs [B, T, 1], passed through sigmoid
             adaptive_lr = torch.sigmoid(self.to_lr(x_detached)) * self.lr_max  # [B, T, 1]
-            adaptive_momentum = torch.sigmoid(self.to_momentum(x_detached))     # [B, T, 1]
-            adaptive_decay = torch.sigmoid(self.to_decay(x_detached))           # [B, T, 1]
+            adaptive_momentum = torch.sigmoid(self.to_momentum(x_detached))  # [B, T, 1]
+            adaptive_decay = torch.sigmoid(self.to_decay(x_detached))  # [B, T, 1]
             lr_param = adaptive_lr
             mom_param = adaptive_momentum
             decay_param = adaptive_decay
@@ -754,6 +758,7 @@ class NeuralMemory(nn.Module):
         if all_grads is None:
             # Fallback: vmap for non-standard MLP depths or unexpected weight structure
             if self._batched_grad_fn is None:
+
                 def single_token_loss(
                     params: dict[str, torch.Tensor], k: torch.Tensor, v: torch.Tensor
                 ) -> torch.Tensor:
@@ -780,9 +785,7 @@ class NeuralMemory(nn.Module):
         # Check if we can use the batched Triton kernel (single kernel for all params)
         first_grad = next(iter(all_grads.values()))
         use_batched = (
-            _TRITON_AVAILABLE
-            and first_grad.is_cuda
-            and triton_batched_weight_update is not None
+            _TRITON_AVAILABLE and first_grad.is_cuda and triton_batched_weight_update is not None
         )
 
         if use_batched:
@@ -857,10 +860,7 @@ class NeuralMemory(nn.Module):
                 new_weights[name] = updated_weights.detach().contiguous()
 
         # Clamp all weights for numerical stability (covers all code paths)
-        new_weights = {
-            name: torch.clamp(w, min=-10.0, max=10.0)
-            for name, w in new_weights.items()
-        }
+        new_weights = {name: torch.clamp(w, min=-10.0, max=10.0) for name, w in new_weights.items()}
 
         return MemoryState(
             weights=new_weights,
@@ -1259,7 +1259,7 @@ class TitansGPT(nn.Module):
                 if module.to_lr.bias is not None:
                     nn.init.zeros_(module.to_lr.bias)  # sigmoid(0)=0.5 -> lr starts at 0.5*lr_max
                     nn.init.constant_(module.to_momentum.bias, 2.0)  # sigmoid(2)≈0.88
-                    nn.init.constant_(module.to_decay.bias, -4.0)    # sigmoid(-4)≈0.018
+                    nn.init.constant_(module.to_decay.bias, -4.0)  # sigmoid(-4)≈0.018
             case nn.Linear():
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
                 if module.bias is not None:

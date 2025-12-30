@@ -20,6 +20,7 @@ from nanogpt_titans.model import (
 
 # --- Fixtures ---
 
+
 @pytest.fixture
 def small_config():
     """Small config for fast testing."""
@@ -45,6 +46,7 @@ def model(small_config):
 
 # --- Parallel Scan Tests ---
 
+
 class TestParallelScan:
     """Tests for parallel_scan_log and parallel_momentum."""
 
@@ -61,7 +63,7 @@ class TestParallelScan:
         expected = torch.zeros_like(tokens)
         expected[:, 0] = tokens[:, 0]
         for t in range(1, T):
-            expected[:, t] = gates[:, t:t+1] * expected[:, t-1] + tokens[:, t]
+            expected[:, t] = gates[:, t : t + 1] * expected[:, t - 1] + tokens[:, t]
 
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
@@ -78,7 +80,9 @@ class TestParallelScan:
         expected = torch.zeros_like(surprises)
         expected[:, 0] = (1 - momentum_coef) * surprises[:, 0]
         for t in range(1, T):
-            expected[:, t] = momentum_coef * expected[:, t-1] + (1 - momentum_coef) * surprises[:, t]
+            expected[:, t] = (
+                momentum_coef * expected[:, t - 1] + (1 - momentum_coef) * surprises[:, t]
+            )
 
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
@@ -106,6 +110,7 @@ class TestParallelScan:
 
 
 # --- Memory Causality Tests ---
+
 
 class TestMemoryCausality:
     """Tests to ensure memory doesn't leak future information."""
@@ -148,8 +153,8 @@ class TestMemoryCausality:
 
         # Create input where future tokens have distinct pattern
         x = torch.zeros(B, T, dtype=torch.long)
-        x[:, :T//2] = 1  # First half: token 1
-        x[:, T//2:] = 2  # Second half: token 2
+        x[:, : T // 2] = 1  # First half: token 1
+        x[:, T // 2 :] = 2  # Second half: token 2
 
         # Get output
         model.eval()
@@ -170,11 +175,12 @@ class TestMemoryCausality:
             logits_modified[:, 0],
             rtol=1e-5,
             atol=1e-5,
-            msg="Position 0 output changed when future tokens were modified - causality violation!"
+            msg="Position 0 output changed when future tokens were modified - causality violation!",
         )
 
 
 # --- Model Forward/Backward Tests ---
+
 
 class TestModelForwardBackward:
     """Tests for model forward and backward passes."""
@@ -237,6 +243,7 @@ class TestModelForwardBackward:
 
 # --- Attention Tests ---
 
+
 class TestCausalSelfAttention:
     """Tests for attention mechanism."""
 
@@ -276,6 +283,7 @@ class TestCausalSelfAttention:
 
 
 # --- Memory State Tests ---
+
 
 class TestMemoryState:
     """Tests for memory state management."""
@@ -317,6 +325,7 @@ class TestMemoryState:
 
 
 # --- Integration Tests ---
+
 
 class TestIntegration:
     """Integration tests for complete workflows."""
@@ -373,6 +382,7 @@ class TestIntegration:
 
 
 # --- Edge Cases ---
+
 
 class TestEdgeCases:
     """Tests for edge cases and potential failure modes."""

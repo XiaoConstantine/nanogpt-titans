@@ -49,6 +49,7 @@ def config():
 
 # --- Eq (12): Associative Memory Loss ---
 
+
 class TestAssociativeMemoryLoss:
     """
     Paper Eq (12): ℓ(M; x) = ‖M(k) - v‖²
@@ -91,12 +92,13 @@ class TestAssociativeMemoryLoss:
 
         # Weights should have changed
         for name in state.weights:
-            assert not torch.allclose(
-                state.weights[name], new_state.weights[name]
-            ), f"Weight {name} unchanged after update"
+            assert not torch.allclose(state.weights[name], new_state.weights[name]), (
+                f"Weight {name} unchanged after update"
+            )
 
 
 # --- Eq (10): Surprise with Momentum ---
+
 
 class TestSurpriseWithMomentum:
     """
@@ -176,8 +178,7 @@ class TestSurpriseWithMomentum:
         # Momentum should be non-zero
         for name in state1.last_momentum:
             assert not torch.allclose(
-                state1.last_momentum[name],
-                torch.zeros_like(state1.last_momentum[name])
+                state1.last_momentum[name], torch.zeros_like(state1.last_momentum[name])
             ), "Momentum should be non-zero after update"
 
         # Second segment should use previous momentum
@@ -189,6 +190,7 @@ class TestSurpriseWithMomentum:
 
 
 # --- Eq (11): Weight Update with Decay ---
+
 
 class TestWeightUpdateWithDecay:
     """
@@ -206,9 +208,7 @@ class TestWeightUpdateWithDecay:
         B, T, C = 2, config.segment_len, config.n_embd
 
         state = memory.init_state(B, torch.device("cpu"))
-        initial_weight_norm = sum(
-            w.norm().item() for w in state.weights.values()
-        )
+        initial_weight_norm = sum(w.norm().item() for w in state.weights.values())
 
         # With zero surprise, weights should decay
         # Create input that produces near-zero gradients (memory already fits well)
@@ -231,8 +231,8 @@ class TestWeightUpdateWithDecay:
         """Verify learning rate scales the surprise contribution."""
         # Create two memories with different learning rates
         # Disable adaptive_memory to test fixed memory_lr
-        config1 = TitansConfig(**{**vars(config), 'memory_lr': 0.01, 'adaptive_memory': False})
-        config2 = TitansConfig(**{**vars(config), 'memory_lr': 0.1, 'adaptive_memory': False})
+        config1 = TitansConfig(**{**vars(config), "memory_lr": 0.01, "adaptive_memory": False})
+        config2 = TitansConfig(**{**vars(config), "memory_lr": 0.1, "adaptive_memory": False})
 
         memory1 = NeuralMemory(config1)
         memory2 = NeuralMemory(config2)
@@ -256,12 +256,10 @@ class TestWeightUpdateWithDecay:
 
         # Higher LR should cause larger weight changes
         change1 = sum(
-            (new_state1.weights[n] - state1.weights[n]).abs().mean().item()
-            for n in state1.weights
+            (new_state1.weights[n] - state1.weights[n]).abs().mean().item() for n in state1.weights
         )
         change2 = sum(
-            (new_state2.weights[n] - state2.weights[n]).abs().mean().item()
-            for n in state2.weights
+            (new_state2.weights[n] - state2.weights[n]).abs().mean().item() for n in state2.weights
         )
 
         # LR ratio is 10x, so change2 should be larger
@@ -269,6 +267,7 @@ class TestWeightUpdateWithDecay:
 
 
 # --- Memory Retrieval Causality ---
+
 
 class TestMemoryRetrievalCausality:
     """
@@ -327,6 +326,7 @@ class TestMemoryRetrievalCausality:
 
 # --- MAC Architecture Tests ---
 
+
 class TestMACArchitecture:
     """
     Paper's MAC (Memory as Context) architecture:
@@ -373,6 +373,7 @@ class TestMACArchitecture:
 
 # --- Full Sequence Processing Tests ---
 
+
 class TestSequenceProcessing:
     """Tests for processing sequences through the full model."""
 
@@ -411,6 +412,7 @@ class TestSequenceProcessing:
 
 # --- Numerical Stability Tests ---
 
+
 class TestNumericalStability:
     """Tests for numerical stability of the algorithm."""
 
@@ -423,14 +425,16 @@ class TestNumericalStability:
 
         # Various input patterns
         for x in [
-            torch.randn(B, T, C),           # Normal
-            torch.randn(B, T, C) * 0.001,    # Small
-            torch.randn(B, T, C) * 100,      # Large
-            torch.zeros(B, T, C),            # Zero
+            torch.randn(B, T, C),  # Normal
+            torch.randn(B, T, C) * 0.001,  # Small
+            torch.randn(B, T, C) * 100,  # Large
+            torch.zeros(B, T, C),  # Zero
         ]:
             new_state = memory.update(x, state)
             for name, w in new_state.weights.items():
-                assert not torch.isnan(w).any(), f"NaN in weights after update with {x.abs().mean()}"
+                assert not torch.isnan(w).any(), (
+                    f"NaN in weights after update with {x.abs().mean()}"
+                )
             for name, m in new_state.last_momentum.items():
                 assert not torch.isnan(m).any(), f"NaN in momentum after update"
 
@@ -454,6 +458,7 @@ class TestNumericalStability:
 
 
 # --- Ablation-Inspired Tests ---
+
 
 class TestAblationComponents:
     """

@@ -164,11 +164,11 @@ def get_peak_tflops(device_type: str, _dtype: str) -> float:
     """Get theoretical peak TFLOPS for common GPUs."""
     # BF16/FP16 tensor core peaks (approximate)
     gpu_peaks = {
-        "L4": 242,      # NVIDIA L4
-        "T4": 65,       # NVIDIA T4
-        "A100": 312,    # NVIDIA A100 (BF16)
-        "H100": 990,    # NVIDIA H100 (BF16)
-        "RTX4090": 330, # RTX 4090
+        "L4": 242,  # NVIDIA L4
+        "T4": 65,  # NVIDIA T4
+        "A100": 312,  # NVIDIA A100 (BF16)
+        "H100": 990,  # NVIDIA H100 (BF16)
+        "RTX4090": 330,  # RTX 4090
     }
 
     if device_type != "cuda":
@@ -176,6 +176,7 @@ def get_peak_tflops(device_type: str, _dtype: str) -> float:
 
     # Try to detect GPU
     import torch
+
     if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(0)
         for key, peak in gpu_peaks.items():
@@ -304,7 +305,9 @@ def train(config: TrainConfig) -> None:
         checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
         # Use saved model config as base
         model_config = checkpoint["model_config"]
-        print(f"  Restored model config: n_layer={model_config.n_layer}, n_embd={model_config.n_embd}")
+        print(
+            f"  Restored model config: n_layer={model_config.n_layer}, n_embd={model_config.n_embd}"
+        )
 
         state_dict = checkpoint["model"]
         # Fix state dict if compiled
@@ -314,7 +317,9 @@ def train(config: TrainConfig) -> None:
                 state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
 
         # Check if checkpoint actually has adaptive memory weights (source of truth)
-        ckpt_has_adaptive = any("to_lr" in k or "to_momentum" in k or "to_decay" in k for k in state_dict)
+        ckpt_has_adaptive = any(
+            "to_lr" in k or "to_momentum" in k or "to_decay" in k for k in state_dict
+        )
         upgrade_to_adaptive = config.adaptive_memory and not ckpt_has_adaptive
 
         if upgrade_to_adaptive:
@@ -362,8 +367,10 @@ def train(config: TrainConfig) -> None:
         # Check for optimizer type mismatch (e.g., resuming with 8-bit when saved with 32-bit)
         saved_8bit = checkpoint.get("use_8bit_optimizer", False)
         if saved_8bit != config.use_8bit_optimizer:
-            print(f"  Skipping optimizer state (type mismatch: saved={'8-bit' if saved_8bit else '32-bit'}, "
-                  f"current={'8-bit' if config.use_8bit_optimizer else '32-bit'})")
+            print(
+                f"  Skipping optimizer state (type mismatch: saved={'8-bit' if saved_8bit else '32-bit'}, "
+                f"current={'8-bit' if config.use_8bit_optimizer else '32-bit'})"
+            )
             print("  Optimizer will start fresh")
         else:
             try:
@@ -401,7 +408,11 @@ def train(config: TrainConfig) -> None:
     running_mfu = -1.0
 
     # Pre-compute FLOPS estimation for MFU calculation
-    num_params = model.get_num_params() if hasattr(model, "get_num_params") else sum(p.numel() for p in model.parameters())
+    num_params = (
+        model.get_num_params()
+        if hasattr(model, "get_num_params")
+        else sum(p.numel() for p in model.parameters())
+    )
     flops_per_iter = estimate_flops_per_iter(config, num_params)
     peak_tflops = get_peak_tflops(device_type, config.dtype)
 
@@ -554,10 +565,18 @@ def main() -> None:
     parser.add_argument("--memory_lr", type=float, default=0.01)
     parser.add_argument("--memory_momentum", type=float, default=0.9)
     parser.add_argument("--memory_decay", type=float, default=0.001)
-    parser.add_argument("--adaptive_memory", action="store_true", default=True,
-                        help="Use learned per-token lr/momentum/decay (default: True)")
-    parser.add_argument("--no_adaptive_memory", action="store_false", dest="adaptive_memory",
-                        help="Disable adaptive memory, use fixed lr/momentum/decay")
+    parser.add_argument(
+        "--adaptive_memory",
+        action="store_true",
+        default=True,
+        help="Use learned per-token lr/momentum/decay (default: True)",
+    )
+    parser.add_argument(
+        "--no_adaptive_memory",
+        action="store_false",
+        dest="adaptive_memory",
+        help="Disable adaptive memory, use fixed lr/momentum/decay",
+    )
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--bias", action="store_true")
     parser.add_argument("--learning_rate", type=float, default=6e-4)
@@ -566,7 +585,9 @@ def main() -> None:
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.95)
     parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--use_8bit_optimizer", action="store_true", help="Use 8-bit AdamW (requires bitsandbytes)")
+    parser.add_argument(
+        "--use_8bit_optimizer", action="store_true", help="Use 8-bit AdamW (requires bitsandbytes)"
+    )
     parser.add_argument("--decay_lr", action="store_true", default=True)
     parser.add_argument("--no_decay_lr", action="store_false", dest="decay_lr")
     parser.add_argument("--warmup_iters", type=int, default=100)

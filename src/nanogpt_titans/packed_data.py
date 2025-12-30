@@ -431,9 +431,7 @@ class PackedDataLoader:
 
     def _build_attention_mask(self, seq_lengths: list[list[int]]) -> torch.Tensor:
         """Build causal attention mask respecting document boundaries."""
-        mask = torch.zeros(
-            self.batch_size, self.block_size, self.block_size, dtype=torch.bool
-        )
+        mask = torch.zeros(self.batch_size, self.block_size, self.block_size, dtype=torch.bool)
 
         for b in range(self.batch_size):
             pos = 0

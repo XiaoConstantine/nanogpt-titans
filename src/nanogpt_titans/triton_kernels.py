@@ -320,7 +320,9 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         # Initialize gradient accumulators
         grad_hidden = torch.zeros_like(hidden)
         grad_weight = torch.zeros_like(weight)
-        grad_bias = torch.zeros(V, device=hidden.device, dtype=hidden.dtype) if bias is not None else None
+        grad_bias = (
+            torch.zeros(V, device=hidden.device, dtype=hidden.dtype) if bias is not None else None
+        )
 
         for start in range(0, N, chunk_size):
             end = min(start + chunk_size, N)
@@ -1045,4 +1047,3 @@ def triton_batched_weight_update(
         offset += size
 
     return new_weights, new_momentum
-

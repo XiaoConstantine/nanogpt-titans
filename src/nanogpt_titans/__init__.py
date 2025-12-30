@@ -5,6 +5,8 @@ Implementation of the Titans architecture from https://arxiv.org/abs/2501.00663
 built on top of nanoGPT.
 """
 
+# Qwen integration (HOPE-Titans)
+from nanogpt_titans import qwen_titans
 from nanogpt_titans.model import (
     MLP,
     CausalSelfAttention,
@@ -15,9 +17,6 @@ from nanogpt_titans.model import (
     TitansConfig,
     TitansGPT,
 )
-
-# Qwen integration (HOPE-Titans)
-from nanogpt_titans import qwen_titans
 
 __version__ = "0.1.0"
 __all__ = [

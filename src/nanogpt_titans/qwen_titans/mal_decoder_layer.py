@@ -18,19 +18,21 @@ Benefits of MAL:
 
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from nanogpt_titans.model import MemoryState
-from nanogpt_titans.qwen_titans.config import TitansQwenConfig
 from nanogpt_titans.qwen_titans.memory_adapter import (
     ContinuumMemoryState,
     ContinuumMemorySystem,
     NeuralMemoryAdapter,
 )
+
+if TYPE_CHECKING:
+    from nanogpt_titans.model import MemoryState
+    from nanogpt_titans.qwen_titans.config import TitansQwenConfig
 
 
 class MALQwenDecoderLayer(nn.Module):
@@ -95,11 +97,11 @@ class MALQwenDecoderLayer(nn.Module):
         self.update_memory = True
 
         # Store memory state during forward
-        self._current_memory_state: Optional[Union[MemoryState, ContinuumMemoryState]] = None
-        self._updated_memory_state: Optional[Union[MemoryState, ContinuumMemoryState]] = None
+        self._current_memory_state: MemoryState | ContinuumMemoryState | None = None
+        self._updated_memory_state: MemoryState | ContinuumMemoryState | None = None
 
         # Internal loss for self-supervised memory signal
-        self._internal_loss: Optional[torch.Tensor] = None
+        self._internal_loss: torch.Tensor | None = None
 
         # Copy attributes that Qwen's internal code expects
         if hasattr(original_layer, "self_attn"):
@@ -116,16 +118,16 @@ class MALQwenDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Any] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Any | None = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        memory_state: Optional[Union[MemoryState, ContinuumMemoryState]] = None,
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        memory_state: MemoryState | ContinuumMemoryState | None = None,
         **kwargs,
-    ) -> Tuple[torch.Tensor, ...]:
+    ) -> tuple[torch.Tensor, ...]:
         """
         Forward with MAL-style memory preprocessing.
 
@@ -149,7 +151,7 @@ class MALQwenDecoderLayer(nn.Module):
         Returns:
             Tuple of (hidden_states, ...) matching original layer format
         """
-        B, T, C = hidden_states.shape
+        B, _T, _C = hidden_states.shape
         device = hidden_states.device
 
         # Use provided state or stored state
@@ -212,18 +214,18 @@ class MALQwenDecoderLayer(nn.Module):
 
         # Return in HuggingFace-compatible format
         if other_outputs:
-            return (output,) + other_outputs
+            return (output, *other_outputs)
         return output
 
-    def set_memory_state(self, state: Optional[Union[MemoryState, ContinuumMemoryState]]) -> None:
+    def set_memory_state(self, state: MemoryState | ContinuumMemoryState | None) -> None:
         """Set the memory state to use for next forward pass."""
         self._current_memory_state = state
 
-    def get_memory_state(self) -> Optional[Union[MemoryState, ContinuumMemoryState]]:
+    def get_memory_state(self) -> MemoryState | ContinuumMemoryState | None:
         """Get the memory state after last forward pass."""
         return self._updated_memory_state
 
-    def get_internal_loss(self) -> Optional[torch.Tensor]:
+    def get_internal_loss(self) -> torch.Tensor | None:
         """Get the internal loss for this layer (if enabled)."""
         return self._internal_loss
 
@@ -249,10 +251,7 @@ class MALQwenDecoderLayer(nn.Module):
             Scalar loss tensor
         """
         # Get the underlying NeuralMemory (handle CMS case)
-        if self._use_cms:
-            mem = self.memory.memories[0].memory
-        else:
-            mem = self.memory.memory
+        mem = self.memory.memories[0].memory if self._use_cms else self.memory.memory
 
         # Detach input
         x = hidden_states.detach()

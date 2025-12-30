@@ -7,15 +7,16 @@ handle the test-time learning memory across segments.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-from nanogpt_titans.model import MemoryState
-from nanogpt_titans.qwen_titans.decoder_layer import TitansQwenDecoderLayer
 from nanogpt_titans.qwen_titans.patcher import get_titans_layers
+
+if TYPE_CHECKING:
+    from nanogpt_titans.model import MemoryState
 
 
 class TitansStateManager:
@@ -85,7 +86,7 @@ class TitansStateManager:
         for layer in self.titans_layers:
             layer.set_memory_state(None)
 
-    def get_state(self, layer_idx: int) -> Optional[MemoryState]:
+    def get_state(self, layer_idx: int) -> MemoryState | None:
         """Get current memory state for a specific layer."""
         return self._states.get(layer_idx)
 
@@ -108,13 +109,13 @@ def titans_generate(
     input_ids: torch.Tensor,
     max_new_tokens: int = 100,
     temperature: float = 1.0,
-    top_k: Optional[int] = None,
-    top_p: Optional[float] = None,
+    top_k: int | None = None,
+    top_p: float | None = None,
     reset_memory: bool = True,
-    state_manager: Optional[TitansStateManager] = None,
-    segment_len: Optional[int] = None,
-    pad_token_id: Optional[int] = None,
-    eos_token_id: Optional[int] = None,
+    state_manager: TitansStateManager | None = None,
+    segment_len: int | None = None,
+    pad_token_id: int | None = None,
+    eos_token_id: int | None = None,
 ) -> torch.Tensor:
     """
     Generate text with Titans memory state management.
@@ -185,10 +186,7 @@ def titans_generate(
     with torch.no_grad():
         for _ in range(max_new_tokens):
             # Use last segment_len tokens as context
-            if generated.size(1) > segment_len:
-                context = generated[:, -segment_len:]
-            else:
-                context = generated
+            context = generated[:, -segment_len:] if generated.size(1) > segment_len else generated
 
             # Forward with memory
             state_manager.sync_to_layers()
@@ -210,16 +208,12 @@ def titans_generate(
             # Apply top-p (nucleus) filtering
             if top_p is not None:
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                cumulative_probs = torch.cumsum(
-                    F.softmax(sorted_logits, dim=-1), dim=-1
-                )
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
 
                 # Remove tokens with cumulative prob above threshold
                 sorted_indices_to_remove = cumulative_probs > top_p
                 # Keep at least one token
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
-                    ..., :-1
-                ].clone()
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                 sorted_indices_to_remove[..., 0] = False
 
                 # Scatter back to original indexing
@@ -236,9 +230,8 @@ def titans_generate(
             generated = torch.cat([generated, next_token], dim=1)
 
             # Check for EOS
-            if eos_token_id is not None:
-                if (next_token == eos_token_id).all():
-                    break
+            if eos_token_id is not None and (next_token == eos_token_id).all():
+                break
 
     return generated
 
@@ -246,8 +239,8 @@ def titans_generate(
 def process_with_memory(
     model: nn.Module,
     input_ids: torch.Tensor,
-    state_manager: Optional[TitansStateManager] = None,
-    segment_len: Optional[int] = None,
+    state_manager: TitansStateManager | None = None,
+    segment_len: int | None = None,
     return_hidden_states: bool = False,
 ) -> tuple:
     """
@@ -280,10 +273,7 @@ def process_with_memory(
 
     # Get segment length
     if segment_len is None:
-        if hasattr(model, "_titans_config"):
-            segment_len = model._titans_config.segment_len
-        else:
-            segment_len = 512
+        segment_len = model._titans_config.segment_len if hasattr(model, "_titans_config") else 512
 
     all_logits = []
     all_hidden_states = [] if return_hidden_states else None
