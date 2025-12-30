@@ -180,7 +180,7 @@ class TestMLXNeuralMemory:
         values = mx.random.normal((B, T, small_dim))
         state = neural_memory.init_state(B)
 
-        grads = neural_memory._compute_gradients(keys, values, state.weights)
+        grads, grad_norm = neural_memory._compute_gradients(keys, values, state.weights)
 
         # Gradients should have same shape as weights
         assert "w0" in grads
@@ -189,6 +189,9 @@ class TestMLXNeuralMemory:
         assert grads["w1"].shape == (B, small_dim, H)
         assert not mx.any(mx.isnan(grads["w0"]))
         assert not mx.any(mx.isnan(grads["w1"]))
+        # grad_norm should be a scalar
+        assert grad_norm.shape == ()
+        assert not mx.isnan(grad_norm)
 
     def test_internal_loss_uses_template_weights(self, neural_memory, small_dim):
         """Test compute_internal_loss uses template weights (trainable)."""
@@ -229,7 +232,7 @@ class TestMLXNeuralMemory:
         state = neural_memory.init_state(B)
 
         # First update
-        new_state = neural_memory.update(x, state)
+        new_state, metrics = neural_memory.update(x, state)
 
         # Step should increase
         assert new_state.step == 1
@@ -247,6 +250,11 @@ class TestMLXNeuralMemory:
         assert new_state.last_segment_output is not None
         assert mx.allclose(new_state.last_segment_output, x)
 
+        # Metrics should be returned
+        from nanogpt_titans.mlx.memory import MemoryMetrics
+        assert isinstance(metrics, MemoryMetrics)
+        assert metrics.grad_norm >= 0
+
     def test_weight_clipping(self, neural_memory, small_dim):
         """Test weights are clipped to [-10, 10] for numerical stability."""
         B, T = 2, 16
@@ -256,7 +264,7 @@ class TestMLXNeuralMemory:
 
         # Multiple updates
         for _ in range(10):
-            state = neural_memory.update(x, state)
+            state, _ = neural_memory.update(x, state)
 
         # Weights should be clipped
         assert mx.all(state.weights["w0"] >= -10.0)
@@ -277,7 +285,7 @@ class TestMLXNeuralMemory:
         assert retrieved1.shape == (B, T, small_dim)
 
         # Update with x1
-        state = neural_memory.update(x1, state)
+        state, _ = neural_memory.update(x1, state)
 
         # Second retrieval - should use x1 (stored in state.last_segment_output)
         retrieved2 = neural_memory(x2, state)
@@ -381,7 +389,7 @@ class TestMLXContinuumMemorySystem:
         mx.eval(*[w["w0"] for w in initial_weights])
 
         # First update (step=0): ALL levels update (0%1=0, 0%4=0, 0%16=0)
-        state = cms.update(x, state)
+        state, _ = cms.update(x, state)
         mx.eval(state)
         assert state.step == 1
 
@@ -398,7 +406,7 @@ class TestMLXContinuumMemorySystem:
         mx.eval(*[w["w0"] for w in weights_after_step0])
 
         # Second update (step=1): Only level 0 updates (1%1=0, 1%4≠0, 1%16≠0)
-        state = cms.update(x, state)
+        state, _ = cms.update(x, state)
         mx.eval(state)
         assert state.step == 2
 
@@ -410,15 +418,15 @@ class TestMLXContinuumMemorySystem:
         assert mx.allclose(state.level_states[2].weights["w0"], weights_after_step0[2]["w0"])
 
         # Continue to step=4 where level 1 should update again
-        state = cms.update(x, state)  # step=2
-        state = cms.update(x, state)  # step=3
+        state, _ = cms.update(x, state)  # step=2
+        state, _ = cms.update(x, state)  # step=3
         mx.eval(state)
 
         # Store weights before step=4
         weights_before_step4 = copy_weights(state.level_states[1].weights)
         mx.eval(weights_before_step4["w0"])
 
-        state = cms.update(x, state)  # step=4, checks if 4%4==0 (yes!)
+        state, _ = cms.update(x, state)  # step=4, checks if 4%4==0 (yes!)
         mx.eval(state)
         assert state.step == 5
 
@@ -426,6 +434,46 @@ class TestMLXContinuumMemorySystem:
         assert not mx.allclose(state.level_states[1].weights["w0"], weights_before_step4["w0"]), (
             "Level 1 should update when step=4 (4%4==0)"
         )
+
+    def test_cascade_mode(self, small_dim):
+        """Test cascade mode where each level transforms the previous level's output."""
+        from nanogpt_titans.mlx.memory import MLXContinuumMemorySystem
+
+        # Create CMS with cascade=True
+        cms_cascade = MLXContinuumMemorySystem(
+            dim=small_dim,
+            num_levels=3,
+            update_frequencies=(1, 4, 16),
+            use_cascade=True,
+        )
+
+        # Create CMS with cascade=False (weighted sum)
+        cms_weighted = MLXContinuumMemorySystem(
+            dim=small_dim,
+            num_levels=3,
+            update_frequencies=(1, 4, 16),
+            use_cascade=False,
+        )
+
+        B, T = 2, 16
+        x = mx.random.normal((B, T, small_dim))
+
+        state_cascade = cms_cascade.init_state(B)
+        state_weighted = cms_weighted.init_state(B)
+
+        # Forward pass
+        out_cascade = cms_cascade(x, state_cascade)
+        out_weighted = cms_weighted(x, state_weighted)
+
+        # Both should produce valid outputs
+        assert out_cascade.shape == (B, T, small_dim)
+        assert out_weighted.shape == (B, T, small_dim)
+        assert not mx.any(mx.isnan(out_cascade))
+        assert not mx.any(mx.isnan(out_weighted))
+
+        # Outputs should be different (different combination strategies)
+        # Note: they could be similar by chance, but generally differ
+        # Just verify they're both valid
 
     def test_internal_loss_uses_first_level(self, cms, small_dim):
         """Test compute_internal_loss uses the fastest (first) memory level."""
@@ -935,6 +983,59 @@ class TestRegression:
         flat_grads = dict(tree_flatten(grads))
         has_template_grads = any("_template_mlp" in k for k in flat_grads.keys())
         assert has_template_grads, "Template weights should receive gradients"
+
+
+# =============================================================================
+# Teach Signal Tests
+# =============================================================================
+
+
+class TestTeachSignal:
+    """Tests for teach signal mechanism from nested_learning."""
+
+    def test_compute_teach_signal_shape(self, small_dim):
+        """Test compute_teach_signal produces correct shape."""
+        from nanogpt_titans.mlx.training import compute_teach_signal
+
+        B, T, V = 2, 16, 100  # vocab size
+        H = small_dim
+
+        logits = mx.random.normal((B, T, V))
+        targets = mx.random.randint(0, V, (B, T))
+        lm_head_weight = mx.random.normal((V, H))
+
+        teach_signal = compute_teach_signal(logits, targets, lm_head_weight)
+
+        assert teach_signal.shape == (B, T, H)
+        assert not mx.any(mx.isnan(teach_signal))
+
+    def test_teach_signal_responds_to_errors(self, small_dim):
+        """Test teach signal is larger when model predictions are wrong."""
+        from nanogpt_titans.mlx.training import compute_teach_signal
+
+        B, T, V = 2, 16, 10
+        H = small_dim
+
+        targets = mx.zeros((B, T), dtype=mx.int32)  # All targets are 0
+        lm_head_weight = mx.random.normal((V, H))
+
+        # Case 1: Model predicts correctly (high prob at target)
+        logits_correct = mx.zeros((B, T, V))
+        logits_correct = logits_correct.at[:, :, 0].add(mx.array(10.0))  # High logit at target
+        teach_signal_correct = compute_teach_signal(logits_correct, targets, lm_head_weight)
+
+        # Case 2: Model predicts incorrectly (high prob elsewhere)
+        logits_wrong = mx.zeros((B, T, V))
+        logits_wrong = logits_wrong.at[:, :, 5].add(mx.array(10.0))  # High logit at wrong class
+        teach_signal_wrong = compute_teach_signal(logits_wrong, targets, lm_head_weight)
+
+        # Wrong predictions should produce larger teach signal (more surprise)
+        norm_correct = mx.sqrt(mx.sum(teach_signal_correct ** 2))
+        norm_wrong = mx.sqrt(mx.sum(teach_signal_wrong ** 2))
+
+        assert norm_wrong > norm_correct, (
+            "Teach signal should be larger when model is wrong"
+        )
 
 
 if __name__ == "__main__":

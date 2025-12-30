@@ -48,21 +48,47 @@ class TimingResult:
     samples: int
 
 
-def time_operation(fn, num_iters: int = 10, warmup: int = 3) -> TimingResult:
-    """Time an operation with warmup."""
+def _eval_result(result):
+    """Recursively evaluate all mx.arrays in a result."""
+    if isinstance(result, mx.array):
+        mx.eval(result)
+    elif isinstance(result, (list, tuple)):
+        for item in result:
+            _eval_result(item)
+    elif hasattr(result, "__dict__"):
+        for v in result.__dict__.values():
+            _eval_result(v)
+    elif isinstance(result, dict):
+        for v in result.values():
+            _eval_result(v)
+
+
+def time_operation(fn, num_iters: int = 10, warmup: int = 3, eval_result: bool = True) -> TimingResult:
+    """Time an operation with warmup.
+
+    Args:
+        fn: Function to time
+        num_iters: Number of iterations
+        warmup: Number of warmup iterations
+        eval_result: If True, force evaluation of results (measure actual compute time)
+    """
     name = fn.__name__ if hasattr(fn, "__name__") else "operation"
 
     # Warmup
     for _ in range(warmup):
-        fn()
-        mx.eval(mx.array(0))  # Sync
+        result = fn()
+        if eval_result:
+            _eval_result(result)
+        mx.eval(mx.array(0))  # Final sync
 
     # Timed runs
     times = []
     for _ in range(num_iters):
         t0 = time.perf_counter()
-        fn()
-        mx.eval(mx.array(0))  # Sync
+        result = fn()
+        if eval_result:
+            _eval_result(result)
+        mx.eval(mx.array(0))  # Final sync
         times.append((time.perf_counter() - t0) * 1000)
 
     import statistics
@@ -413,6 +439,164 @@ def profile_gradient_accumulation(config: MLXTitansConfig, num_accum_steps: int 
     return results
 
 
+def profile_update_breakdown(dim: int = 896, batch_size: int = 2, seq_len: int = 512):
+    """Profile individual operations within memory update to find exact bottleneck."""
+    print("\n" + "=" * 60)
+    print("DETAILED UPDATE BREAKDOWN")
+    print("=" * 60)
+
+    from nanogpt_titans.mlx.memory import MLXNeuralMemory
+
+    # Create memory and inputs
+    single_mem = MLXNeuralMemory(dim, depth=2, expansion=2, adaptive=True)
+    x = mx.random.normal((batch_size, seq_len, dim))
+    state = single_mem.init_state(batch_size)
+    mx.eval(x, state.weights, state.last_momentum)
+
+    results = {}
+
+    # Profile key/value projection
+    def profile_projections():
+        keys = single_mem.key_proj(x)
+        values = single_mem.value_proj(x)
+        mx.eval(keys, values)
+        return keys, values
+
+    t0 = time.perf_counter()
+    for _ in range(10):
+        keys, values = profile_projections()
+    results["projections"] = TimingResult(
+        "projections", (time.perf_counter() - t0) * 100, 0, 0, 0, 10
+    )
+    print(f"  Key/Value projections:     {results['projections'].mean_ms:.2f} ms avg")
+
+    # Profile gradient computation only
+    keys, values = profile_projections()
+
+    def profile_grad_comp():
+        grads, grad_norm = single_mem._compute_gradients(keys, values, state.weights)
+        mx.eval(grads["w0"], grads["w1"], grad_norm)
+        return grads, grad_norm
+
+    t0 = time.perf_counter()
+    for _ in range(10):
+        grads, grad_norm = profile_grad_comp()
+    results["gradient_comp"] = TimingResult(
+        "gradient_comp", (time.perf_counter() - t0) * 100, 0, 0, 0, 10
+    )
+    print(f"  Gradient computation:      {results['gradient_comp'].mean_ms:.2f} ms avg")
+
+    # Profile .item() call (forces CPU-GPU sync)
+    def profile_item_call():
+        _ = float(grad_norm.item())
+
+    t0 = time.perf_counter()
+    for _ in range(10):
+        profile_item_call()
+    results["item_call"] = TimingResult(
+        "item_call", (time.perf_counter() - t0) * 100, 0, 0, 0, 10
+    )
+    print(f"  .item() sync call:         {results['item_call'].mean_ms:.2f} ms avg")
+
+    # Profile adaptive parameter computation
+    def profile_adaptive_params():
+        adaptive_lr = mx.sigmoid(single_mem.to_lr(x)) * single_mem.lr_max
+        adaptive_momentum = mx.sigmoid(single_mem.to_momentum(x))
+        adaptive_decay = mx.sigmoid(single_mem.to_decay(x))
+        lr_param = mx.mean(adaptive_lr, axis=1)[:, 0]
+        mom_param = mx.mean(adaptive_momentum, axis=1)[:, 0]
+        decay_param = mx.mean(adaptive_decay, axis=1)[:, 0]
+        mx.eval(lr_param, mom_param, decay_param)
+        return lr_param, mom_param, decay_param
+
+    t0 = time.perf_counter()
+    for _ in range(10):
+        lr_param, mom_param, decay_param = profile_adaptive_params()
+    results["adaptive_params"] = TimingResult(
+        "adaptive_params", (time.perf_counter() - t0) * 100, 0, 0, 0, 10
+    )
+    print(f"  Adaptive param compute:    {results['adaptive_params'].mean_ms:.2f} ms avg")
+
+    # Profile .item() on adaptive params (3x calls)
+    def profile_adaptive_item():
+        _ = float(mx.mean(lr_param).item())
+        _ = float(mx.mean(mom_param).item())
+        _ = float(mx.mean(decay_param).item())
+
+    t0 = time.perf_counter()
+    for _ in range(10):
+        profile_adaptive_item()
+    results["adaptive_item"] = TimingResult(
+        "adaptive_item", (time.perf_counter() - t0) * 100, 0, 0, 0, 10
+    )
+    print(f"  Adaptive .item() (3x):     {results['adaptive_item'].mean_ms:.2f} ms avg")
+
+    # Profile weight update loop (without .item())
+    def profile_weight_update():
+        new_weights = {}
+        new_momentum = {}
+        for name in state.weights:
+            g = grads[name]
+            m_prev = state.last_momentum[name]
+            w_prev = state.weights[name]
+
+            mom_expanded = mom_param.reshape((-1,) + (1,) * (g.ndim - 1))
+            lr_expanded = lr_param.reshape((-1,) + (1,) * (g.ndim - 1))
+            decay_expanded = decay_param.reshape((-1,) + (1,) * (g.ndim - 1))
+
+            m = mom_expanded * m_prev + (1 - mom_expanded) * g
+            decay_factor = 1 - decay_expanded
+            w = decay_factor * w_prev - lr_expanded * m
+            w = mx.clip(w, -10.0, 10.0)
+
+            new_weights[name] = w
+            new_momentum[name] = m
+        mx.eval(new_weights["w0"], new_weights["w1"])
+        return new_weights, new_momentum
+
+    t0 = time.perf_counter()
+    for _ in range(10):
+        new_weights, new_momentum = profile_weight_update()
+    results["weight_update"] = TimingResult(
+        "weight_update", (time.perf_counter() - t0) * 100, 0, 0, 0, 10
+    )
+    print(f"  Weight update loop:        {results['weight_update'].mean_ms:.2f} ms avg")
+
+    # Profile full update (with all .item() calls)
+    def full_update():
+        return single_mem.update(x, state)
+
+    state_copy = single_mem.init_state(batch_size)
+    mx.eval(state_copy.weights)
+
+    t0 = time.perf_counter()
+    for _ in range(5):
+        new_state, metrics = full_update()
+        mx.eval(new_state.weights)
+    results["full_update"] = TimingResult(
+        "full_update", (time.perf_counter() - t0) * 200, 0, 0, 0, 5
+    )
+    print(f"  Full update (current):     {results['full_update'].mean_ms:.2f} ms avg")
+
+    # Summary
+    print("\n  --- Analysis ---")
+    total_ops = (
+        results["projections"].mean_ms
+        + results["gradient_comp"].mean_ms
+        + results["adaptive_params"].mean_ms
+        + results["weight_update"].mean_ms
+    )
+    item_overhead = results["item_call"].mean_ms + results["adaptive_item"].mean_ms
+    print(f"  Pure computation time:     {total_ops:.2f} ms")
+    print(f"  .item() sync overhead:     {item_overhead:.2f} ms")
+    print(f"  Full update actual:        {results['full_update'].mean_ms:.2f} ms")
+    if results["full_update"].mean_ms > 0:
+        overhead_pct = (item_overhead / results["full_update"].mean_ms) * 100
+        print(f"  Sync overhead ratio:       {overhead_pct:.1f}%")
+
+    return results
+
+
 def identify_bottlenecks(all_results: dict[str, dict[str, Any]]):
     """Analyze results and identify bottlenecks."""
     print("\n" + "=" * 60)
@@ -482,6 +666,7 @@ def main():
     parser.add_argument("--detailed", action="store_true", help="Run all profiling tests")
     parser.add_argument("--memory-only", action="store_true", help="Only profile memory ops")
     parser.add_argument("--training-only", action="store_true", help="Only profile training step")
+    parser.add_argument("--breakdown", action="store_true", help="Detailed update breakdown")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -506,7 +691,9 @@ def main():
 
     all_results = {}
 
-    if args.memory_only:
+    if args.breakdown:
+        all_results["update_breakdown"] = profile_update_breakdown()
+    elif args.memory_only:
         all_results["memory_ops"] = profile_memory_operations()
         all_results["titans_layer"] = profile_titans_layer()
     elif args.training_only:

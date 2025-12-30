@@ -36,6 +36,8 @@ if _MLX_AVAILABLE:
         TitansLayerState,
     )
     from nanogpt_titans.mlx.memory import (
+        CMSMetrics,
+        MemoryMetrics,
         MLXCMSState,
         MLXContinuumMemorySystem,
         MLXMemoryState,
@@ -44,6 +46,8 @@ if _MLX_AVAILABLE:
     from nanogpt_titans.mlx.training import (
         CombinedModel,
         accumulate_grads,
+        apply_teach_signal_to_memory,
+        compute_teach_signal,
         create_loss_fn,
         create_masked_grads,
         create_titans_layer_from_model,
@@ -53,22 +57,21 @@ if _MLX_AVAILABLE:
     )
 
     __all__ = [
-        # Availability flag
         "_MLX_AVAILABLE",
-        # Training
+        "CMSMetrics",
         "CombinedModel",
+        "MemoryMetrics",
         "MLXCMSState",
         "MLXContinuumMemorySystem",
-        # Memory
         "MLXMemoryState",
         "MLXNeuralMemory",
-        # Decoder layer
         "MLXPositionDependentGate",
-        # Config
         "MLXTitansConfig",
         "MLXTitansLayer",
         "TitansLayerState",
         "accumulate_grads",
+        "apply_teach_signal_to_memory",
+        "compute_teach_signal",
         "config_to_mlx",
         "create_loss_fn",
         "create_masked_grads",

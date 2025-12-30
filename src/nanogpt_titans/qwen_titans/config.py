@@ -78,6 +78,9 @@ class TitansQwenConfig:
     cms_update_frequencies: list[int] = field(
         default_factory=lambda: [1, 4, 16]
     )  # Update every N segments
+    # Cascade mode: each level transforms previous level's output (hierarchical refinement)
+    # vs weighted sum mode: all levels process same input, outputs are weighted sum
+    use_cascade: bool = False
 
     # Self-modifying components (online adaptation via delta rule)
     # NOTE: use_self_mod_gate=False enables the new PositionDependentGate
@@ -96,6 +99,19 @@ class TitansQwenConfig:
     # The internal loss trains key_proj, value_proj, query_proj to produce meaningful mappings
     use_internal_loss: bool = True  # ENABLED by default - critical for memory learning
     internal_loss_weight: float = 0.1  # Stronger signal for memory training
+
+    # Surprise threshold: skip memory updates when gradient norm is below threshold
+    # From nested_learning: prevents memory pollution from predictable tokens
+    surprise_threshold: float = 0.0  # 0.0 = disabled, try 0.01-0.1
+
+    # Per-level gradient clipping for CMS (Continuum Memory System)
+    # Prevents any single level from dominating updates
+    memory_grad_clip: float = 1.0  # Clip grad norm per memory level
+
+    # Teach signal: auxiliary gradient from logit residuals (from nested_learning)
+    # Supplements internal loss with gradient approximation from LM predictions
+    use_teach_signal: bool = False
+    teach_signal_weight: float = 0.1
 
     @classmethod
     def from_qwen_config(

@@ -24,7 +24,13 @@ from nanogpt_titans.qwen_titans.generation import (
     titans_generate,
 )
 from nanogpt_titans.qwen_titans.mag_decoder_layer import MAGQwenDecoderLayer
-from nanogpt_titans.qwen_titans.memory_adapter import NeuralMemoryAdapter
+from nanogpt_titans.qwen_titans.memory_adapter import (
+    CMSMetrics,
+    ContinuumMemoryState,
+    ContinuumMemorySystem,
+    MemoryMetrics,
+    NeuralMemoryAdapter,
+)
 from nanogpt_titans.qwen_titans.patcher import (
     enable_memory_updates,
     freeze_base_model,
@@ -38,7 +44,11 @@ from nanogpt_titans.qwen_titans.patcher import (
 )
 
 __all__ = [
+    "CMSMetrics",
+    "ContinuumMemoryState",
+    "ContinuumMemorySystem",
     "MAGQwenDecoderLayer",
+    "MemoryMetrics",
     "NeuralMemoryAdapter",
     "TitansQwenConfig",
     "TitansQwenDecoderLayer",

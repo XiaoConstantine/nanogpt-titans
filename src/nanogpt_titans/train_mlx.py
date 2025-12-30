@@ -103,6 +103,9 @@ def create_titans_layers(model, config: MLXTitansConfig) -> dict[int, MLXTitansL
             adaptive_memory=config.adaptive_memory,
             memory_lr_max=config.memory_lr_max,
             gate_init_bias=config.gate_init_bias,
+            grad_clip=config.memory_grad_clip,
+            surprise_threshold=config.surprise_threshold,
+            use_cascade=config.use_cascade,
         )
 
     return titans_layers
@@ -216,8 +219,13 @@ def train(config: MLXTitansConfig):
     if config.use_cms:
         print(f"CMS levels: {config.num_cms_levels}")
         print(f"CMS frequencies: {config.cms_update_frequencies}")
+        print(f"CMS cascade mode: {config.use_cascade}")
     print(f"Max steps: {config.max_steps}")
     print(f"Internal loss: {config.use_internal_loss} (weight={config.internal_loss_weight})")
+    if config.surprise_threshold > 0:
+        print(f"Surprise threshold: {config.surprise_threshold}")
+    if config.memory_grad_clip > 0:
+        print(f"Memory grad clip: {config.memory_grad_clip}")
     if config.unfreeze_backbone_layers > 0:
         print(f"Backbone unfreezing: {config.unfreeze_backbone_layers} layers near TITANS")
     print()
@@ -739,6 +747,24 @@ def main():
         action="store_true",
         help="Disable eager evaluation (slower but uses less memory per micro-step)",
     )
+    parser.add_argument(
+        "--use_cascade",
+        action="store_true",
+        default=False,
+        help="Use cascade mode for CMS (each level transforms previous level's output)",
+    )
+    parser.add_argument(
+        "--surprise_threshold",
+        type=float,
+        default=0.0,
+        help="Skip memory updates when grad norm below threshold (0=disabled)",
+    )
+    parser.add_argument(
+        "--memory_grad_clip",
+        type=float,
+        default=1.0,
+        help="Per-level gradient clipping for CMS",
+    )
 
     args = parser.parse_args()
 
@@ -756,6 +782,7 @@ def main():
         segment_len=args.segment_len,
         output_dir=args.output_dir,
         use_cms=args.use_cms,
+        use_cascade=args.use_cascade,
         gate_warmup_steps=args.gate_warmup_steps,
         adaptive_memory=not args.no_adaptive,
         use_internal_loss=args.use_internal_loss,
@@ -765,6 +792,8 @@ def main():
         gate_init_bias=args.gate_init_bias,
         eager_eval=not args.no_eager_eval,
         unfreeze_backbone_layers=args.unfreeze_backbone_layers,
+        surprise_threshold=args.surprise_threshold,
+        memory_grad_clip=args.memory_grad_clip,
     )
 
     train(config)

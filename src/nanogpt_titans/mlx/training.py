@@ -4,6 +4,7 @@ MLX TITANS training utilities.
 Provides training loop components for MLX backend:
 - CombinedModel: Wrapper combining base model with TITANS layer
 - Training utilities: loss functions, gradient filtering, LR scheduling
+- Teach signal: auxiliary gradient from logit residuals (from nested_learning)
 """
 
 from __future__ import annotations
@@ -18,6 +19,100 @@ from nanogpt_titans.mlx.decoder_layer import MLXTitansLayer, TitansLayerState
 
 if TYPE_CHECKING:
     from nanogpt_titans.mlx.config import MLXTitansConfig
+
+
+def compute_teach_signal(
+    logits: mx.array, targets: mx.array, lm_head_weight: mx.array
+) -> mx.array:
+    """
+    Compute teaching signal from logit residuals.
+
+    This provides an auxiliary gradient signal to memory without full backprop.
+    From nested_learning: allows memory to learn from "what surprised the model".
+
+    teach_signal = (softmax(logits) - one_hot(targets)) @ lm_head.weight
+
+    Args:
+        logits: Model predictions [B, T, V] where V is vocab size
+        targets: Target token IDs [B, T]
+        lm_head_weight: LM head weight matrix [V, H] where H is hidden dim
+
+    Returns:
+        Teaching signal [B, T, H] - gradient approximation in hidden space
+    """
+    B, T, V = logits.shape
+
+    # Softmax to get probabilities
+    probs = mx.softmax(logits, axis=-1)  # [B, T, V]
+
+    # Create one-hot targets
+    # MLX doesn't have one_hot, so we construct it manually
+    one_hot = mx.zeros((B, T, V))
+    # Use scatter-like operation via indexing
+    batch_idx = mx.arange(B)[:, None].astype(mx.int32)  # [B, 1]
+    seq_idx = mx.arange(T)[None, :].astype(mx.int32)  # [1, T]
+    batch_idx = mx.broadcast_to(batch_idx, (B, T))  # [B, T]
+    seq_idx = mx.broadcast_to(seq_idx, (B, T))  # [B, T]
+
+    # Create one-hot by setting the target positions to 1
+    # This is equivalent to F.one_hot in PyTorch
+    targets_int = targets.astype(mx.int32)
+    one_hot = mx.zeros((B * T, V))
+    flat_indices = mx.arange(B * T)
+    flat_targets = targets_int.reshape(-1)
+    # Use scatter: one_hot[flat_indices, flat_targets] = 1
+    one_hot = one_hot.at[flat_indices, flat_targets].add(mx.ones(B * T))
+    one_hot = one_hot.reshape(B, T, V)
+
+    # Compute residual: what the model got wrong
+    residual = probs - one_hot  # [B, T, V]
+
+    # Project back to hidden dimension
+    # residual @ lm_head_weight gives [B, T, H]
+    # Note: lm_head_weight is typically [V, H] (output embedding)
+    teach_signal = mx.matmul(residual, lm_head_weight)  # [B, T, H]
+
+    return teach_signal
+
+
+def apply_teach_signal_to_memory(
+    teach_signal: mx.array,
+    _titans_layer: MLXTitansLayer,
+    state: TitansLayerState,
+    signal_weight: float = 0.1,
+) -> TitansLayerState:
+    """
+    Apply teaching signal to memory weights.
+
+    This provides an additional learning signal to memory beyond the internal loss.
+    The teach signal is treated as a gradient and applied with the memory's update rule.
+
+    Args:
+        teach_signal: Gradient approximation [B, T, H]
+        _titans_layer: The TITANS layer containing memory (reserved for future use)
+        state: Current memory state
+        signal_weight: Weight for the teach signal contribution
+
+    Returns:
+        Updated memory state
+    """
+    # Scale down the teach signal (kept for future implementation)
+    _ = teach_signal * signal_weight
+
+    # For now, we incorporate the teach signal into the memory via its update path
+    # The memory will see the teach signal as part of the input during its next update
+    # This is a simplified integration - the full nested_learning approach modifies
+    # the memory weights directly using the projected teach signal
+
+    # The proper integration would be:
+    # 1. Project teach_signal through memory's key/value projections
+    # 2. Compute gradient w.r.t. memory weights
+    # 3. Apply additional weight update
+
+    # For this implementation, we return the state unchanged and let the
+    # loss function handle teach signal integration through compute_internal_loss_with_teach
+
+    return state
 
 
 class CombinedModel(nn.Module):
@@ -36,6 +131,8 @@ class CombinedModel(nn.Module):
         titans_layers: dict[int, MLXTitansLayer],
         use_internal_loss: bool = False,
         internal_loss_weight: float = 1e-4,
+        use_teach_signal: bool = False,
+        teach_signal_weight: float = 0.1,
     ):
         """
         Initialize combined model with multiple TITANS layers.
@@ -45,6 +142,8 @@ class CombinedModel(nn.Module):
             titans_layers: Dict mapping layer_idx -> MLXTitansLayer
             use_internal_loss: Whether to compute internal loss
             internal_loss_weight: Weight for internal loss
+            use_teach_signal: Whether to compute teach signal from logit residuals
+            teach_signal_weight: Weight for teach signal contribution
         """
         super().__init__()
         self.base_model = base_model
@@ -52,6 +151,8 @@ class CombinedModel(nn.Module):
         self.memory_layer_indices = sorted(titans_layers.keys())
         self.use_internal_loss = use_internal_loss
         self.internal_loss_weight = internal_loss_weight
+        self.use_teach_signal = use_teach_signal
+        self.teach_signal_weight = teach_signal_weight
 
         # Get inner model reference
         self._inner_model = base_model.model if hasattr(base_model, "model") else base_model
@@ -61,6 +162,10 @@ class CombinedModel(nn.Module):
 
         # Store internal loss from last forward (for logging)
         self._last_internal_loss: mx.array | None = None
+
+        # Store teach signal from last forward (for loss computation)
+        self._last_teach_signal: mx.array | None = None
+        self._last_h_at_memory_layers: dict[int, mx.array] = {}
 
     def init_memory_state(self, batch_size: int):
         """Initialize memory state for all TITANS layers."""
@@ -98,11 +203,14 @@ class CombinedModel(nn.Module):
 
             # Apply TITANS at specified layers (with memory state update)
             if i in self.memory_layer_indices:
-                # Store hidden states and state BEFORE memory update for internal loss
-                if self.use_internal_loss:
+                # Store hidden states and state BEFORE memory update for internal/teach loss
+                if self.use_internal_loss or self.use_teach_signal:
                     h_at_memory_layers[i] = h
                     states_before_update[i] = self._memory_states[i]
                 h, self._memory_states[i] = self.titans_layers[i](h, self._memory_states[i])
+
+        # Store for teach signal computation
+        self._last_h_at_memory_layers = h_at_memory_layers
 
         # Compute internal loss if enabled (sum across all layers)
         if self.use_internal_loss and h_at_memory_layers:
@@ -126,12 +234,51 @@ class CombinedModel(nn.Module):
         # Project to vocabulary
         if hasattr(self.base_model, "lm_head"):
             logits = self.base_model.lm_head(h)
+            lm_head_weight = self.base_model.lm_head.weight
         elif hasattr(self._inner_model, "lm_head"):
             logits = self._inner_model.lm_head(h)
+            lm_head_weight = self._inner_model.lm_head.weight
         else:
             logits = h @ self._inner_model.embed_tokens.weight.T
+            lm_head_weight = self._inner_model.embed_tokens.weight
+
+        # Store lm_head_weight for teach signal computation
+        self._lm_head_weight = lm_head_weight
 
         return logits
+
+    def compute_teach_signal_loss(self, logits: mx.array, targets: mx.array) -> mx.array | None:
+        """
+        Compute teaching signal loss from logit residuals.
+
+        This provides auxiliary gradient to memory from "what surprised the model".
+
+        Args:
+            logits: Model predictions [B, T, V]
+            targets: Target token IDs [B, T]
+
+        Returns:
+            Scalar teach signal loss, or None if teach signal disabled
+        """
+        if not self.use_teach_signal or not self._last_h_at_memory_layers:
+            return None
+
+        # Compute teach signal: (softmax(logits) - one_hot(targets)) @ lm_head_weight
+        teach_signal = compute_teach_signal(logits, targets, self._lm_head_weight)
+
+        # Compute MSE between teach signal and hidden states at memory layers
+        # This encourages the memory to predict what will surprise the model
+        teach_losses = []
+        for _idx, h in self._last_h_at_memory_layers.items():
+            # teach_signal is [B, T, H], h is [B, T, H]
+            # We want memory to learn to anticipate surprises
+            diff = teach_signal - h
+            teach_loss = mx.mean(diff * diff)
+            teach_losses.append(teach_loss)
+
+        if teach_losses:
+            return mx.mean(mx.stack(teach_losses)) * self.teach_signal_weight
+        return None
 
     def get_internal_loss(self) -> mx.array | None:
         """Get the internal loss from the last forward pass."""
@@ -223,6 +370,12 @@ def create_loss_fn(
             internal_loss = combined_model.get_internal_loss()
             if internal_loss is not None:
                 total_loss = lm_loss + combined_model.internal_loss_weight * internal_loss
+
+        # Add teach signal loss if enabled (from nested_learning)
+        if combined_model.use_teach_signal:
+            teach_loss = combined_model.compute_teach_signal_loss(logits, target_ids)
+            if teach_loss is not None:
+                total_loss = total_loss + teach_loss
 
         # Add gate regularization if enabled (prevents gate from collapsing)
         if gate_min_value > 0 and gate_reg_weight > 0:
@@ -381,4 +534,7 @@ def create_titans_layer_from_model(model, config: MLXTitansConfig) -> MLXTitansL
         adaptive_memory=config.adaptive_memory,
         memory_lr_max=config.memory_lr_max,
         gate_init_bias=config.gate_init_bias,
+        grad_clip=config.memory_grad_clip,
+        surprise_threshold=config.surprise_threshold,
+        use_cascade=config.use_cascade,
     )

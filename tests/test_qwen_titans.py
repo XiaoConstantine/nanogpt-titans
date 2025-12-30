@@ -365,15 +365,44 @@ class TestContinuumMemorySystem:
 
         # Update 16 times
         for i in range(16):
-            state = cms.update(x, state)
+            state, metrics = cms.update(x, state)
 
         # All levels should have been updated at least once
         assert state.segment_counts == [16, 16, 16]
+
+        # Verify metrics are returned
+        from nanogpt_titans.qwen_titans import CMSMetrics
+        assert isinstance(metrics, CMSMetrics)
+        assert len(metrics.level_metrics) == 3
 
     def test_level_weights_learnable(self, cms_config):
         """Test level weights are learnable parameters."""
         cms = ContinuumMemorySystem(cms_config)
         assert cms.level_weights.requires_grad
+
+    def test_cascade_mode(self, cms_config):
+        """Test cascade mode where each level transforms the previous level's output."""
+        # Create config with cascade enabled
+        cms_config.use_cascade = True
+        cms_cascade = ContinuumMemorySystem(cms_config)
+
+        # Reset for weighted sum mode
+        cms_config.use_cascade = False
+        cms_weighted = ContinuumMemorySystem(cms_config)
+
+        x = torch.randn(2, 32, 64)
+
+        state_cascade = cms_cascade.init_state(2, torch.device("cpu"))
+        state_weighted = cms_weighted.init_state(2, torch.device("cpu"))
+
+        # Forward pass
+        out_cascade = cms_cascade(x, state_cascade)
+        out_weighted = cms_weighted(x, state_weighted)
+
+        # Both should produce valid outputs with same shape
+        assert out_cascade.shape == out_weighted.shape
+        assert not torch.any(torch.isnan(out_cascade))
+        assert not torch.any(torch.isnan(out_weighted))
 
 
 # --- WarmStartEncoder Tests ---

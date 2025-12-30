@@ -14,6 +14,8 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from nanogpt_titans.mlx.memory import (
+    CMSMetrics,
+    MemoryMetrics,
     MLXCMSState,
     MLXContinuumMemorySystem,
     MLXMemoryState,
@@ -84,10 +86,16 @@ class MLXTitansLayer(nn.Module):
         adaptive_memory: bool = True,
         memory_lr_max: float = 0.01,
         gate_init_bias: float = 0.0,
+        grad_clip: float = 1.0,
+        surprise_threshold: float = 0.0,
+        use_cascade: bool = False,
     ):
         super().__init__()
         self.dim = dim
         self._use_cms = use_cms
+
+        # Store last metrics
+        self._last_metrics: CMSMetrics | MemoryMetrics | None = None
 
         # Memory system (CMS or single)
         if use_cms:
@@ -99,6 +107,9 @@ class MLXTitansLayer(nn.Module):
                 memory_expansion=memory_expansion,
                 adaptive=adaptive_memory,
                 lr_max=memory_lr_max,
+                grad_clip=grad_clip,
+                surprise_threshold=surprise_threshold,
+                use_cascade=use_cascade,
             )
         else:
             self.memory = MLXNeuralMemory(
@@ -107,6 +118,8 @@ class MLXTitansLayer(nn.Module):
                 expansion=memory_expansion,
                 adaptive=adaptive_memory,
                 lr_max=memory_lr_max,
+                grad_clip=grad_clip,
+                surprise_threshold=surprise_threshold,
             )
 
         # Memory projection (matches PyTorch mem_proj)
@@ -169,9 +182,14 @@ class MLXTitansLayer(nn.Module):
         output = hidden_states + gate_value * mem_scaled
 
         # 5. Update memory with current segment (test-time learning!)
-        new_state = self.memory.update(output, state)
+        new_state, metrics = self.memory.update(output, state)
+        self._last_metrics = metrics
 
         return output, new_state
+
+    def get_last_metrics(self) -> CMSMetrics | MemoryMetrics | None:
+        """Get metrics from the last forward pass."""
+        return self._last_metrics
 
     def compute_internal_loss(self, hidden_states: mx.array, state: TitansLayerState) -> mx.array:
         """

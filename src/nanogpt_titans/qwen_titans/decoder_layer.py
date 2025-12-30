@@ -320,7 +320,12 @@ class TitansQwenDecoderLayer(nn.Module):
 
         # 6. Update memory with segment output
         if self.update_memory:
-            new_memory_state = self.memory.update(output, memory_state)
+            update_result = self.memory.update(output, memory_state)
+            # Handle both old and new return types (CMS returns tuple)
+            if isinstance(update_result, tuple):
+                new_memory_state, _metrics = update_result
+            else:
+                new_memory_state = update_result
         else:
             new_memory_state = memory_state
 
