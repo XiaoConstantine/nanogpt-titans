@@ -351,6 +351,9 @@ def train(config: MLXTitansConfig):
     )
     loss_and_grad_fn = nn.value_and_grad(combined_model, loss_fn)
 
+    # Note: mx.compile doesn't work well with nn.value_and_grad wrapper
+    # The optimization gains from async_eval and batched loss accumulation are sufficient
+
     # Helper function to evaluate gradient tree (prevents graph accumulation)
     def _eval_grad_tree(tree):
         """Evaluate all arrays in a gradient tree structure."""
@@ -373,15 +376,23 @@ def train(config: MLXTitansConfig):
         )
 
     t0 = time.time()
+    step_times = []  # Track step times for averaging
 
     for step in range(config.max_steps):
+        step_start = time.perf_counter()
+
         # Reset memory state at start of each step
         combined_model.reset_memory_state()
+
+        # Timing breakdown
+        t_fwd_bwd = 0.0
+        t_opt = 0.0
+        t_eval = 0.0
 
         # Gradient accumulation loop
         accumulated_grads = None
         accumulated_backbone_grads = None
-        total_loss = 0.0
+        total_loss = mx.array(0.0)  # Keep as mx.array to avoid .item() in loop
 
         for micro_step in range(config.gradient_accumulation_steps):
             batch_idx = step * config.gradient_accumulation_steps + micro_step
@@ -393,8 +404,10 @@ def train(config: MLXTitansConfig):
             input_ids = batch[:-1].reshape(1, -1)
             target_ids = batch[1:].reshape(1, -1)
 
+            t_fwd_start = time.perf_counter()
             loss, full_grads = loss_and_grad_fn(combined_model, input_ids, target_ids)
             titans_grads = filter_titans_grads(full_grads)
+            t_fwd_bwd += time.perf_counter() - t_fwd_start
 
             # Extract backbone gradients if unfreezing is enabled
             backbone_grads = None
@@ -409,12 +422,11 @@ def train(config: MLXTitansConfig):
                         if str(idx) in layers_grads or idx in layers_grads
                     }
 
-            # OPTIMIZATION: Evaluate loss AND gradients immediately when eager_eval=True
-            # This is crucial for MLX performance - lazy evaluation accumulates
-            # a huge graph across micro-steps, causing slow final eval (2-3s)
-            # With early eval: optimizer step drops from ~2000ms to ~20ms
+            # OPTIMIZATION: Use async_eval to pipeline graph construction with computation
+            # This returns control immediately, allowing next iteration to start building graph
+            # while previous computation runs on GPU
             if config.eager_eval:
-                mx.eval(loss)
+                mx.async_eval(loss)
                 _eval_grad_tree(titans_grads)
                 if backbone_grads:
                     _eval_grad_tree(backbone_grads)
@@ -430,9 +442,13 @@ def train(config: MLXTitansConfig):
                 accumulated_backbone_grads = accumulate_grads(
                     accumulated_backbone_grads, backbone_grads_scaled
                 )
-            total_loss += float(loss.item())
 
-        avg_loss = total_loss / config.gradient_accumulation_steps
+            # OPTIMIZATION: Collect losses without triggering eval
+            # Avoid .item() in loop - batch the conversion later
+            total_loss = total_loss + loss  # Keep as mx.array
+
+        # OPTIMIZATION: Convert loss to float only once after accumulation
+        avg_loss = float((total_loss / config.gradient_accumulation_steps).item())
 
         # Get current learning rate
         lr = get_lr(step, config)
@@ -449,9 +465,17 @@ def train(config: MLXTitansConfig):
         # Gate warmup: freeze gate params
         gate_warmup_active = step < config.gate_warmup_steps
 
-        # Apply optimizers to each TITANS layer
-        # Collect all parameters to evaluate at once (more efficient)
+        # Apply optimizers to all TITANS layers
+        # OPTIMIZATION: Batch updates - set LR once, collect grads, then update
         params_to_eval = []
+
+        # Set learning rates once (avoid repeated assignments)
+        optimizer_memory.learning_rate = lr
+        optimizer_gate.learning_rate = lr_gate
+
+        # Collect all grads first, then apply updates
+        all_memory_grads = {}
+        all_gate_grads = {}
 
         for layer_idx, layer in titans_layers.items():
             # Get gradients for this layer
@@ -462,18 +486,17 @@ def train(config: MLXTitansConfig):
             else:
                 layer_grads = titans_grads  # Single layer case
 
-            # Apply memory optimizer (non-gate parameters)
-            memory_only_grads = create_masked_grads(layer_grads, keep_gate_scale=False)
-            optimizer_memory.learning_rate = lr
-            optimizer_memory.update(layer, memory_only_grads)
-
-            # Apply gate optimizer (gate/scale parameters)
-            gate_only_grads = create_masked_grads(
+            # Pre-compute masked grads
+            all_memory_grads[layer_idx] = create_masked_grads(layer_grads, keep_gate_scale=False)
+            all_gate_grads[layer_idx] = create_masked_grads(
                 layer_grads, keep_gate_scale=True, freeze_gate=gate_warmup_active
             )
-            optimizer_gate.learning_rate = lr_gate
-            optimizer_gate.update(layer, gate_only_grads)
 
+        # Apply all updates
+        t_opt_start = time.perf_counter()
+        for layer_idx, layer in titans_layers.items():
+            optimizer_memory.update(layer, all_memory_grads[layer_idx])
+            optimizer_gate.update(layer, all_gate_grads[layer_idx])
             params_to_eval.extend(tree_flatten(layer.parameters()))
 
         # Update backbone layers if unfreezing is enabled
@@ -490,9 +513,22 @@ def train(config: MLXTitansConfig):
                         optimizer_backbone.update(backbone_layer, layer_grads)
                         params_to_eval.extend(tree_flatten(backbone_layer.parameters()))
 
-        # OPTIMIZATION: Single eval call for all parameters
-        # This is more efficient than evaluating each layer separately
+        t_opt = time.perf_counter() - t_opt_start
+
+        # OPTIMIZATION: Release intermediate references before eval to reduce peak memory
+        # This allows MLX to free gradient arrays before computing parameter updates
+        del all_memory_grads, all_gate_grads, accumulated_grads
+        if accumulated_backbone_grads is not None:
+            del accumulated_backbone_grads
+
+        # Eval all updated parameters
+        t_eval_start = time.perf_counter()
         mx.eval(*[p for _, p in params_to_eval])
+        t_eval = time.perf_counter() - t_eval_start
+
+        # Track step time
+        step_time = time.perf_counter() - step_start
+        step_times.append(step_time)
 
         # Logging
         if step % 10 == 0:
@@ -575,8 +611,13 @@ def train(config: MLXTitansConfig):
             else:
                 gates_str = f", gate={gate_mean:.3f}"
 
+            # Timing info
+            avg_step_time = sum(step_times[-10:]) / len(step_times[-10:]) if step_times else 0
+            steps_per_sec = 1.0 / avg_step_time if avg_step_time > 0 else 0
+            timing_str = f" [{t_fwd_bwd*1000:.0f}+{t_opt*1000:.0f}+{t_eval*1000:.0f}ms, {steps_per_sec:.1f} step/s]"
+
             print(
-                f"step {step}: loss={avg_loss:.4f}, mem_scale={mem_scale:.3f}{gates_str}{cms_str}{il_str}, lr={lr:.2e}"
+                f"step {step}: loss={avg_loss:.4f}, mem_scale={mem_scale:.3f}{gates_str}{cms_str}{il_str}, lr={lr:.2e}{timing_str}"
             )
 
     # Save results

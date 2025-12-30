@@ -225,19 +225,21 @@ def profile_training_step(config: MLXTitansConfig):
 
     print(f"Model dim: {dim}, layers: {num_layers}")
 
-    # Create TITANS layer
-    titans_layer = MLXTitansLayer(
-        dim=dim,
-        use_cms=config.use_cms,
-        num_cms_levels=config.num_cms_levels,
-        memory_depth=config.memory_depth,
-        memory_expansion=config.memory_expansion,
-        adaptive_memory=config.adaptive_memory,
-    )
+    # Create TITANS layers (support multiple)
+    titans_layers = {}
+    for layer_idx in config.memory_layers:
+        idx = min(layer_idx, num_layers - 1)
+        titans_layers[idx] = MLXTitansLayer(
+            dim=dim,
+            use_cms=config.use_cms,
+            num_cms_levels=config.num_cms_levels,
+            memory_depth=config.memory_depth,
+            memory_expansion=config.memory_expansion,
+            adaptive_memory=config.adaptive_memory,
+        )
 
-    # Use middle layer
-    layer_idx = min(config.memory_layers[0], num_layers - 1)
-    titans_layers = {layer_idx: titans_layer}
+    print(f"TITANS layers: {list(titans_layers.keys())}")
+    layer_idx = list(titans_layers.keys())[0]  # Use first for single-layer tests
 
     # Create combined model
     combined_model = CombinedModel(
@@ -316,13 +318,25 @@ def profile_training_step(config: MLXTitansConfig):
         layer_memory_grads = memory_grads
         layer_gate_grads = gate_grads
 
+    titans_layer = titans_layers[layer_idx]  # Get first layer for single-layer tests
+
     def optimizer_step():
         optimizer_memory.update(titans_layer, layer_memory_grads)
         optimizer_gate.update(titans_layer, layer_gate_grads)
 
     result = time_operation(optimizer_step, num_iters=5)
     results["optimizer_step"] = result
-    print(f"  Optimizer step:          {result.mean_ms:.2f} ms (std={result.std_ms:.2f})")
+    print(f"  Optimizer step (1 layer):{result.mean_ms:.2f} ms (std={result.std_ms:.2f})")
+
+    # Profile optimizer step for ALL layers
+    def optimizer_step_all():
+        for idx, layer in titans_layers.items():
+            optimizer_memory.update(layer, layer_memory_grads)
+            optimizer_gate.update(layer, layer_gate_grads)
+
+    result = time_operation(optimizer_step_all, num_iters=5)
+    results["optimizer_step_all"] = result
+    print(f"  Optimizer step ({len(titans_layers)} layers):{result.mean_ms:.2f} ms (std={result.std_ms:.2f})")
 
     # Profile mx.eval
     def eval_params():
@@ -477,11 +491,15 @@ def main():
     print(f"Segment length: {args.segment_len}")
     print(f"Batch size: {args.batch_size}")
 
+    # Test both single and multi-layer configs
+    memory_layers = [8, 10, 12] if args.detailed else [12]
+    print(f"Memory layers: {memory_layers}")
+
     config = MLXTitansConfig(
         model_name=args.model_name,
         segment_len=args.segment_len,
         batch_size=args.batch_size,
-        memory_layers=[12],
+        memory_layers=memory_layers,
         use_cms=True,
         num_cms_levels=3,
     )
