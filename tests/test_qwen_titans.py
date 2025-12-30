@@ -18,24 +18,16 @@ import torch
 import torch.nn as nn
 
 from nanogpt_titans.qwen_titans.config import TitansQwenConfig
+from nanogpt_titans.qwen_titans.decoder_layer import PositionDependentGate, TitansQwenDecoderLayer
 from nanogpt_titans.qwen_titans.memory_adapter import (
-    NeuralMemoryAdapter,
-    SelfModifyingLinear,
-    SelfModifyingGate,
-    ContinuumMemorySystem,
     ContinuumMemoryState,
-    WarmStartEncoder,
+    ContinuumMemorySystem,
     DeepMomentumUpdate,
+    NeuralMemoryAdapter,
+    SelfModifyingGate,
+    SelfModifyingLinear,
+    WarmStartEncoder,
 )
-from nanogpt_titans.qwen_titans.decoder_layer import TitansQwenDecoderLayer, PositionDependentGate
-from nanogpt_titans.qwen_titans.patcher import (
-    patch_qwen_with_titans,
-    freeze_base_model,
-    get_titans_layers,
-    get_gate_statistics,
-    get_internal_losses,
-)
-
 
 # --- Fixtures ---
 
@@ -578,8 +570,9 @@ class TestTitansQwenDecoderLayer:
         assert internal_loss is not None
         assert internal_loss.item() >= 0
 
-    def test_internal_loss_disabled_by_default(self, small_config, mock_qwen_layer):
-        """Test internal loss is NOT computed when disabled (default)."""
+    def test_internal_loss_disabled_when_configured(self, small_config, mock_qwen_layer):
+        """Test internal loss is NOT computed when explicitly disabled in config."""
+        # small_config fixture has use_internal_loss=False
         layer = TitansQwenDecoderLayer(mock_qwen_layer, 0, small_config)
         layer.train()
         x = torch.randn(2, 32, 64)
@@ -685,9 +678,9 @@ class TestTitansQwenConfig:
         # New defaults: self-mod components disabled, use PositionDependentGate
         assert config.use_self_mod_proj is False
         assert config.use_self_mod_gate is False
-        # Internal loss disabled by default
-        assert config.use_internal_loss is False
-        assert config.internal_loss_weight == 0.0
+        # Internal loss ENABLED by default (critical for memory to learn)
+        assert config.use_internal_loss is True
+        assert config.internal_loss_weight == 0.1
 
     def test_prefix_len_property(self):
         """Test prefix_len calculation."""

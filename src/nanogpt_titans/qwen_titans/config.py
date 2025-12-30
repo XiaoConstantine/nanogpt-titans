@@ -91,11 +91,11 @@ class TitansQwenConfig:
     warm_start_prefix_len: int = 32  # Tokens to use for warm start
     warm_start_layers: int = 2  # Transformer layers in warm start encoder
 
-    # Internal loss (self-supervised signal for memory)
-    # WARNING: Internal loss can dominate LM loss and train memory for wrong objective
-    # Keep disabled or use very small weight (1e-4 max)
-    use_internal_loss: bool = False  # DISABLED by default - causes degradation
-    internal_loss_weight: float = 0.0  # Set to 0 or 1e-4 max if enabled
+    # Internal loss (CRITICAL: teaches memory projections to store/retrieve patterns)
+    # Must be True for memory to learn during training!
+    # The internal loss trains key_proj, value_proj, query_proj to produce meaningful mappings
+    use_internal_loss: bool = True  # ENABLED by default - critical for memory learning
+    internal_loss_weight: float = 0.1  # Stronger signal for memory training
 
     @classmethod
     def from_qwen_config(
