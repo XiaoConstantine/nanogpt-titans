@@ -22,7 +22,6 @@ from dataclasses import dataclass
 import mlx.core as mx
 import mlx.nn as nn
 
-
 # =============================================================================
 # Helper Functions for Performance
 # =============================================================================
@@ -78,6 +77,8 @@ def _compute_grads_and_update_impl(
     dW1 = dW1 * clip_coef
 
     # Weight update with momentum
+    # NOTE: Removed intermediate clips for 1.29x speedup. Gradient clipping above
+    # already bounds gradients, so momentum stays bounded. Only clip final weights.
     one_minus_mom = 1 - mom_3d
     decay_factor = 1 - decay_3d
 
@@ -165,6 +166,7 @@ def _cms_update_stacked_impl(
     dW1_clipped = (dW1_L * clip_coefs_expanded).reshape(L * B, C, H)
 
     # Weight update with momentum
+    # NOTE: Removed intermediate clips for speedup (gradient clipping already bounds values)
     one_minus_mom = 1 - mom_flat
     decay_factor = 1 - decay_flat
     new_m0 = mom_flat * m0_flat + one_minus_mom * dW0_clipped
@@ -201,6 +203,7 @@ def _weight_update(
 
     Performs momentum SGD with decay on both weight matrices in one pass.
     This reduces overhead vs updating weights separately.
+    NOTE: Removed intermediate clips for speedup (gradient clipping bounds values).
     """
     one_minus_mom = 1 - mom_3d
     decay_factor = 1 - decay_3d
@@ -437,12 +440,18 @@ class MLXNeuralMemory(nn.Module):
         W0 = weights["w0"]  # [B, H, C]
         W1 = weights["w1"]  # [B, C, H]
 
+        # Clip input for numerical stability
+        x = mx.clip(x, -10.0, 10.0)
+
         # Layer 0: h = silu(x @ W0.T)
         h_pre = mx.matmul(x, mx.transpose(W0, axes=(0, 2, 1)))  # [B, T, H]
+        h_pre = mx.clip(h_pre, -10.0, 10.0)  # Clip before activation
         h = mx.sigmoid(h_pre) * h_pre  # SiLU activation
+        h = mx.clip(h, -10.0, 10.0)  # Clip after activation
 
         # Layer 1: out = h @ W1.T
         out = mx.matmul(h, mx.transpose(W1, axes=(0, 2, 1)))  # [B, T, C]
+        out = mx.clip(out, -10.0, 10.0)  # Clip output
 
         return out
 
@@ -627,8 +636,12 @@ class MLXNeuralMemory(nn.Module):
             # First segment: use learned initial query
             query_source = mx.broadcast_to(self.init_query, (B, 1, C))
 
+        # Clip query source for numerical stability
+        query_source = mx.clip(query_source, -10.0, 10.0)
+
         # Project to queries
         queries = self.query_proj(query_source)
+        queries = mx.clip(queries, -10.0, 10.0)
 
         # Retrieve using per-batch memory MLP weights
         retrieved = self._batched_mlp_forward(queries, state.weights)
@@ -644,7 +657,9 @@ class MLXNeuralMemory(nn.Module):
                 padding = mx.broadcast_to(retrieved[:, -1:, :], (B, T - T_prev, C))
                 retrieved = mx.concatenate([retrieved, padding], axis=1)
 
-        return self.out_proj(retrieved)
+        # Clip output for numerical stability
+        output = self.out_proj(retrieved)
+        return mx.clip(output, -10.0, 10.0)
 
     def update(self, x: mx.array, state: MLXMemoryState) -> tuple[MLXMemoryState, MemoryMetrics]:
         """
@@ -877,12 +892,16 @@ class MLXContinuumMemorySystem(nn.Module):
         Returns:
             Combined memory output [B, T, C]
         """
+        # Clip input for numerical stability
+        hidden_states = mx.clip(hidden_states, -10.0, 10.0)
+
         if self.use_cascade:
             # Cascade mode: each level transforms the previous level's output
             # Level 0 processes input, Level 1 processes Level 0's output, etc.
             current = hidden_states
             for i, mem in enumerate(self.memories):
                 current = mem(current, state.level_states[i])
+                current = mx.clip(current, -10.0, 10.0)  # Clip after each level
             return current
         else:
             # Weighted sum mode (default): all levels process same input
@@ -900,7 +919,8 @@ class MLXContinuumMemorySystem(nn.Module):
             weights_expanded = weights.reshape(-1, 1, 1, 1)
             combined = mx.sum(weights_expanded * stacked, axis=0)  # [B, T, C]
 
-            return combined
+            # Clip output for numerical stability
+            return mx.clip(combined, -10.0, 10.0)
 
     def compute_internal_loss(self, x: mx.array, state: MLXCMSState) -> mx.array:
         """
@@ -1174,3 +1194,350 @@ class MLXContinuumMemorySystem(nn.Module):
     def get_last_metrics(self) -> CMSMetrics | None:
         """Get metrics from the last update call."""
         return self._last_metrics
+
+
+# =============================================================================
+# Shared Memory Architecture
+# =============================================================================
+
+
+class MLXLayerAdapter(nn.Module):
+    """
+    Per-layer adapter for shared memory access.
+
+    Each transformer layer that uses shared memory has its own adapter
+    that controls how it reads from and writes to the shared memory.
+
+    This enables layer-specific transformations while sharing the
+    underlying memory weights across all layers.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        gate_init_bias: float = -2.0,
+    ):
+        super().__init__()
+        self.dim = dim
+
+        # Query transformation (how this layer reads from memory)
+        self.to_query = nn.Linear(dim, dim, bias=False)
+
+        # Update transformation (how this layer writes to memory)
+        self.to_update = nn.Linear(dim, dim, bias=False)
+
+        # Memory output projection and normalization
+        self.mem_proj = nn.Linear(dim, dim, bias=False)
+        self.mem_ln = nn.LayerNorm(dim)
+
+        # Learned scale parameter (sigmoid(0) = 0.5)
+        self.mem_scale = mx.array([0.0])
+
+        # Position-dependent gate (per-token gating)
+        # Using small MLP like MLXPositionDependentGate
+        self.gate_linear1 = nn.Linear(dim, dim // 4)
+        self.gate_linear2 = nn.Linear(dim // 4, 1)
+
+        # Initialize gate with small random weights
+        scale = 0.01
+        self.gate_linear1.weight = mx.random.normal(self.gate_linear1.weight.shape) * scale
+        self.gate_linear1.bias = mx.zeros(self.gate_linear1.bias.shape)
+        self.gate_linear2.weight = mx.random.normal(self.gate_linear2.weight.shape) * scale
+        self.gate_linear2.bias = mx.array([gate_init_bias])
+
+    def compute_gate(self, x: mx.array) -> mx.array:
+        """Compute per-token gate values [B, T, 1]."""
+        # Clip input for numerical stability
+        x_clipped = mx.clip(x, -10.0, 10.0)
+        h = mx.tanh(self.gate_linear1(x_clipped))
+        return mx.sigmoid(self.gate_linear2(h))
+
+    def transform_for_query(self, hidden_states: mx.array) -> mx.array:
+        """Transform hidden states for memory retrieval."""
+        # Clip for numerical stability
+        h_clipped = mx.clip(hidden_states, -10.0, 10.0)
+        out = self.to_query(h_clipped)
+        return mx.clip(out, -10.0, 10.0)
+
+    def transform_for_update(self, hidden_states: mx.array) -> mx.array:
+        """Transform hidden states for memory update."""
+        # Clip for numerical stability
+        h_clipped = mx.clip(hidden_states, -10.0, 10.0)
+        out = self.to_update(h_clipped)
+        return mx.clip(out, -10.0, 10.0)
+
+    def project_memory_output(self, mem_out: mx.array) -> mx.array:
+        """Project and normalize memory output."""
+        # Clip memory output for numerical stability
+        mem_out = mx.clip(mem_out, -10.0, 10.0)
+
+        # Pool across memory tokens if needed
+        if mem_out.ndim == 3 and mem_out.shape[1] > 1:
+            mem_out = mx.mean(mem_out, axis=1, keepdims=True)
+
+        projected = self.mem_proj(mem_out)
+        # Clip before LayerNorm to prevent NaN
+        projected = mx.clip(projected, -10.0, 10.0)
+        normalized = self.mem_ln(projected)
+        # Clip after LayerNorm as well
+        normalized = mx.clip(normalized, -10.0, 10.0)
+        scaled = mx.sigmoid(self.mem_scale) * normalized
+        return scaled
+
+
+@dataclass
+class SharedMemoryState:
+    """State for shared memory system."""
+
+    memory_state: MLXMemoryState | MLXCMSState
+    step: int = 0
+
+
+class MLXSharedMemorySystem(nn.Module):
+    """
+    Shared memory system where ONE memory is used across multiple transformer layers.
+
+    Instead of independent memory modules at each layer, this system has:
+    - One shared memory (CMS or single NeuralMemory)
+    - Per-layer adapters for reading/writing
+
+    Benefits:
+    - Fewer parameters (1x memory + small adapters vs Nx memories)
+    - Layers coordinate through shared state
+    - Information accumulates across layers
+    - Matches paper's "one memory module" design more closely
+
+    Usage:
+        shared_mem = MLXSharedMemorySystem(dim=896, memory_layers=[8, 10, 12])
+        shared_mem.init_state(batch_size=2)
+
+        # In forward pass, for each memory layer:
+        h = shared_mem.apply_memory(h, layer_idx=8)
+        # ... more transformer layers ...
+        h = shared_mem.apply_memory(h, layer_idx=10)
+        # ... more transformer layers ...
+        h = shared_mem.apply_memory(h, layer_idx=12)
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        memory_layers: list[int],
+        use_cms: bool = True,
+        num_cms_levels: int = 3,
+        cms_update_frequencies: tuple[int, ...] = (1, 4, 16),
+        memory_depth: int = 2,
+        memory_expansion: int = 2,
+        adaptive: bool = True,
+        lr_max: float = 0.01,
+        grad_clip: float = 1.0,
+        gate_init_bias: float = -2.0,
+        use_cascade: bool = False,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.memory_layers = sorted(memory_layers)
+        self.use_cms = use_cms
+
+        # Create ONE shared memory
+        if use_cms:
+            self.memory = MLXContinuumMemorySystem(
+                dim=dim,
+                num_levels=num_cms_levels,
+                update_frequencies=cms_update_frequencies,
+                memory_depth=memory_depth,
+                memory_expansion=memory_expansion,
+                adaptive=adaptive,
+                lr_max=lr_max,
+                grad_clip=grad_clip,
+                use_cascade=use_cascade,
+            )
+        else:
+            self.memory = MLXNeuralMemory(
+                dim=dim,
+                depth=memory_depth,
+                expansion=memory_expansion,
+                adaptive=adaptive,
+                lr_max=lr_max,
+                grad_clip=grad_clip,
+            )
+
+        # Create per-layer adapters
+        self.adapters = {
+            layer_idx: MLXLayerAdapter(dim, gate_init_bias=gate_init_bias)
+            for layer_idx in memory_layers
+        }
+
+        # State management
+        self._state: MLXMemoryState | MLXCMSState | None = None
+        self._last_metrics: dict[int, MemoryMetrics | CMSMetrics] = {}
+
+    def init_state(self, batch_size: int) -> SharedMemoryState:
+        """Initialize shared memory state."""
+        self._state = self.memory.init_state(batch_size)
+        self._last_metrics = {}
+        return SharedMemoryState(memory_state=self._state)
+
+    def reset_state(self) -> None:
+        """Reset shared memory state."""
+        self._state = None
+        self._last_metrics = {}
+
+    def retrieve(self, hidden_states: mx.array, layer_idx: int) -> mx.array:
+        """
+        Retrieve from shared memory using layer-specific query transformation.
+
+        Args:
+            hidden_states: Current hidden states [B, T, C]
+            layer_idx: Which layer is retrieving
+
+        Returns:
+            Memory output [B, T, C] or [B, num_longterm_mem, C]
+        """
+        if self._state is None:
+            raise RuntimeError("Memory state not initialized. Call init_state() first.")
+
+        if layer_idx not in self.adapters:
+            raise ValueError(f"Layer {layer_idx} not in memory_layers {self.memory_layers}")
+
+        adapter = self.adapters[layer_idx]
+
+        # Transform hidden states for this layer's query
+        query = adapter.transform_for_query(hidden_states)
+
+        # Retrieve from shared memory
+        return self.memory(query, self._state)
+
+    def update_memory(self, hidden_states: mx.array, layer_idx: int) -> MemoryMetrics | CMSMetrics:
+        """
+        Update shared memory using layer-specific update transformation.
+
+        Note: Named update_memory (not update) to avoid conflict with nn.Module.update()
+        which is used by MLX optimizers.
+
+        Args:
+            hidden_states: Current hidden states [B, T, C]
+            layer_idx: Which layer is updating
+
+        Returns:
+            Update metrics
+        """
+        if self._state is None:
+            raise RuntimeError("Memory state not initialized. Call init_state() first.")
+
+        if layer_idx not in self.adapters:
+            raise ValueError(f"Layer {layer_idx} not in memory_layers {self.memory_layers}")
+
+        adapter = self.adapters[layer_idx]
+
+        # Transform hidden states for this layer's update
+        update_signal = adapter.transform_for_update(hidden_states)
+
+        # Update shared memory
+        self._state, metrics = self.memory.update(update_signal, self._state)
+        self._last_metrics[layer_idx] = metrics
+
+        return metrics
+
+    def apply_memory(
+        self,
+        hidden_states: mx.array,
+        layer_idx: int,
+        state: SharedMemoryState | None = None,
+    ) -> tuple[mx.array, SharedMemoryState]:
+        """
+        Full memory integration: retrieve, gate, add residual, update.
+
+        This is the main interface for using shared memory in a transformer layer.
+
+        Args:
+            hidden_states: Hidden states from transformer layer [B, T, C]
+            layer_idx: Which layer is using memory
+            state: Optional state to use (if None, uses internal state)
+
+        Returns:
+            Tuple of (updated hidden states [B, T, C], new state)
+        """
+        # Use provided state or internal state
+        if state is not None:
+            self._state = state.memory_state
+
+        if self._state is None:
+            raise RuntimeError("Memory state not initialized. Call init_state() first.")
+
+        adapter = self.adapters[layer_idx]
+
+        # Clip input for numerical stability
+        hidden_states_clipped = mx.clip(hidden_states, -10.0, 10.0)
+
+        # 1. Retrieve from shared memory
+        mem_out = self.retrieve(hidden_states_clipped, layer_idx)
+
+        # 2. Project and scale memory output
+        mem_projected = adapter.project_memory_output(mem_out)
+
+        # 3. Broadcast to sequence length if needed
+        if mem_projected.shape[1] == 1 and hidden_states.shape[1] > 1:
+            mem_projected = mx.broadcast_to(
+                mem_projected,
+                (hidden_states.shape[0], hidden_states.shape[1], hidden_states.shape[2])
+            )
+
+        # 4. Compute per-token gate
+        gate = adapter.compute_gate(hidden_states_clipped)
+
+        # 5. Apply gated residual (HOPE formula)
+        output = hidden_states + gate * mem_projected
+
+        # Clip output for numerical stability
+        output = mx.clip(output, -10.0, 10.0)
+
+        # 6. Update shared memory with the output
+        self.update_memory(output, layer_idx)
+
+        # Return output and new state
+        new_state = SharedMemoryState(memory_state=self._state)
+        return output, new_state
+
+    def compute_internal_loss(
+        self,
+        hidden_states: mx.array,
+        layer_idx: int,
+        state: SharedMemoryState | None = None,
+    ) -> mx.array:
+        """
+        Compute internal loss for training.
+
+        Uses the shared memory's internal loss computation.
+
+        Args:
+            hidden_states: Hidden states [B, T, C]
+            layer_idx: Which layer is computing loss
+            state: Optional state to use (if None, uses internal state)
+        """
+        # Use provided state or internal state
+        if state is not None:
+            memory_state = state.memory_state
+        elif self._state is not None:
+            memory_state = self._state
+        else:
+            raise RuntimeError("Memory state not initialized. Call init_state() first.")
+
+        adapter = self.adapters[layer_idx]
+        query = adapter.transform_for_query(hidden_states)
+
+        return self.memory.compute_internal_loss(query, memory_state)
+
+    def get_state(self) -> MLXMemoryState | MLXCMSState | None:
+        """Get current memory state."""
+        return self._state
+
+    def get_last_metrics(self, layer_idx: int | None = None) -> dict | MemoryMetrics | CMSMetrics | None:
+        """Get metrics from last update(s)."""
+        if layer_idx is not None:
+            return self._last_metrics.get(layer_idx)
+        return self._last_metrics
+
+    def get_adapter(self, layer_idx: int) -> MLXLayerAdapter:
+        """Get adapter for a specific layer."""
+        return self.adapters[layer_idx]
