@@ -216,14 +216,16 @@ class MAGQwenDecoderLayer(nn.Module):
         # Broadcast gate to full sequence
         gate = gate.expand(-1, T, -1)  # [B, T, C]
 
-        # Apply multiplicative modulation
-        output = attn_output * gate
-
         # ===== Memory Update =====
+        # Update with RAW attn_output (not memory-modulated output!)
+        # Memory should learn to predict transformer patterns, not its own output.
         if self.update_memory:
-            new_memory_state = self.memory.update(output, memory_state)
+            new_memory_state = self.memory.update(attn_output, memory_state)
         else:
             new_memory_state = memory_state
+
+        # Apply multiplicative modulation (after update)
+        output = attn_output * gate
 
         # Store for external access
         self._updated_memory_state = new_memory_state

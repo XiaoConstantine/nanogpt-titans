@@ -135,7 +135,7 @@ class CombinedModel(nn.Module):
         teach_signal_weight: float = 0.1,
     ):
         """
-        Initialize combined model with multiple TITANS layers.
+        Initialize combined model with TITANS layers.
 
         Args:
             base_model: The base language model
@@ -147,8 +147,6 @@ class CombinedModel(nn.Module):
         """
         super().__init__()
         self.base_model = base_model
-        self.titans_layers = titans_layers
-        self.memory_layer_indices = sorted(titans_layers.keys())
         self.use_internal_loss = use_internal_loss
         self.internal_loss_weight = internal_loss_weight
         self.use_teach_signal = use_teach_signal
@@ -157,6 +155,9 @@ class CombinedModel(nn.Module):
         # Get inner model reference
         self._inner_model = base_model.model if hasattr(base_model, "model") else base_model
 
+        # Independent memory mode: separate TITANS layer per position
+        self.titans_layers = titans_layers
+        self.memory_layer_indices = sorted(titans_layers.keys())
         # Memory states per layer (initialized on first forward)
         self._memory_states: dict[int, TitansLayerState | None] = dict.fromkeys(self.memory_layer_indices)
 
@@ -203,7 +204,7 @@ class CombinedModel(nn.Module):
 
             # Apply TITANS at specified layers (with memory state update)
             if i in self.memory_layer_indices:
-                # Store hidden states and state BEFORE memory update for internal/teach loss
+                # Independent memory mode: separate TITANS layer per position
                 if self.use_internal_loss or self.use_teach_signal:
                     h_at_memory_layers[i] = h
                     states_before_update[i] = self._memory_states[i]
@@ -215,6 +216,7 @@ class CombinedModel(nn.Module):
         # Compute internal loss if enabled (sum across all layers)
         if self.use_internal_loss and h_at_memory_layers:
             internal_losses = []
+            # Independent mode: compute internal loss per TITANS layer
             for idx in self.memory_layer_indices:
                 if idx in h_at_memory_layers and idx in states_before_update:
                     loss = self.titans_layers[idx].compute_internal_loss(
@@ -286,13 +288,14 @@ class CombinedModel(nn.Module):
 
     # Convenience properties for single-layer backward compatibility
     @property
-    def titans_layer(self) -> MLXTitansLayer:
+    def titans_layer(self) -> MLXTitansLayer | None:
         """Get the first TITANS layer (for backward compatibility)."""
         return self.titans_layers[self.memory_layer_indices[0]]
 
     def get_layer_stats(self) -> dict[int, dict[str, float]]:
         """Get stats for all TITANS layers."""
         stats = {}
+        # Independent mode: get stats from TITANS layers
         for idx in self.memory_layer_indices:
             layer = self.titans_layers[idx]
             stats[idx] = {
@@ -608,7 +611,7 @@ def online_eval(
 
     # Handle remaining tokens if T is not divisible by chunk_size
     remaining = T % chunk_size
-    if remaining > 0 and T > chunk_size:
+    if remaining > 0 and chunk_size < T:
         logits = combined_model(input_ids)
         mx.eval(logits)
 
@@ -661,7 +664,7 @@ def online_generate(
     """
     # Encode prompt
     input_ids = mx.array(tokenizer.encode(prompt)).reshape(1, -1)
-    B, T = input_ids.shape
+    B, _T = input_ids.shape
 
     # Initialize memory
     combined_model.init_memory_state(B)

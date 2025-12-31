@@ -318,9 +318,11 @@ class TitansQwenDecoderLayer(nn.Module):
         if self.config.use_internal_loss and self.training:
             self._internal_loss = self._compute_memory_surprise(hidden_states)
 
-        # 6. Update memory with segment output
+        # 6. Update memory with RAW attn_output (not memory-augmented output!)
+        # This is critical: memory should learn to predict transformer patterns,
+        # not its own output. Using output here creates a feedback loop.
         if self.update_memory:
-            update_result = self.memory.update(output, memory_state)
+            update_result = self.memory.update(attn_output, memory_state)
             # Handle both old and new return types (CMS returns tuple)
             if isinstance(update_result, tuple):
                 new_memory_state, _metrics = update_result

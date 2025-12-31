@@ -812,3 +812,5 @@ class NeuralMemoryAdapter(nn.Module):
     def get_trainable_param_count(self) -> int:
         """Get trainable parameter count for this memory module."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+

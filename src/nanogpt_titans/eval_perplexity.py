@@ -441,35 +441,37 @@ def evaluate_mlx_perplexity(
     dim = model.model.layers[0].self_attn.q_proj.weight.shape[0]
     num_layers = len(model.model.layers)
 
-    # Create TITANS layers
-    titans_layers = {}
-    for layer_idx in memory_layers:
-        idx = min(layer_idx, num_layers - 1)
-        titans_layers[idx] = MLXTitansLayer(
-            dim=dim,
-            use_cms=True,
-            num_cms_levels=3,
-            cms_update_frequencies=(1, 4, 16),
-        )
-
-
+    # Load weights if provided
+    weights = None
     if titans_weights:
-        # Load saved weights (supports .safetensors and .npz)
         print(f"Loading TITANS weights from {titans_weights}...")
         if titans_weights.endswith(".safetensors"):
             weights = mx.load(titans_weights)
         else:
             weights = dict(mx.load(titans_weights))
 
+    # Clamp memory layers to valid range
+    valid_memory_layers = [min(idx, num_layers - 1) for idx in memory_layers]
+
+    # Create independent TITANS layers
+    titans_layers = {}
+    for layer_idx in valid_memory_layers:
+        titans_layers[layer_idx] = MLXTitansLayer(
+            dim=dim,
+            use_cms=True,
+            num_cms_levels=3,
+            cms_update_frequencies=(1, 4, 16),
+        )
+
+    # Load weights for each layer
+    if weights:
         for layer_idx, layer in titans_layers.items():
             prefix = f"layer_{layer_idx}."
-            # Get weights for this layer with string keys (e.g., 'gate.linear1.weight')
             layer_weights = [
                 (k[len(prefix) :], v) for k, v in weights.items() if k.startswith(prefix)
             ]
 
             if layer_weights:
-                # load_weights expects list of (key_string, value) tuples
                 layer.load_weights(layer_weights)
                 print(f"  Loaded {len(layer_weights)} weights for layer {layer_idx}")
 
@@ -477,7 +479,7 @@ def evaluate_mlx_perplexity(
             *[p for layer in titans_layers.values() for _, p in tree_flatten(layer.parameters())]
         )
 
-    # Create combined model
+    # Create combined model with independent layers
     combined_model = CombinedModel(model, titans_layers)
 
     # Track losses by position

@@ -200,8 +200,10 @@ class MALQwenDecoderLayer(nn.Module):
             other_outputs = ()
 
         # ===== STEP 4: Memory Update =====
+        # Update with RAW hidden_states (not memory-enhanced or attention output!)
+        # Memory should learn to predict transformer patterns, not its own output.
         if self.update_memory:
-            new_memory_state = self.memory.update(output, memory_state)
+            new_memory_state = self.memory.update(hidden_states, memory_state)
         else:
             new_memory_state = memory_state
 

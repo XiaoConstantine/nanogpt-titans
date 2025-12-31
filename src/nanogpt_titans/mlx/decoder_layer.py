@@ -178,12 +178,14 @@ class MLXTitansLayer(nn.Module):
         # 3. Position-dependent gate
         gate_value = self.gate(hidden_states)  # [B, T, 1]
 
-        # 4. HOPE: Additive contribution
-        output = hidden_states + gate_value * mem_scaled
-
-        # 5. Update memory with current segment (test-time learning!)
-        new_state, metrics = self.memory.update(output, state)
+        # 4. Update memory with RAW hidden_states (not memory-augmented output!)
+        # This is critical: memory should learn to predict transformer patterns,
+        # not its own output. Using output here creates a feedback loop.
+        new_state, metrics = self.memory.update(hidden_states, state)
         self._last_metrics = metrics
+
+        # 5. HOPE: Additive contribution (after update)
+        output = hidden_states + gate_value * mem_scaled
 
         return output, new_state
 
