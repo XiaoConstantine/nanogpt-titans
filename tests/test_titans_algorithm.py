@@ -3,11 +3,11 @@ Tests for Titans core algorithm based on the paper:
 "Titans: Learning to Memorize at Test Time" (arXiv:2501.00663)
 
 These tests verify the implementation matches the paper's key equations:
-- Eq (12): Loss ℓ(M; x) = ‖M(k) - v‖²
-- Eq (10): Sₜ = ηₜSₜ₋₁ - θₜ∇ℓ(Mₜ₋₁; xₜ)  [surprise with momentum]
-- Eq (11): ℳₜ = (1 - αₜ)ℳₜ₋₁ + Sₜ  [weight update with decay]
-- Memory retrieval uses Mₜ₋₁ (previous state, not current)
-- MAC architecture: [persistent_mem ‖ retrieved_mem ‖ segment]
+- Eq (12): Loss L(M; x) = ||M(k) - v||^2
+- Eq (10): S_t = eta_t * S_{t-1} - theta_t * grad_L(M_{t-1}; x_t)  [surprise with momentum]
+- Eq (11): M_t = (1 - alpha_t) * M_{t-1} + S_t  [weight update with decay]
+- Memory retrieval uses M_{t-1} (previous state, not current)
+- MAC architecture: [persistent_mem || retrieved_mem || segment]
 
 Run with: uv run pytest tests/test_titans_algorithm.py -v
 """
@@ -17,12 +17,10 @@ import torch
 import torch.nn.functional as F
 
 from nanogpt_titans.model import (
+    NeuralMemory,
+    TitansBlock,
     TitansConfig,
     TitansGPT,
-    TitansBlock,
-    NeuralMemory,
-    MemoryState,
-    MemoryMLP,
     parallel_momentum,
 )
 
@@ -52,7 +50,7 @@ def config():
 
 class TestAssociativeMemoryLoss:
     """
-    Paper Eq (12): ℓ(M; x) = ‖M(k) - v‖²
+    Paper Eq (12): L(M; x) = ||M(k) - v||^2
 
     The loss measures how well the memory MLP can predict v from k.
     """
@@ -102,19 +100,19 @@ class TestAssociativeMemoryLoss:
 
 class TestSurpriseWithMomentum:
     """
-    Paper Eq (10): Sₜ = ηₜSₜ₋₁ - θₜ∇ℓ(Mₜ₋₁; xₜ)
+    Paper Eq (10): S_t = eta_t * S_{t-1} - theta_t * grad_L(M_{t-1}; x_t)
 
-    - Sₜ is accumulated surprise (momentum)
-    - ηₜ is momentum coefficient
-    - θₜ scales momentary surprise
-    - ∇ℓ is gradient of loss
+    - S_t is accumulated surprise (momentum)
+    - eta_t is momentum coefficient
+    - theta_t scales momentary surprise
+    - grad_L is gradient of loss
     """
 
     def test_weight_update_uses_gradient_descent(self, config):
         """
         Weight update should follow gradient descent direction.
 
-        Paper: Sₜ = ... - θₜ∇ℓ (negative gradient for surprise)
+        Paper: S_t = ... - theta_t * grad_L (negative gradient for surprise)
         Our optimized impl: weights -= lr * momentum(grads)
 
         This is mathematically equivalent to:
@@ -177,9 +175,9 @@ class TestSurpriseWithMomentum:
 
         # Momentum should be non-zero
         for name in state1.last_momentum:
-            assert not torch.allclose(
-                state1.last_momentum[name], torch.zeros_like(state1.last_momentum[name])
-            ), "Momentum should be non-zero after update"
+            assert not torch.allclose(state1.last_momentum[name], torch.zeros_like(state1.last_momentum[name])), (
+                "Momentum should be non-zero after update"
+            )
 
         # Second segment should use previous momentum
         x2 = torch.randn(B, T, C)
@@ -208,7 +206,7 @@ class TestWeightUpdateWithDecay:
         B, T, C = 2, config.segment_len, config.n_embd
 
         state = memory.init_state(B, torch.device("cpu"))
-        initial_weight_norm = sum(w.norm().item() for w in state.weights.values())
+        sum(w.norm().item() for w in state.weights.values())
 
         # With zero surprise, weights should decay
         # Create input that produces near-zero gradients (memory already fits well)
@@ -218,7 +216,7 @@ class TestWeightUpdateWithDecay:
         # Weight update: (1 - decay) * old + lr * momentum
         # With small surprise/momentum, weights should shrink slightly
         decay = config.memory_decay
-        expected_factor = 1 - decay
+        1 - decay
 
         # Weights should be approximately (1-decay) * original
         for name in state.weights:
@@ -255,12 +253,8 @@ class TestWeightUpdateWithDecay:
         new_state2 = memory2.update(x, state2)
 
         # Higher LR should cause larger weight changes
-        change1 = sum(
-            (new_state1.weights[n] - state1.weights[n]).abs().mean().item() for n in state1.weights
-        )
-        change2 = sum(
-            (new_state2.weights[n] - state2.weights[n]).abs().mean().item() for n in state2.weights
-        )
+        change1 = sum((new_state1.weights[n] - state1.weights[n]).abs().mean().item() for n in state1.weights)
+        change2 = sum((new_state2.weights[n] - state2.weights[n]).abs().mean().item() for n in state2.weights)
 
         # LR ratio is 10x, so change2 should be larger
         assert change2 > change1, "Higher LR should cause larger updates"
@@ -286,7 +280,7 @@ class TestMemoryRetrievalCausality:
 
         # First retrieval should NOT use x1 (uses init_query instead)
         x1 = torch.randn(B, T, C) * 100  # Large values
-        retrieved1 = memory(x1, state)
+        memory(x1, state)
 
         # Update with x1
         state = memory.update(x1, state)
@@ -297,7 +291,7 @@ class TestMemoryRetrievalCausality:
 
         # Second retrieval should use x1, not x2
         x2 = torch.randn(B, T, C) * 0.001  # Very different values
-        retrieved2 = memory(x2, state)
+        memory(x2, state)
 
         # retrieved2 should be based on x1, not x2
         # If it used x2, results would be very different due to value difference
@@ -345,9 +339,9 @@ class TestMACArchitecture:
 
         # The forward pass should concatenate in order:
         # [num_longterm_mem, num_persist_mem, T]
-        prefix_len = config.num_longterm_mem + config.num_persist_mem
+        config.num_longterm_mem + config.num_persist_mem
 
-        output, new_state = block(x, state)
+        output, _new_state = block(x, state)
 
         # Output should have same shape as input segment
         assert output.shape == (B, T, C)
@@ -384,7 +378,7 @@ class TestSequenceProcessing:
         T = config.segment_len * 3  # 3 segments
 
         x = torch.randint(0, config.vocab_size, (B, T))
-        logits, loss, states = model(x, targets=x)
+        _logits, _loss, states = model(x, targets=x)
 
         # Memory should have been updated 3 times (once per segment)
         memory_layer_idx = config.n_layer // 2
@@ -431,12 +425,10 @@ class TestNumericalStability:
             torch.zeros(B, T, C),  # Zero
         ]:
             new_state = memory.update(x, state)
-            for name, w in new_state.weights.items():
-                assert not torch.isnan(w).any(), (
-                    f"NaN in weights after update with {x.abs().mean()}"
-                )
-            for name, m in new_state.last_momentum.items():
-                assert not torch.isnan(m).any(), f"NaN in momentum after update"
+            for _name, w in new_state.weights.items():
+                assert not torch.isnan(w).any(), f"NaN in weights after update with {x.abs().mean()}"
+            for _name, m in new_state.last_momentum.items():
+                assert not torch.isnan(m).any(), "NaN in momentum after update"
 
     def test_weights_bounded(self, config):
         """Verify weights don't explode over many updates."""
@@ -481,12 +473,12 @@ class TestAblationComponents:
         assert not torch.allclose(high_mom, low_mom)
 
         # High momentum should be "smoother" (less variance)
-        high_var = high_mom.var().item()
-        low_var = low_mom.var().item()
+        high_mom.var().item()
+        low_mom.var().item()
         # Not guaranteed, but typically true
 
     def test_weight_decay_prevents_unbounded_growth(self, config):
-        """Verify weight decay (α) prevents memory from growing unbounded."""
+        """Verify weight decay (alpha) prevents memory from growing unbounded."""
         memory = NeuralMemory(config)
         B, T, C = 2, config.segment_len, config.n_embd
 

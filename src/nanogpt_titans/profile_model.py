@@ -295,11 +295,6 @@ def profile_with_torch_profiler(
             print(f"  {op_time / 1000:>8.2f} ms  {op_name[:60]}")
 
 
-# =============================================================================
-# Qwen-Titans Gradient Diagnostics
-# =============================================================================
-
-
 def diagnose_gradient_flow(
     model_name: str = "Qwen/Qwen2-0.5B",
     memory_layers: list[int] | None = None,
@@ -604,11 +599,6 @@ def diagnose_gradient_flow(
         "initial_values": {k: v.item() if v.numel() == 1 else v.tolist() for k, v in initial_values.items()},
         "issues": issues,
     }
-
-
-# =============================================================================
-# Qwen-Titans Profiling
-# =============================================================================
 
 
 def profile_qwen_training(

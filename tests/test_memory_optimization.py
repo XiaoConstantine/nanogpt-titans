@@ -130,9 +130,7 @@ class TestAggregatedGradientUpdate:
         )
 
         # Momentum should no longer be zero
-        assert not torch.allclose(
-            new_momentum1["layers.0.weight"], torch.zeros_like(new_momentum1["layers.0.weight"])
-        )
+        assert not torch.allclose(new_momentum1["layers.0.weight"], torch.zeros_like(new_momentum1["layers.0.weight"]))
 
     def test_zero_lr_no_weight_change(self, memory_weights, memory_momentum):
         """Test that lr=0 results in no weight change (only decay)."""
@@ -244,12 +242,8 @@ class TestAggregatedGradientUpdate:
 
         # First batch should have larger weight changes
         # (This is approximate due to aggregation)
-        w0_change_b0 = (
-            (new_weights["layers.0.weight"][0] - memory_weights["layers.0.weight"][0]).abs().mean()
-        )
-        w0_change_b1 = (
-            (new_weights["layers.0.weight"][1] - memory_weights["layers.0.weight"][1]).abs().mean()
-        )
+        w0_change_b0 = (new_weights["layers.0.weight"][0] - memory_weights["layers.0.weight"][0]).abs().mean()
+        w0_change_b1 = (new_weights["layers.0.weight"][1] - memory_weights["layers.0.weight"][1]).abs().mean()
 
         # With higher lr, expect larger changes (not always true due to gradient direction)
         # Just verify both batches updated
@@ -372,9 +366,7 @@ class TestAdaptiveMemoryParameters:
                 mem = block.memory
                 # Check bias values
                 assert abs(mem.to_lr.bias.item() - 0.0) < 1e-5, "to_lr bias should be ~0"
-                assert abs(mem.to_momentum.bias.item() - 2.0) < 1e-5, (
-                    "to_momentum bias should be ~2"
-                )
+                assert abs(mem.to_momentum.bias.item() - 2.0) < 1e-5, "to_momentum bias should be ~2"
                 assert abs(mem.to_decay.bias.item() - (-4.0)) < 1e-5, "to_decay bias should be ~-4"
 
     def test_default_parameter_values(self, small_config):
@@ -396,9 +388,7 @@ class TestAdaptiveMemoryParameters:
                 # decay: sigmoid(-4) ≈ 0.018
                 assert abs(lr.item() - 0.005) < 0.001, f"Expected lr ~0.005, got {lr.item()}"
                 assert abs(mom.item() - 0.88) < 0.02, f"Expected momentum ~0.88, got {mom.item()}"
-                assert abs(decay.item() - 0.018) < 0.005, (
-                    f"Expected decay ~0.018, got {decay.item()}"
-                )
+                assert abs(decay.item() - 0.018) < 0.005, f"Expected decay ~0.018, got {decay.item()}"
 
     def test_set_adaptive_toggle(self, small_config):
         """Test set_adaptive method toggles adaptive mode."""
@@ -434,9 +424,7 @@ class TestAdaptiveMemoryParameters:
         new_state = memory.update(x, state)
 
         # With high lr, weights should change significantly
-        weight_change = (
-            (new_state.weights["layers.0.weight"] - state.weights["layers.0.weight"]).abs().mean()
-        )
+        weight_change = (new_state.weights["layers.0.weight"] - state.weights["layers.0.weight"]).abs().mean()
         assert weight_change > 1e-4, "Adaptive lr should cause weight changes"
 
 
@@ -560,9 +548,7 @@ class TestMemoryOptimizationIntegration:
         expected_extra = 3 * (small_config.n_embd + 1)  # 3 projections
         actual_extra = params_adaptive - params_fixed
 
-        assert actual_extra == expected_extra, (
-            f"Expected {expected_extra} extra params, got {actual_extra}"
-        )
+        assert actual_extra == expected_extra, f"Expected {expected_extra} extra params, got {actual_extra}"
 
 
 # --- Edge Cases ---

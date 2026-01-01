@@ -97,13 +97,9 @@ def evaluate_perplexity_by_position(
         # Get random starting positions
         ix = torch.randint(len(data) - block_size - 1, (batch_size,))
 
-        x = torch.stack(
-            [torch.from_numpy(data[i : i + block_size].astype(np.int64)) for i in ix]
-        ).to(device)
+        x = torch.stack([torch.from_numpy(data[i : i + block_size].astype(np.int64)) for i in ix]).to(device)
 
-        y = torch.stack(
-            [torch.from_numpy(data[i + 1 : i + 1 + block_size].astype(np.int64)) for i in ix]
-        ).to(device)
+        y = torch.stack([torch.from_numpy(data[i + 1 : i + 1 + block_size].astype(np.int64)) for i in ix]).to(device)
 
         with torch.no_grad(), ctx:
             # Process and get per-token losses
@@ -222,11 +218,6 @@ def print_results(results: dict[str, Any], model_name: str = "Model") -> None:
     for seg_idx, data in results["by_segment"].items():
         bar = "█" * int(data["perplexity"] / 10)
         print(f"  Segment {seg_idx:2d}: {data['perplexity']:6.2f} {bar}")
-
-
-# =============================================================================
-# Qwen-Titans Support
-# =============================================================================
 
 
 def load_qwen_model(
@@ -400,11 +391,6 @@ def evaluate_qwen_perplexity_by_position(
     }
 
 
-# =============================================================================
-# MLX-Titans Support
-# =============================================================================
-
-
 def evaluate_mlx_perplexity(
     model_name: str,
     titans_weights: str | None,
@@ -467,17 +453,13 @@ def evaluate_mlx_perplexity(
     if weights:
         for layer_idx, layer in titans_layers.items():
             prefix = f"layer_{layer_idx}."
-            layer_weights = [
-                (k[len(prefix) :], v) for k, v in weights.items() if k.startswith(prefix)
-            ]
+            layer_weights = [(k[len(prefix) :], v) for k, v in weights.items() if k.startswith(prefix)]
 
             if layer_weights:
                 layer.load_weights(layer_weights)
                 print(f"  Loaded {len(layer_weights)} weights for layer {layer_idx}")
 
-        mx.eval(
-            *[p for layer in titans_layers.values() for _, p in tree_flatten(layer.parameters())]
-        )
+        mx.eval(*[p for layer in titans_layers.values() for _, p in tree_flatten(layer.parameters())])
 
     # Create combined model with independent layers
     combined_model = CombinedModel(model, titans_layers)
@@ -579,25 +561,19 @@ def main() -> None:
     """Entry point."""
     import argparse
 
-    parser = argparse.ArgumentParser(
-        description="Evaluate TitansGPT, Qwen-Titans, or MLX-Titans perplexity"
-    )
+    parser = argparse.ArgumentParser(description="Evaluate TitansGPT, Qwen-Titans, or MLX-Titans perplexity")
     # Model selection
     parser.add_argument("--qwen", action="store_true", help="Use Qwen-Titans (PyTorch)")
     parser.add_argument("--mlx", action="store_true", help="Use MLX-Titans (Apple Silicon)")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2-0.5B", help="Qwen model name")
-    parser.add_argument(
-        "--titans_state", type=str, default=None, help="Path to Titans state for Qwen (PyTorch)"
-    )
+    parser.add_argument("--titans_state", type=str, default=None, help="Path to Titans state for Qwen (PyTorch)")
     parser.add_argument(
         "--titans_weights",
         type=str,
         default=None,
         help="Path to Titans weights for MLX (.npz or .safetensors)",
     )
-    parser.add_argument(
-        "--memory_layers", type=str, default="12", help="Memory layer indices (comma-separated)"
-    )
+    parser.add_argument("--memory_layers", type=str, default="12", help="Memory layer indices (comma-separated)")
     parser.add_argument("--segment_len", type=int, default=256, help="Segment length")
 
     # TitansGPT args
@@ -610,22 +586,14 @@ def main() -> None:
         default="wikitext",
         choices=["shakespeare", "wikitext103", "openwebtext", "wikitext"],
     )
-    parser.add_argument(
-        "--block_size", type=int, default=None, help="Override block size (default: use model's)"
-    )
+    parser.add_argument("--block_size", type=int, default=None, help="Override block size (default: use model's)")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_batches", type=int, default=100)
-    parser.add_argument(
-        "--num_samples", type=int, default=50, help="Number of samples for Qwen eval"
-    )
+    parser.add_argument("--num_samples", type=int, default=50, help="Number of samples for Qwen eval")
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda"
-        if torch.cuda.is_available()
-        else "mps"
-        if torch.backends.mps.is_available()
-        else "cpu",
+        default="cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu",
     )
     parser.add_argument("--dtype", type=str, default="bfloat16")
 
@@ -659,9 +627,7 @@ def main() -> None:
             dataset = load_dataset("wikitext", "wikitext-103-v1", split="test")
             min_chars = segment_len * 8 * 4
             texts = []
-            for i in range(
-                0, len("\n\n".join([t for t in dataset["text"] if t.strip()])), min_chars
-            ):
+            for i in range(0, len("\n\n".join([t for t in dataset["text"] if t.strip()])), min_chars):
                 chunk = "\n\n".join([t for t in dataset["text"] if t.strip()])[i : i + min_chars]
                 if len(chunk) > segment_len * 2 * 4:
                     texts.append(chunk)
@@ -716,11 +682,7 @@ def main() -> None:
 
     dtype_map = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
     ptdtype = dtype_map.get(args.dtype, torch.bfloat16)
-    ctx = (
-        nullcontext()
-        if device_type == "cpu"
-        else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
-    )
+    ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
     # =========================================================================
     # Qwen-Titans evaluation (PyTorch)
@@ -736,9 +698,7 @@ def main() -> None:
         )
 
         use_titans = args.titans_state is not None
-        model_name = (
-            f"Qwen-Titans ({args.model_name})" if use_titans else f"Base Qwen ({args.model_name})"
-        )
+        model_name = f"Qwen-Titans ({args.model_name})" if use_titans else f"Base Qwen ({args.model_name})"
 
         # Load text data from HuggingFace datasets
         print(f"\nLoading {args.dataset} dataset...")

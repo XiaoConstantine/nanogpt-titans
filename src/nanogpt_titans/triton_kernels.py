@@ -18,10 +18,6 @@ import torch
 import triton
 import triton.language as tl
 
-# =============================================================================
-# Cross-Entropy Kernels (fused log_softmax + nll_loss)
-# =============================================================================
-
 
 @triton.jit
 def _cross_entropy_fwd_kernel(
@@ -224,11 +220,6 @@ def triton_cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.T
     return _TritonCrossEntropy.apply(logits, targets)
 
 
-# =============================================================================
-# Fused Linear Cross-Entropy (Liger-Kernel inspired)
-# =============================================================================
-
-
 class _FusedLinearCrossEntropy(torch.autograd.Function):
     """
     Fused linear projection + cross-entropy loss.
@@ -393,11 +384,6 @@ def fused_linear_cross_entropy(
     return _FusedLinearCrossEntropy.apply(hidden, weight, bias, targets, chunk_size)
 
 
-# =============================================================================
-# LayerNorm Kernel
-# =============================================================================
-
-
 @triton.jit
 def _layer_norm_fwd_kernel(
     x_ptr,
@@ -503,11 +489,6 @@ def triton_layer_norm(
     )
 
     return y.view(orig_shape)
-
-
-# =============================================================================
-# Fused Linear + SiLU Kernel
-# =============================================================================
 
 
 @triton.jit
@@ -633,11 +614,6 @@ def triton_linear_silu(
     )
 
     return y.view(*orig_shape, N)
-
-
-# =============================================================================
-# Fused MSE Gradient Kernel (for memory update)
-# =============================================================================
 
 
 @triton.jit

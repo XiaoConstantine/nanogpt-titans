@@ -234,11 +234,6 @@ class SelfModifyingGate(nn.Module):
         return self._mean_gate.item()
 
 
-# ---
-# Continuum Memory System (Multi-frequency memory)
-# ---
-
-
 @dataclass
 class ContinuumMemoryState:
     """State for multi-level memory system."""
@@ -487,11 +482,6 @@ class ContinuumMemorySystem(nn.Module):
         return self._last_metrics
 
 
-# ---
-# Warm Start Encoder
-# ---
-
-
 class WarmStartEncoder(nn.Module):
     """
     Initialize memory from input tokens instead of random.
@@ -551,11 +541,6 @@ class WarmStartEncoder(nn.Module):
         mem_init = self.to_memory_init(pooled)  # [B, C]
 
         return mem_init
-
-
-# ---
-# Deep Momentum (Learned gradient compression)
-# ---
 
 
 class DeepMomentumUpdate(nn.Module):
@@ -748,5 +733,3 @@ class NeuralMemoryAdapter(nn.Module):
     def get_trainable_param_count(self) -> int:
         """Get trainable parameter count for this memory module."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
-
-

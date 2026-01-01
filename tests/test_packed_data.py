@@ -11,8 +11,7 @@ import numpy as np
 import pytest
 import torch
 
-from nanogpt_titans.packed_data import PackedDataLoader, PackedBatch
-
+from nanogpt_titans.packed_data import PackedBatch, PackedDataLoader
 
 # --- Fixtures ---
 
@@ -164,7 +163,7 @@ class TestAttentionMask:
                         if mask[i, j]:
                             # Check if they're in the same document
                             # (should not be if there's a boundary between them)
-                            assert False, f"Cross-document attention at ({i}, {j})"
+                            raise AssertionError(f"Cross-document attention at ({i}, {j})")
 
 
 # --- Utilization Tests ---

@@ -7,6 +7,8 @@ the same results as the reference PyTorch implementations.
 Run with: uv run pytest tests/test_triton_kernels.py -v
 """
 
+import contextlib
+
 import pytest
 import torch
 
@@ -169,9 +171,7 @@ class TestFusedWeightUpdateKernel:
         weights_in = torch.ones(B, D, device="cuda", dtype=torch.float32)
         prev_momentum = torch.zeros(B, D, device="cuda", dtype=torch.float32)
 
-        weights_out, _ = triton_fused_weight_update(
-            weights_in, grads, prev_momentum, lr, momentum_coef, decay
-        )
+        weights_out, _ = triton_fused_weight_update(weights_in, grads, prev_momentum, lr, momentum_coef, decay)
 
         # With positive grads and subtraction, weights should decrease
         assert (weights_out < weights_in).all(), "Weights should decrease with positive gradients"
@@ -188,9 +188,7 @@ class TestFusedWeightUpdateKernel:
         weights_in = torch.ones(B, D, device="cuda", dtype=torch.float32) * 10
         prev_momentum = torch.zeros(B, D, device="cuda", dtype=torch.float32)
 
-        weights_out, _ = triton_fused_weight_update(
-            weights_in, grads, prev_momentum, lr, momentum_coef, decay
-        )
+        weights_out, _ = triton_fused_weight_update(weights_in, grads, prev_momentum, lr, momentum_coef, decay)
 
         expected = (1 - decay) * weights_in
         torch.testing.assert_close(weights_out, expected, rtol=1e-5, atol=1e-5)
@@ -251,12 +249,8 @@ class TestBatchedWeightUpdateKernel:
 
         # Verify all parameters match
         for name in param_shapes:
-            torch.testing.assert_close(
-                ref_weights[name], batched_weights[name], rtol=1e-4, atol=1e-4
-            )
-            torch.testing.assert_close(
-                ref_momentum[name], batched_momentum[name], rtol=1e-4, atol=1e-4
-            )
+            torch.testing.assert_close(ref_weights[name], batched_weights[name], rtol=1e-4, atol=1e-4)
+            torch.testing.assert_close(ref_momentum[name], batched_momentum[name], rtol=1e-4, atol=1e-4)
 
     def test_single_param(self):
         """Batched kernel should work with a single parameter."""
@@ -271,7 +265,7 @@ class TestBatchedWeightUpdateKernel:
         grads_dict = {"weight": torch.randn(B, T, D, device="cuda", dtype=torch.float32)}
         momentum_dict = {"weight": torch.randn(B, D, device="cuda", dtype=torch.float32)}
 
-        new_weights, new_momentum = triton_batched_weight_update(
+        new_weights, _new_momentum = triton_batched_weight_update(
             weights_dict, grads_dict, momentum_dict, lr, momentum_coef, decay
         )
 
@@ -429,20 +423,16 @@ triton_linear_silu = None
 triton_mse_grad = None
 
 if CUDA_AVAILABLE:
-    try:
+    with contextlib.suppress(ImportError):
         from nanogpt_titans.triton_kernels import (
             triton_cross_entropy,
             triton_layer_norm,
             triton_linear_silu,
             triton_mse_grad,
         )
-    except ImportError:
-        pass
 
 
-@pytest.mark.skipif(
-    not TRITON_AVAILABLE or triton_cross_entropy is None, reason="Triton not available"
-)
+@pytest.mark.skipif(not TRITON_AVAILABLE or triton_cross_entropy is None, reason="Triton not available")
 class TestTritonCrossEntropy:
     """Tests for the Triton fused cross-entropy kernel."""
 
@@ -505,9 +495,7 @@ class TestTritonCrossEntropy:
         torch.testing.assert_close(loss_ref, loss_triton, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.skipif(
-    not TRITON_AVAILABLE or triton_layer_norm is None, reason="Triton not available"
-)
+@pytest.mark.skipif(not TRITON_AVAILABLE or triton_layer_norm is None, reason="Triton not available")
 class TestTritonLayerNorm:
     """Tests for the Triton fused layer norm kernel."""
 
@@ -565,9 +553,7 @@ class TestTritonLayerNorm:
         torch.testing.assert_close(y_ref, y_triton, rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.skipif(
-    not TRITON_AVAILABLE or triton_linear_silu is None, reason="Triton not available"
-)
+@pytest.mark.skipif(not TRITON_AVAILABLE or triton_linear_silu is None, reason="Triton not available")
 class TestTritonLinearSiLU:
     """Tests for the Triton fused linear + SiLU kernel."""
 
@@ -670,9 +656,7 @@ class TestTritonMSEGrad:
             # Triton
             grad_triton = triton_mse_grad(pred.detach(), target)
 
-            torch.testing.assert_close(
-                grad_ref, grad_triton, rtol=1e-4, atol=1e-4, msg=f"Shape {shape} failed"
-            )
+            torch.testing.assert_close(grad_ref, grad_triton, rtol=1e-4, atol=1e-4, msg=f"Shape {shape} failed")
 
 
 if __name__ == "__main__":

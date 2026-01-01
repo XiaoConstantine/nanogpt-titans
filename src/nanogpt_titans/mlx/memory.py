@@ -22,10 +22,6 @@ from dataclasses import dataclass
 import mlx.core as mx
 import mlx.nn as nn
 
-# =============================================================================
-# Helper Functions for Performance
-# =============================================================================
-
 
 def _compute_grads_and_update_impl(
     keys: mx.array,
@@ -99,21 +95,16 @@ def _compute_grads_and_update_impl(
 _compiled_update = mx.compile(_compute_grads_and_update_impl)
 
 
-# =============================================================================
-# Batched CMS Update - Process all levels in parallel (stacked tensors)
-# =============================================================================
-
-
 def _cms_update_stacked_impl(
-    keys: mx.array,      # [L, B, T, C] - L levels stacked
-    values: mx.array,    # [L, B, T, C]
-    W0: mx.array,        # [L, B, H, C]
-    W1: mx.array,        # [L, B, C, H]
-    m0: mx.array,        # [L, B, H, C]
-    m1: mx.array,        # [L, B, C, H]
-    lr: mx.array,        # [L, B, 1, 1]
-    mom: mx.array,       # [L, B, 1, 1]
-    decay: mx.array,     # [L, B, 1, 1]
+    keys: mx.array,  # [L, B, T, C] - L levels stacked
+    values: mx.array,  # [L, B, T, C]
+    W0: mx.array,  # [L, B, H, C]
+    W1: mx.array,  # [L, B, C, H]
+    m0: mx.array,  # [L, B, H, C]
+    m1: mx.array,  # [L, B, C, H]
+    lr: mx.array,  # [L, B, 1, 1]
+    mom: mx.array,  # [L, B, 1, 1]
+    decay: mx.array,  # [L, B, 1, 1]
     grad_clip: float,
 ) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array]:
     """
@@ -126,34 +117,34 @@ def _cms_update_stacked_impl(
     H = W0.shape[2]
 
     # Reshape for batched matmul: treat L*B as batch dimension
-    keys_flat = keys.reshape(L * B, T, C)        # [L*B, T, C]
-    values_flat = values.reshape(L * B, T, C)    # [L*B, T, C]
-    W0_flat = W0.reshape(L * B, H, C)            # [L*B, H, C]
-    W1_flat = W1.reshape(L * B, C, H)            # [L*B, C, H]
-    m0_flat = m0.reshape(L * B, H, C)            # [L*B, H, C]
-    m1_flat = m1.reshape(L * B, C, H)            # [L*B, C, H]
-    lr_flat = lr.reshape(L * B, 1, 1)            # [L*B, 1, 1]
-    mom_flat = mom.reshape(L * B, 1, 1)          # [L*B, 1, 1]
-    decay_flat = decay.reshape(L * B, 1, 1)      # [L*B, 1, 1]
+    keys_flat = keys.reshape(L * B, T, C)  # [L*B, T, C]
+    values_flat = values.reshape(L * B, T, C)  # [L*B, T, C]
+    W0_flat = W0.reshape(L * B, H, C)  # [L*B, H, C]
+    W1_flat = W1.reshape(L * B, C, H)  # [L*B, C, H]
+    m0_flat = m0.reshape(L * B, H, C)  # [L*B, H, C]
+    m1_flat = m1.reshape(L * B, C, H)  # [L*B, C, H]
+    lr_flat = lr.reshape(L * B, 1, 1)  # [L*B, 1, 1]
+    mom_flat = mom.reshape(L * B, 1, 1)  # [L*B, 1, 1]
+    decay_flat = decay.reshape(L * B, 1, 1)  # [L*B, 1, 1]
 
     # Forward pass
     W0_T = mx.transpose(W0_flat, axes=(0, 2, 1))  # [L*B, C, H]
     W1_T = mx.transpose(W1_flat, axes=(0, 2, 1))  # [L*B, H, C]
-    h_pre = mx.matmul(keys_flat, W0_T)            # [L*B, T, H]
+    h_pre = mx.matmul(keys_flat, W0_T)  # [L*B, T, H]
     sig_h = mx.sigmoid(h_pre)
-    h = h_pre * sig_h                             # SiLU
-    pred = mx.matmul(h, W1_T)                     # [L*B, T, C]
+    h = h_pre * sig_h  # SiLU
+    pred = mx.matmul(h, W1_T)  # [L*B, T, C]
 
     # Backward pass
     scale = 2.0 / C
     d_pred = scale * (pred - values_flat)
     d_pred_T = mx.transpose(d_pred, axes=(0, 2, 1))
-    dW1 = mx.matmul(d_pred_T, h)                  # [L*B, C, H]
-    dh = mx.matmul(d_pred, W1_flat)               # [L*B, T, H]
+    dW1 = mx.matmul(d_pred_T, h)  # [L*B, C, H]
+    dh = mx.matmul(d_pred, W1_flat)  # [L*B, T, H]
     silu_grad = sig_h * (1 + h_pre * (1 - sig_h))
     dh_pre = dh * silu_grad
     dh_pre_T = mx.transpose(dh_pre, axes=(0, 2, 1))
-    dW0 = mx.matmul(dh_pre_T, keys_flat)          # [L*B, H, C]
+    dW0 = mx.matmul(dh_pre_T, keys_flat)  # [L*B, H, C]
 
     # Per-level gradient clipping (reshape to get per-level norms)
     dW0_L = dW0.reshape(L, B, H, C)
@@ -269,11 +260,12 @@ class MemoryMetrics:
     # Per-component metrics (from nested_learning)
     w0_grad_norm: mx.array | float = 0.0  # Layer 0 gradient norm
     w1_grad_norm: mx.array | float = 0.0  # Layer 1 gradient norm
-    weight_norm: mx.array | float = 0.0   # Current weight magnitude
+    weight_norm: mx.array | float = 0.0  # Current weight magnitude
     update_magnitude: mx.array | float = 0.0  # Size of weight change
 
     def to_dict(self) -> dict[str, float]:
         """Convert metrics to dict with float values (triggers sync if needed)."""
+
         def _to_float(v):
             if isinstance(v, mx.array):
                 return float(v.item())
@@ -428,9 +420,7 @@ class MLXNeuralMemory(nn.Module):
             "w1": mx.zeros_like(weights["w1"]),
         }
 
-        return MLXMemoryState(
-            weights=weights, last_momentum=last_momentum, last_segment_output=None, step=0
-        )
+        return MLXMemoryState(weights=weights, last_momentum=last_momentum, last_segment_output=None, step=0)
 
     def _batched_mlp_forward(self, x: mx.array, weights: dict[str, mx.array]) -> mx.array:
         """
@@ -605,9 +595,7 @@ class MLXNeuralMemory(nn.Module):
 
             # L2 regularization on adaptive outputs - gives direct gradients
             # This encourages adaptive params to produce reasonable values
-            adaptive_reg = (
-                mx.mean(lr_out**2) + mx.mean(mom_out**2) + mx.mean(decay_out**2)
-            ) * 0.001  # Small weight
+            adaptive_reg = (mx.mean(lr_out**2) + mx.mean(mom_out**2) + mx.mean(decay_out**2)) * 0.001  # Small weight
 
             # Also train query_proj
             query_out = self.query_proj(x_clipped)
@@ -794,6 +782,7 @@ class CMSMetrics:
 
     def to_dict(self) -> dict:
         """Convert metrics to dict with float values (triggers sync if needed)."""
+
         def _to_float(v):
             if isinstance(v, mx.array):
                 return float(v.item())
@@ -909,24 +898,23 @@ class MLXContinuumMemorySystem(nn.Module):
                 current = mem(current, state.level_states[i])
                 current = mx.clip(current, -10.0, 10.0)  # Clip after each level
             return current
-        else:
-            # Weighted sum mode (default): all levels process same input
-            weights = mx.softmax(self.level_weights)
+        # Weighted sum mode (default): all levels process same input
+        weights = mx.softmax(self.level_weights)
 
-            # Retrieve from each level and combine
-            level_outputs = []
-            for i, mem in enumerate(self.memories):
-                level_outputs.append(mem(hidden_states, state.level_states[i]))
+        # Retrieve from each level and combine
+        level_outputs = []
+        for i, mem in enumerate(self.memories):
+            level_outputs.append(mem(hidden_states, state.level_states[i]))
 
-            # Stack and apply weights: [num_levels, B, T, C]
-            stacked = mx.stack(level_outputs, axis=0)
+        # Stack and apply weights: [num_levels, B, T, C]
+        stacked = mx.stack(level_outputs, axis=0)
 
-            # Weight and sum
-            weights_expanded = weights.reshape(-1, 1, 1, 1)
-            combined = mx.sum(weights_expanded * stacked, axis=0)  # [B, T, C]
+        # Weight and sum
+        weights_expanded = weights.reshape(-1, 1, 1, 1)
+        combined = mx.sum(weights_expanded * stacked, axis=0)  # [B, T, C]
 
-            # Clip output for numerical stability
-            return mx.clip(combined, -10.0, 10.0)
+        # Clip output for numerical stability
+        return mx.clip(combined, -10.0, 10.0)
 
     def compute_internal_loss(self, x: mx.array, state: MLXCMSState) -> mx.array:
         """
@@ -968,6 +956,7 @@ class MLXContinuumMemorySystem(nn.Module):
         # Apply jitter if enabled
         if self.jitter > 0 and freq > 1:
             import random
+
             # Jitter adjusts the effective frequency by ±jitter%
             jitter_range = int(freq * self.jitter)
             if jitter_range > 0:
@@ -980,9 +969,7 @@ class MLXContinuumMemorySystem(nn.Module):
 
         return step % effective_freq == 0
 
-    def _update_parallel(
-        self, hidden_states: mx.array, state: MLXCMSState
-    ) -> tuple[MLXCMSState, CMSMetrics]:
+    def _update_parallel(self, hidden_states: mx.array, state: MLXCMSState) -> tuple[MLXCMSState, CMSMetrics]:
         """
         Parallel update for all CMS levels using compiled stacked tensor function.
 
@@ -1046,25 +1033,30 @@ class MLXContinuumMemorySystem(nn.Module):
                 decay_list.append(mx.full((B, 1, 1), mem.decay))
 
         # Stack into [L, B, ...] tensors
-        keys_stacked = mx.stack(keys_list, axis=0)      # [L, B, T, C]
+        keys_stacked = mx.stack(keys_list, axis=0)  # [L, B, T, C]
         values_stacked = mx.stack(values_list, axis=0)  # [L, B, T, C]
-        W0_stacked = mx.stack(W0_list, axis=0)          # [L, B, H, C]
-        W1_stacked = mx.stack(W1_list, axis=0)          # [L, B, C, H]
-        m0_stacked = mx.stack(m0_list, axis=0)          # [L, B, H, C]
-        m1_stacked = mx.stack(m1_list, axis=0)          # [L, B, C, H]
-        lr_stacked = mx.stack(lr_list, axis=0)          # [L, B, 1, 1]
-        mom_stacked = mx.stack(mom_list, axis=0)        # [L, B, 1, 1]
-        decay_stacked = mx.stack(decay_list, axis=0)    # [L, B, 1, 1]
+        W0_stacked = mx.stack(W0_list, axis=0)  # [L, B, H, C]
+        W1_stacked = mx.stack(W1_list, axis=0)  # [L, B, C, H]
+        m0_stacked = mx.stack(m0_list, axis=0)  # [L, B, H, C]
+        m1_stacked = mx.stack(m1_list, axis=0)  # [L, B, C, H]
+        lr_stacked = mx.stack(lr_list, axis=0)  # [L, B, 1, 1]
+        mom_stacked = mx.stack(mom_list, axis=0)  # [L, B, 1, 1]
+        decay_stacked = mx.stack(decay_list, axis=0)  # [L, B, 1, 1]
 
         grad_clip = self.memories[0].grad_clip if self.memories[0].grad_clip > 0 else 1e10
 
         # Single compiled call for all active levels
         new_w0, new_w1, new_m0, new_m1, grad_norms = _compiled_cms_update(
-            keys_stacked, values_stacked,
-            W0_stacked, W1_stacked,
-            m0_stacked, m1_stacked,
-            lr_stacked, mom_stacked, decay_stacked,
-            grad_clip
+            keys_stacked,
+            values_stacked,
+            W0_stacked,
+            W1_stacked,
+            m0_stacked,
+            m1_stacked,
+            lr_stacked,
+            mom_stacked,
+            decay_stacked,
+            grad_clip,
         )
 
         # Reconstruct states and metrics
@@ -1200,5 +1192,3 @@ class MLXContinuumMemorySystem(nn.Module):
     def get_last_metrics(self) -> CMSMetrics | None:
         """Get metrics from the last update call."""
         return self._last_metrics
-
-

@@ -8,15 +8,14 @@ import pytest
 import torch
 
 from nanogpt_titans.model import (
+    CausalSelfAttention,
+    MemoryState,
+    NeuralMemory,
     TitansConfig,
     TitansGPT,
-    NeuralMemory,
-    MemoryState,
-    CausalSelfAttention,
-    parallel_scan_log,
     parallel_momentum,
+    parallel_scan_log,
 )
-
 
 # --- Fixtures ---
 
@@ -80,9 +79,7 @@ class TestParallelScan:
         expected = torch.zeros_like(surprises)
         expected[:, 0] = (1 - momentum_coef) * surprises[:, 0]
         for t in range(1, T):
-            expected[:, t] = (
-                momentum_coef * expected[:, t - 1] + (1 - momentum_coef) * surprises[:, t]
-            )
+            expected[:, t] = momentum_coef * expected[:, t - 1] + (1 - momentum_coef) * surprises[:, t]
 
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
@@ -201,7 +198,7 @@ class TestModelForwardBackward:
         B, T = 2, 64
         x = torch.randint(0, small_config.vocab_size, (B, T))
 
-        logits, loss, _ = model(x, targets=x)
+        _logits, loss, _ = model(x, targets=x)
         loss.backward()
 
         # Check gradients exist
@@ -301,7 +298,7 @@ class TestMemoryState:
         assert len(state.last_momentum) > 0
 
         # Check batch dimension
-        for name, w in state.weights.items():
+        for _name, w in state.weights.items():
             assert w.shape[0] == B
 
     def test_reset_state(self, small_config):
@@ -338,8 +335,8 @@ class TestIntegration:
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
         # Forward
-        logits, loss, _ = model(x, targets=x)
-        initial_loss = loss.item()
+        _logits, loss, _ = model(x, targets=x)
+        loss.item()
 
         # Backward
         loss.backward()
@@ -377,7 +374,7 @@ class TestIntegration:
 
         for T in [16, 32, 64, 128]:
             x = torch.randint(0, small_config.vocab_size, (B, T))
-            logits, loss, _ = model(x, targets=x)
+            logits, _loss, _ = model(x, targets=x)
             assert logits.shape == (B, T, small_config.vocab_size)
 
 
@@ -400,7 +397,7 @@ class TestEdgeCases:
         B, T = 1, 64
         x = torch.randint(0, small_config.vocab_size, (B, T))
 
-        logits, loss, _ = model(x, targets=x)
+        logits, _loss, _ = model(x, targets=x)
         assert logits.shape == (B, T, small_config.vocab_size)
 
     def test_exact_segment_length(self, model, small_config):

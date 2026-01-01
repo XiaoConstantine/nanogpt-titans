@@ -22,22 +22,7 @@ if TYPE_CHECKING:
 
 
 def compute_teach_signal(logits: mx.array, targets: mx.array, lm_head_weight: mx.array) -> mx.array:
-    """
-    Compute teaching signal from logit residuals.
-
-    This provides an auxiliary gradient signal to memory without full backprop.
-    From nested_learning: allows memory to learn from "what surprised the model".
-
-    teach_signal = (softmax(logits) - one_hot(targets)) @ lm_head.weight
-
-    Args:
-        logits: Model predictions [B, T, V] where V is vocab size
-        targets: Target token IDs [B, T]
-        lm_head_weight: LM head weight matrix [V, H] where H is hidden dim
-
-    Returns:
-        Teaching signal [B, T, H] - gradient approximation in hidden space
-    """
+    """Compute teaching signal: (softmax(logits) - one_hot(targets)) @ lm_head_weight."""
     B, T, V = logits.shape
 
     # Softmax to get probabilities
@@ -79,21 +64,7 @@ def apply_teach_signal_to_memory(
     state: TitansLayerState,
     signal_weight: float = 0.1,
 ) -> TitansLayerState:
-    """
-    Apply teaching signal to memory weights.
-
-    This provides an additional learning signal to memory beyond the internal loss.
-    The teach signal is treated as a gradient and applied with the memory's update rule.
-
-    Args:
-        teach_signal: Gradient approximation [B, T, H]
-        _titans_layer: The TITANS layer containing memory (reserved for future use)
-        state: Current memory state
-        signal_weight: Weight for the teach signal contribution
-
-    Returns:
-        Updated memory state
-    """
+    """Apply teaching signal to memory weights (currently returns state unchanged)."""
     # Scale down the teach signal (kept for future implementation)
     _ = teach_signal * signal_weight
 
@@ -114,14 +85,7 @@ def apply_teach_signal_to_memory(
 
 
 class CombinedModel(nn.Module):
-    """
-    Combined model wrapper that includes both base model and TITANS layers.
-
-    This wrapper ensures gradients flow through the entire computation graph,
-    matching PyTorch's behavior where gradients propagate through frozen layers.
-
-    Supports multiple TITANS layers at different positions in the transformer.
-    """
+    """Wrapper combining base model with TITANS layers for gradient flow."""
 
     def __init__(
         self,
@@ -132,17 +96,6 @@ class CombinedModel(nn.Module):
         use_teach_signal: bool = False,
         teach_signal_weight: float = 0.1,
     ):
-        """
-        Initialize combined model with TITANS layers.
-
-        Args:
-            base_model: The base language model
-            titans_layers: Dict mapping layer_idx -> MLXTitansLayer
-            use_internal_loss: Whether to compute internal loss
-            internal_loss_weight: Weight for internal loss
-            use_teach_signal: Whether to compute teach signal from logit residuals
-            teach_signal_weight: Weight for teach signal contribution
-        """
         super().__init__()
         self.base_model = base_model
         self.use_internal_loss = use_internal_loss
@@ -248,18 +201,7 @@ class CombinedModel(nn.Module):
         return logits
 
     def compute_teach_signal_loss(self, logits: mx.array, targets: mx.array) -> mx.array | None:
-        """
-        Compute teaching signal loss from logit residuals.
-
-        This provides auxiliary gradient to memory from "what surprised the model".
-
-        Args:
-            logits: Model predictions [B, T, V]
-            targets: Target token IDs [B, T]
-
-        Returns:
-            Scalar teach signal loss, or None if teach signal disabled
-        """
+        """Compute teaching signal loss from logit residuals."""
         if not self.use_teach_signal or not self._last_h_at_memory_layers:
             return None
 
@@ -304,19 +246,7 @@ class CombinedModel(nn.Module):
 
 
 def compute_gate_regularization(titans_layer: MLXTitansLayer, min_value: float = 0.15) -> mx.array:
-    """
-    Compute regularization loss to prevent gate from collapsing below min_value.
-
-    Matches PyTorch compute_gate_regularization() exactly.
-    Penalty: max(0, min_value - gate)^2
-
-    Args:
-        titans_layer: The TITANS layer containing the gate
-        min_value: Minimum gate value to maintain
-
-    Returns:
-        Regularization loss (scalar)
-    """
+    """Compute regularization loss: max(0, min_value - gate)^2."""
     # Get gate bias and compute expected gate value
     gate_bias = titans_layer.gate.linear2.bias[0]
     expected_gate = mx.sigmoid(gate_bias)
@@ -331,16 +261,7 @@ def compute_gate_regularization(titans_layer: MLXTitansLayer, min_value: float =
 def compute_multi_layer_gate_regularization(
     titans_layers: dict[int, MLXTitansLayer], min_value: float = 0.15
 ) -> mx.array:
-    """
-    Compute gate regularization for multiple TITANS layers.
-
-    Args:
-        titans_layers: Dict mapping layer_idx -> MLXTitansLayer
-        min_value: Minimum gate value to maintain
-
-    Returns:
-        Mean regularization loss across all layers
-    """
+    """Compute mean gate regularization across all TITANS layers."""
     if not titans_layers:
         return mx.array(0.0)
 
@@ -387,17 +308,7 @@ def create_loss_fn(_combined_model: CombinedModel, gate_min_value: float = 0.0, 
 
 
 def filter_titans_grads(grads: dict[str, Any]) -> dict[str, Any]:
-    """
-    Filter gradients to only include TITANS layer gradients.
-
-    OPTIMIZATION: Direct key lookup instead of string matching when possible.
-
-    Args:
-        grads: Full gradient dict from value_and_grad
-
-    Returns:
-        Filtered dict with only titans_layer gradients
-    """
+    """Filter gradients to only include TITANS layer gradients."""
     # Fast path: direct key lookup
     if "titans_layers" in grads:
         return {"titans_layers": grads["titans_layers"]}
@@ -414,17 +325,7 @@ def filter_titans_grads(grads: dict[str, Any]) -> dict[str, Any]:
 
 
 def get_lr(step: int, config: MLXTitansConfig, use_linear: bool = False) -> float:
-    """
-    Learning rate schedule: Linear warmup followed by cosine decay.
-
-    Args:
-        step: Current training step
-        config: Training configuration
-        use_linear: If True, use linear warmup only
-
-    Returns:
-        Current learning rate
-    """
+    """Learning rate schedule: linear warmup + cosine decay."""
     warmup_steps = max(config.warmup_steps, 1)
 
     if step < warmup_steps:
@@ -439,18 +340,7 @@ def get_lr(step: int, config: MLXTitansConfig, use_linear: bool = False) -> floa
 def create_masked_grads(
     grads: dict[str, Any], keep_gate_scale: bool, path: str = "", freeze_gate: bool = False
 ) -> dict[str, Any]:
-    """
-    Create grads with zeros for non-target params.
-
-    Args:
-        grads: Gradient dictionary
-        keep_gate_scale: If True, keep gate/scale grads; else keep memory grads
-        path: Current path in gradient tree (for recursion)
-        freeze_gate: If True, zero out gate gradients (for warmup)
-
-    Returns:
-        Masked gradient dictionary
-    """
+    """Create grads with zeros for non-target params (gate/scale vs memory)."""
     if isinstance(grads, dict):
         return {
             k: create_masked_grads(v, keep_gate_scale, f"{path}.{k}" if path else k, freeze_gate)
@@ -532,43 +422,13 @@ def create_titans_layer_from_model(model, config: MLXTitansConfig) -> MLXTitansL
     )
 
 
-# =============================================================================
-# Online Eval Mode (Chunked Memorization)
-# =============================================================================
-
-
 def online_eval(
     combined_model: CombinedModel,
     input_ids: mx.array,
     chunk_size: int = 128,
     return_all_logits: bool = False,
 ) -> tuple[mx.array, list[dict]]:
-    """
-    Online evaluation with chunked memorization (from nested_learning).
-
-    Processes tokens incrementally with expanding context, updating memory
-    after each chunk. This simulates true online learning during inference.
-
-    Unlike batch evaluation where the full sequence is processed at once,
-    online eval:
-    1. Processes tokens[0:chunk_size], updates memory
-    2. Processes tokens[0:2*chunk_size] with updated memory
-    3. Continues until all tokens are processed
-
-    This allows the model to "learn" from earlier parts of the sequence
-    and apply that knowledge to later parts.
-
-    Args:
-        combined_model: CombinedModel with TITANS layers
-        input_ids: Input token IDs [B, T]
-        chunk_size: Number of tokens per chunk (default 128)
-        return_all_logits: If True, return logits for all chunks
-
-    Returns:
-        Tuple of:
-        - Final logits [B, T, V] (or list of chunk logits if return_all_logits=True)
-        - List of per-chunk metrics (gate values, memory stats, etc.)
-    """
+    """Online evaluation with chunked memorization - updates memory after each chunk."""
     B, T = input_ids.shape
     chunk_metrics = []
     all_logits = [] if return_all_logits else None
@@ -634,26 +494,7 @@ def online_generate(
     top_p: float = 0.9,
     chunk_size: int = 128,
 ) -> tuple[str, list[dict]]:
-    """
-    Online text generation with chunked memorization.
-
-    Generates text token by token, updating memory as the sequence grows.
-    This allows the model to adapt to the generated context.
-
-    Args:
-        combined_model: CombinedModel with TITANS layers
-        tokenizer: Tokenizer for encoding/decoding
-        prompt: Initial text prompt
-        max_new_tokens: Maximum tokens to generate
-        temperature: Sampling temperature (higher = more random)
-        top_p: Top-p (nucleus) sampling threshold
-        chunk_size: Tokens between memory updates
-
-    Returns:
-        Tuple of:
-        - Generated text (including prompt)
-        - List of generation metrics
-    """
+    """Generate text token by token, updating memory as the sequence grows."""
     # Encode prompt
     input_ids = mx.array(tokenizer.encode(prompt)).reshape(1, -1)
     B, _T = input_ids.shape

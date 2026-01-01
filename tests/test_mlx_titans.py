@@ -12,8 +12,9 @@ Tests cover:
 Run with: uv run pytest tests/test_mlx_titans.py -v
 """
 
-import pytest
 import math
+
+import pytest
 
 # Check if MLX is available (Apple Silicon only)
 try:
@@ -26,30 +27,28 @@ except ImportError:
     MLX_AVAILABLE = False
 
 # Skip all tests in this module if MLX is not available
-pytestmark = pytest.mark.skipif(
-    not MLX_AVAILABLE, reason="MLX not available (requires Apple Silicon)"
-)
+pytestmark = pytest.mark.skipif(not MLX_AVAILABLE, reason="MLX not available (requires Apple Silicon)")
 
 
 # Only import MLX modules if available
 if MLX_AVAILABLE:
-    from nanogpt_titans.mlx.memory import (
-        MLXMemoryState,
-        MLXNeuralMemory,
-        MLXCMSState,
-        MLXContinuumMemorySystem,
-    )
+    from nanogpt_titans.mlx.config import MLXTitansConfig
     from nanogpt_titans.mlx.decoder_layer import (
         MLXPositionDependentGate,
         MLXTitansLayer,
     )
+    from nanogpt_titans.mlx.memory import (
+        MLXCMSState,
+        MLXContinuumMemorySystem,
+        MLXMemoryState,
+        MLXNeuralMemory,
+    )
     from nanogpt_titans.mlx.training import (
+        accumulate_grads,
         compute_gate_regularization,
         create_masked_grads,
         scale_grads_recursive,
-        accumulate_grads,
     )
-    from nanogpt_titans.mlx.config import MLXTitansConfig
 
 
 # =============================================================================
@@ -242,9 +241,7 @@ class TestMLXNeuralMemory:
         assert not mx.allclose(new_state.weights["w1"], state.weights["w1"])
 
         # Momentum should be non-zero now
-        assert not mx.allclose(
-            new_state.last_momentum["w0"], mx.zeros_like(new_state.last_momentum["w0"])
-        )
+        assert not mx.allclose(new_state.last_momentum["w0"], mx.zeros_like(new_state.last_momentum["w0"]))
 
         # Last segment output should be stored
         assert new_state.last_segment_output is not None
@@ -252,6 +249,7 @@ class TestMLXNeuralMemory:
 
         # Metrics should be returned
         from nanogpt_titans.mlx.memory import MemoryMetrics
+
         assert isinstance(metrics, MemoryMetrics)
         assert metrics.grad_norm >= 0
 
@@ -400,9 +398,7 @@ class TestMLXContinuumMemorySystem:
             )
 
         # Store weights after first update
-        weights_after_step0 = [
-            copy_weights(level_state.weights) for level_state in state.level_states
-        ]
+        weights_after_step0 = [copy_weights(level_state.weights) for level_state in state.level_states]
         mx.eval(*[w["w0"] for w in weights_after_step0])
 
         # Second update (step=1): Only level 0 updates (1%1=0, 1%4≠0, 1%16≠0)
@@ -559,7 +555,7 @@ class TestMLXTitansLayer:
         x = mx.random.normal((B, T, small_dim))
         state = titans_layer.init_state(B)
 
-        output, new_state = titans_layer(x, state)
+        output, _new_state = titans_layer(x, state)
 
         assert output.shape == x.shape
         assert not mx.any(mx.isnan(output))
@@ -576,7 +572,7 @@ class TestMLXTitansLayer:
 
         initial_step = state.step if hasattr(state, "step") else state.level_states[0].step
 
-        output, new_state = titans_layer(x, state)
+        _output, new_state = titans_layer(x, state)
 
         # For CMS, check the first level's step
         if hasattr(new_state, "level_states"):
@@ -717,9 +713,7 @@ class TestTrainingComponents:
         assert mx.allclose(masked["memory"]["w0"], grads["memory"]["w0"])
 
         # Gate should be zeroed
-        assert mx.allclose(
-            masked["gate"]["linear2"]["bias"], mx.zeros_like(grads["gate"]["linear2"]["bias"])
-        )
+        assert mx.allclose(masked["gate"]["linear2"]["bias"], mx.zeros_like(grads["gate"]["linear2"]["bias"]))
 
     def test_create_masked_grads_freeze_gate(self, small_dim):
         """Test gradient masking can freeze gate during warmup."""
@@ -733,9 +727,7 @@ class TestTrainingComponents:
         masked = create_masked_grads(grads, keep_gate_scale=True, freeze_gate=True)
 
         # Gate should be zeroed (frozen)
-        assert mx.allclose(
-            masked["gate"]["linear2"]["weight"], mx.zeros_like(grads["gate"]["linear2"]["weight"])
-        )
+        assert mx.allclose(masked["gate"]["linear2"]["weight"], mx.zeros_like(grads["gate"]["linear2"]["weight"]))
 
         # Scale should be preserved (not frozen, just gate)
         assert mx.allclose(masked["mem_scale"], grads["mem_scale"])
@@ -815,7 +807,7 @@ class TestIntegration:
         states_history = [state]
 
         # Process multiple segments
-        for i in range(5):
+        for _i in range(5):
             x = mx.random.normal((B, T, small_dim))
             _, state = titans_layer(x, state)
             states_history.append(state)
@@ -849,7 +841,7 @@ class TestIntegration:
         x = mx.random.normal((B, T, small_dim)) * 100
         state = titans_layer.init_state(B)
 
-        output, new_state = titans_layer(x, state)
+        output, _new_state = titans_layer(x, state)
 
         # Should not produce NaN or Inf
         assert not mx.any(mx.isnan(output))
@@ -899,7 +891,7 @@ class TestEdgeCases:
         x = mx.random.normal((B, T, small_dim))
         state = titans_layer.init_state(B)
 
-        output, new_state = titans_layer(x, state)
+        output, _new_state = titans_layer(x, state)
 
         assert output.shape == (B, T, small_dim)
 
@@ -909,7 +901,7 @@ class TestEdgeCases:
         x = mx.random.normal((B, T, small_dim))
         state = titans_layer.init_state(B)
 
-        output, new_state = titans_layer(x, state)
+        output, _new_state = titans_layer(x, state)
 
         assert output.shape == (B, T, small_dim)
 
@@ -919,7 +911,7 @@ class TestEdgeCases:
         x = mx.random.normal((B, T, small_dim))
         state = titans_layer.init_state(B)
 
-        output, new_state = titans_layer(x, state)
+        output, _new_state = titans_layer(x, state)
 
         assert output.shape == (B, T, small_dim)
 
@@ -929,7 +921,7 @@ class TestEdgeCases:
         x = mx.zeros((B, T, small_dim))
         state = titans_layer.init_state(B)
 
-        output, new_state = titans_layer(x, state)
+        output, _new_state = titans_layer(x, state)
 
         assert not mx.any(mx.isnan(output))
 
@@ -977,11 +969,11 @@ class TestRegression:
         def loss_fn(memory, x, state):
             return memory.compute_internal_loss(x, state)
 
-        loss, grads = mx.value_and_grad(loss_fn)(neural_memory, x, state)
+        _loss, grads = mx.value_and_grad(loss_fn)(neural_memory, x, state)
 
         # Template weights should have non-zero gradients
         flat_grads = dict(tree_flatten(grads))
-        has_template_grads = any("_template_mlp" in k for k in flat_grads.keys())
+        has_template_grads = any("_template_mlp" in k for k in flat_grads)
         assert has_template_grads, "Template weights should receive gradients"
 
 
@@ -1030,12 +1022,10 @@ class TestTeachSignal:
         teach_signal_wrong = compute_teach_signal(logits_wrong, targets, lm_head_weight)
 
         # Wrong predictions should produce larger teach signal (more surprise)
-        norm_correct = mx.sqrt(mx.sum(teach_signal_correct ** 2))
-        norm_wrong = mx.sqrt(mx.sum(teach_signal_wrong ** 2))
+        norm_correct = mx.sqrt(mx.sum(teach_signal_correct**2))
+        norm_wrong = mx.sqrt(mx.sum(teach_signal_wrong**2))
 
-        assert norm_wrong > norm_correct, (
-            "Teach signal should be larger when model is wrong"
-        )
+        assert norm_wrong > norm_correct, "Teach signal should be larger when model is wrong"
 
 
 if __name__ == "__main__":

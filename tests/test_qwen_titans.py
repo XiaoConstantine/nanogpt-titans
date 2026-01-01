@@ -204,12 +204,8 @@ class TestPositionDependentGate:
         assert w1_grad is not None
         assert w2_grad is not None
         # Critical: gradients must be non-zero for learning to occur
-        assert w1_grad.abs().sum() > 0, (
-            "First layer weights have zero gradient - gate cannot learn!"
-        )
-        assert w2_grad.abs().sum() > 0, (
-            "Second layer weights have zero gradient - gate cannot learn!"
-        )
+        assert w1_grad.abs().sum() > 0, "First layer weights have zero gradient - gate cannot learn!"
+        assert w2_grad.abs().sum() > 0, "Second layer weights have zero gradient - gate cannot learn!"
 
     def test_weights_update_after_optimizer_step(self):
         """Test gate weights actually change after optimizer step."""
@@ -364,7 +360,7 @@ class TestContinuumMemorySystem:
         x = torch.randn(2, 32, 64)
 
         # Update 16 times
-        for i in range(16):
+        for _i in range(16):
             state, metrics = cms.update(x, state)
 
         # All levels should have been updated at least once
@@ -372,6 +368,7 @@ class TestContinuumMemorySystem:
 
         # Verify metrics are returned
         from nanogpt_titans.qwen_titans import CMSMetrics
+
         assert isinstance(metrics, CMSMetrics)
         assert len(metrics.level_metrics) == 3
 
@@ -684,12 +681,8 @@ class TestTitansQwenDecoderLayer:
 
         # Check values changed
         assert not torch.allclose(initial_mem_scale, layer.mem_scale), "mem_scale should update"
-        assert not torch.allclose(initial_gate_bias, layer.gate.gate_mlp[2].bias), (
-            "gate should update"
-        )
-        assert not torch.allclose(initial_mem_ln_weight, layer.mem_ln.weight), (
-            "mem_ln should update"
-        )
+        assert not torch.allclose(initial_gate_bias, layer.gate.gate_mlp[2].bias), "gate should update"
+        assert not torch.allclose(initial_mem_ln_weight, layer.mem_ln.weight), "mem_ln should update"
 
 
 # --- Config Tests ---

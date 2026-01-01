@@ -14,12 +14,11 @@ import pytest
 import torch
 
 from nanogpt_titans.model import (
+    MemoryState,
+    NeuralMemory,
     TitansConfig,
     TitansGPT,
-    NeuralMemory,
-    MemoryState,
 )
-
 
 # --- Fixtures ---
 
@@ -64,7 +63,7 @@ class TestCompilerDisableDecorators:
         assert state.step == 0
         assert len(state.weights) > 0
         # Verify batch dimension
-        for name, w in state.weights.items():
+        for _name, w in state.weights.items():
             assert w.shape[0] == B
 
     def test_memory_reset_state_works(self, small_config):
@@ -149,7 +148,7 @@ class TestTrainingModeBehavior:
         x = torch.randint(0, small_config.vocab_size, (B, T))
 
         model.train()
-        logits, loss, states = model(x, targets=x)
+        logits, loss, _states = model(x, targets=x)
 
         assert loss is not None
         assert loss.item() > 0
@@ -162,7 +161,7 @@ class TestTrainingModeBehavior:
 
         model.eval()
         with torch.no_grad():
-            logits, loss, states = model(x, targets=x)
+            logits, _loss, _states = model(x, targets=x)
 
         assert logits.shape == (B, T, small_config.vocab_size)
         assert not torch.isnan(logits).any()
@@ -173,7 +172,7 @@ class TestTrainingModeBehavior:
         x = torch.randint(0, small_config.vocab_size, (B, T))
 
         model.train()
-        logits, loss, _ = model(x, targets=x)
+        _logits, loss, _ = model(x, targets=x)
         loss.backward()
 
         # Verify gradients exist
@@ -274,7 +273,7 @@ class TestTorchCompile:
         B, T = 2, 64
         x = torch.randint(0, small_config.vocab_size, (B, T)).cuda()
 
-        logits, loss, states = model(x, targets=x)
+        logits, loss, _states = model(x, targets=x)
 
         assert logits.shape == (B, T, small_config.vocab_size)
         assert loss is not None
@@ -287,7 +286,7 @@ class TestTorchCompile:
         B, T = 2, 64
         x = torch.randint(0, small_config.vocab_size, (B, T)).cuda()
 
-        logits, loss, _ = model(x, targets=x)
+        _logits, loss, _ = model(x, targets=x)
         loss.backward()
 
         # Verify gradients exist
@@ -305,7 +304,7 @@ class TestTorchCompile:
 
         losses = []
         for _ in range(3):
-            logits, loss, _ = model(x, targets=x)
+            _logits, loss, _ = model(x, targets=x)
             losses.append(loss.item())
 
             optimizer.zero_grad()
@@ -313,7 +312,7 @@ class TestTorchCompile:
             optimizer.step()
 
         # All losses should be valid
-        assert all(l > 0 and not float("inf") == l for l in losses)
+        assert all(v > 0 and float("inf") != v for v in losses)
 
     def test_compile_with_different_sequence_lengths(self, small_config):
         """Test compiled model with varying sequence lengths."""
