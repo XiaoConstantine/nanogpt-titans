@@ -37,9 +37,7 @@ from tqdm import tqdm
 try:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 except ImportError as e:
-    raise ImportError(
-        "transformers is required for Qwen training. Install with: uv add transformers"
-    ) from e
+    raise ImportError("transformers is required for Qwen training. Install with: uv add transformers") from e
 
 import torch.nn.functional as F
 
@@ -131,11 +129,7 @@ class QwenTitansTrainConfig:
     backend: str = field(default_factory=_detect_backend)
     device: str = field(
         default_factory=lambda: (
-            "cuda"
-            if torch.cuda.is_available()
-            else "mps"
-            if torch.backends.mps.is_available()
-            else "cpu"
+            "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
         )
     )
     dtype: str = field(
@@ -205,9 +199,7 @@ def collate_fn(batch, pad_token_id: int):
         pad_len = max_len - inp.size(0)
         if pad_len > 0:
             inp = torch.cat([inp, torch.full((pad_len,), pad_token_id, dtype=inp.dtype)])
-            lab = torch.cat(
-                [lab, torch.full((pad_len,), -100, dtype=lab.dtype)]
-            )  # -100 = ignore in loss
+            lab = torch.cat([lab, torch.full((pad_len,), -100, dtype=lab.dtype)])  # -100 = ignore in loss
         padded_input_ids.append(inp)
         padded_labels.append(lab)
 
@@ -485,9 +477,7 @@ def train(config: QwenTitansTrainConfig) -> None:
 
     print("\nOptimizer param groups:")
     print(f"  Memory params: {sum(p.numel() for p in other_params):,} @ lr={config.learning_rate}")
-    print(
-        f"  Gate/scale params: {sum(p.numel() for p in gate_scale_params):,} @ lr={gate_scale_lr}"
-    )
+    print(f"  Gate/scale params: {sum(p.numel() for p in gate_scale_params):,} @ lr={gate_scale_lr}")
 
     optimizer = torch.optim.AdamW(
         param_groups,
@@ -520,9 +510,7 @@ def train(config: QwenTitansTrainConfig) -> None:
 
         # If resuming past gate warmup, unfreeze gate
         if start_step >= config.gate_warmup_steps and gate_warmup_active:
-            print(
-                f"Resume step {start_step} >= gate_warmup_steps {config.gate_warmup_steps}, unfreezing gate"
-            )
+            print(f"Resume step {start_step} >= gate_warmup_steps {config.gate_warmup_steps}, unfreezing gate")
             set_gate_trainable(titans_layers, trainable=True)
             gate_warmup_active = False
 
@@ -609,27 +597,18 @@ def train(config: QwenTitansTrainConfig) -> None:
 
                     # Gate regularization: prevent gate from collapsing to 0
                     # Only apply for MAC variant (MAG doesn't have this issue)
-                    if (
-                        config.titans_variant == "mac"
-                        and not gate_warmup_active
-                        and config.gate_min_value > 0
-                    ):
+                    if config.titans_variant == "mac" and not gate_warmup_active and config.gate_min_value > 0:
                         gate_reg = compute_gate_regularization(titans_layers, config.gate_min_value)
                         if gate_reg.item() > 0:
-                            loss = (
-                                loss + 1.0 * gate_reg
-                            )  # Strong regularization to prevent collapse
+                            loss = loss + 1.0 * gate_reg  # Strong regularization to prevent collapse
 
                     # Check for NaN in main loss - skip this segment if NaN
                     if torch.isnan(loss):
-                        print(
-                            f"WARNING: NaN detected in loss at step {step}, segment {start}:{end}, skipping"
-                        )
+                        print(f"WARNING: NaN detected in loss at step {step}, segment {start}:{end}, skipping")
                         state_manager.sync_from_layers()
                         continue  # Skip backward for this segment
 
-                    # Scale loss ONCE for gradient accumulation across both micro-steps AND segments
-                    # Total divisor: accumulation steps × segments per sequence
+                    # Scale loss for gradient accumulation (steps * segments)
                     total_divisor = config.gradient_accumulation_steps * seq_segments
                     scaled_loss = loss / total_divisor
 
@@ -713,15 +692,12 @@ def train(config: QwenTitansTrainConfig) -> None:
 
             # Only show internal loss if enabled
             int_loss_str = f", int_loss {avg_internal:.4f}" if config.use_internal_loss else ""
-            print(
-                f"step {step}: loss {avg_loss:.4f}{int_loss_str}{mod_str}, lr {lr:.2e}, time {dt * 1000:.1f}ms"
-            )
+            print(f"step {step}: loss {avg_loss:.4f}{int_loss_str}{mod_str}, lr {lr:.2e}, time {dt * 1000:.1f}ms")
 
             # Log CMS weights every 50 steps
             if config.use_cms and step % 50 == 0 and "cms_weight_0" in diagnostics:
                 cms_str = ", ".join(
-                    f"{diagnostics.get(f'cms_weight_{i}', 0):.3f}"
-                    for i in range(config.num_cms_levels)
+                    f"{diagnostics.get(f'cms_weight_{i}', 0):.3f}" for i in range(config.num_cms_levels)
                 )
                 print(f"         CMS weights: [{cms_str}]")
 
@@ -765,9 +741,7 @@ def train(config: QwenTitansTrainConfig) -> None:
         step += 1
 
     # Final save
-    save_checkpoint(
-        model, optimizer, step, avg_loss, config, output_dir / "final.pt", scaler, best_val_loss
-    )
+    save_checkpoint(model, optimizer, step, avg_loss, config, output_dir / "final.pt", scaler, best_val_loss)
     save_titans_state(model, str(output_dir / "titans_state_final.pt"))
 
     # Save training log
@@ -789,9 +763,7 @@ def train(config: QwenTitansTrainConfig) -> None:
         last = log_history[-1]
         print("\nPhase 3 Summary:")
         print(f"  Loss: {first['loss']:.4f} → {last['loss']:.4f}")
-        print(
-            f"  Internal Loss: {first.get('internal_loss', 0):.4f} → {last.get('internal_loss', 0):.4f}"
-        )
+        print(f"  Internal Loss: {first.get('internal_loss', 0):.4f} → {last.get('internal_loss', 0):.4f}")
         print(f"  Gate Mean: {first.get('gate_mean', 0):.4f} → {last.get('gate_mean', 0):.4f}")
 
 
@@ -893,9 +865,7 @@ def main() -> None:
 
     # Model arguments
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2-1.5B")
-    parser.add_argument(
-        "--memory_layers", type=str, default="14", help="Comma-separated layer indices"
-    )
+    parser.add_argument("--memory_layers", type=str, default="14", help="Comma-separated layer indices")
 
     # Titans arguments
     parser.add_argument("--segment_len", type=int, default=512)
@@ -929,9 +899,7 @@ def main() -> None:
     )
 
     # HOPE feature arguments
-    parser.add_argument(
-        "--use_cms", action="store_true", default=True, help="Use Continuum Memory System"
-    )
+    parser.add_argument("--use_cms", action="store_true", default=True, help="Use Continuum Memory System")
     parser.add_argument("--no_cms", action="store_true", help="Disable CMS")
     parser.add_argument("--num_cms_levels", type=int, default=3)
     parser.add_argument("--use_self_mod_proj", action="store_true", default=True)
@@ -977,9 +945,7 @@ def main() -> None:
     )
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--dtype", type=str, default=None)
-    parser.add_argument(
-        "--compile", action="store_true", help="Use torch.compile for faster training (CUDA only)"
-    )
+    parser.add_argument("--compile", action="store_true", help="Use torch.compile for faster training (CUDA only)")
 
     args = parser.parse_args()
 

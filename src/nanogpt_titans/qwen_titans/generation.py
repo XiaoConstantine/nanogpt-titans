@@ -217,9 +217,7 @@ def titans_generate(
                 sorted_indices_to_remove[..., 0] = False
 
                 # Scatter back to original indexing
-                indices_to_remove = sorted_indices_to_remove.scatter(
-                    1, sorted_indices, sorted_indices_to_remove
-                )
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
                 logits[indices_to_remove] = float("-inf")
 
             # Sample next token

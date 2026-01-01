@@ -265,7 +265,7 @@ def profile_training_step(config: MLXTitansConfig):
         )
 
     print(f"TITANS layers: {list(titans_layers.keys())}")
-    layer_idx = list(titans_layers.keys())[0]  # Use first for single-layer tests
+    layer_idx = next(iter(titans_layers.keys()))  # Use first for single-layer tests
 
     # Create combined model
     combined_model = CombinedModel(
@@ -356,7 +356,7 @@ def profile_training_step(config: MLXTitansConfig):
 
     # Profile optimizer step for ALL layers
     def optimizer_step_all():
-        for idx, layer in titans_layers.items():
+        for _idx, layer in titans_layers.items():
             optimizer_memory.update(layer, layer_memory_grads)
             optimizer_gate.update(layer, layer_gate_grads)
 
@@ -465,9 +465,7 @@ def profile_update_breakdown(dim: int = 896, batch_size: int = 2, seq_len: int =
     t0 = time.perf_counter()
     for _ in range(10):
         keys, values = profile_projections()
-    results["projections"] = TimingResult(
-        "projections", (time.perf_counter() - t0) * 100, 0, 0, 0, 10
-    )
+    results["projections"] = TimingResult("projections", (time.perf_counter() - t0) * 100, 0, 0, 0, 10)
     print(f"  Key/Value projections:     {results['projections'].mean_ms:.2f} ms avg")
 
     # Profile gradient computation only
@@ -481,9 +479,7 @@ def profile_update_breakdown(dim: int = 896, batch_size: int = 2, seq_len: int =
     t0 = time.perf_counter()
     for _ in range(10):
         grads, grad_norm = profile_grad_comp()
-    results["gradient_comp"] = TimingResult(
-        "gradient_comp", (time.perf_counter() - t0) * 100, 0, 0, 0, 10
-    )
+    results["gradient_comp"] = TimingResult("gradient_comp", (time.perf_counter() - t0) * 100, 0, 0, 0, 10)
     print(f"  Gradient computation:      {results['gradient_comp'].mean_ms:.2f} ms avg")
 
     # Profile .item() call (forces CPU-GPU sync)
@@ -493,9 +489,7 @@ def profile_update_breakdown(dim: int = 896, batch_size: int = 2, seq_len: int =
     t0 = time.perf_counter()
     for _ in range(10):
         profile_item_call()
-    results["item_call"] = TimingResult(
-        "item_call", (time.perf_counter() - t0) * 100, 0, 0, 0, 10
-    )
+    results["item_call"] = TimingResult("item_call", (time.perf_counter() - t0) * 100, 0, 0, 0, 10)
     print(f"  .item() sync call:         {results['item_call'].mean_ms:.2f} ms avg")
 
     # Profile adaptive parameter computation
@@ -512,9 +506,7 @@ def profile_update_breakdown(dim: int = 896, batch_size: int = 2, seq_len: int =
     t0 = time.perf_counter()
     for _ in range(10):
         lr_param, mom_param, decay_param = profile_adaptive_params()
-    results["adaptive_params"] = TimingResult(
-        "adaptive_params", (time.perf_counter() - t0) * 100, 0, 0, 0, 10
-    )
+    results["adaptive_params"] = TimingResult("adaptive_params", (time.perf_counter() - t0) * 100, 0, 0, 0, 10)
     print(f"  Adaptive param compute:    {results['adaptive_params'].mean_ms:.2f} ms avg")
 
     # Profile .item() on adaptive params (3x calls)
@@ -526,9 +518,7 @@ def profile_update_breakdown(dim: int = 896, batch_size: int = 2, seq_len: int =
     t0 = time.perf_counter()
     for _ in range(10):
         profile_adaptive_item()
-    results["adaptive_item"] = TimingResult(
-        "adaptive_item", (time.perf_counter() - t0) * 100, 0, 0, 0, 10
-    )
+    results["adaptive_item"] = TimingResult("adaptive_item", (time.perf_counter() - t0) * 100, 0, 0, 0, 10)
     print(f"  Adaptive .item() (3x):     {results['adaptive_item'].mean_ms:.2f} ms avg")
 
     # Profile weight update loop (without .item())
@@ -556,10 +546,8 @@ def profile_update_breakdown(dim: int = 896, batch_size: int = 2, seq_len: int =
 
     t0 = time.perf_counter()
     for _ in range(10):
-        new_weights, new_momentum = profile_weight_update()
-    results["weight_update"] = TimingResult(
-        "weight_update", (time.perf_counter() - t0) * 100, 0, 0, 0, 10
-    )
+        _new_weights, _new_momentum = profile_weight_update()
+    results["weight_update"] = TimingResult("weight_update", (time.perf_counter() - t0) * 100, 0, 0, 0, 10)
     print(f"  Weight update loop:        {results['weight_update'].mean_ms:.2f} ms avg")
 
     # Profile full update (with all .item() calls)
@@ -571,11 +559,9 @@ def profile_update_breakdown(dim: int = 896, batch_size: int = 2, seq_len: int =
 
     t0 = time.perf_counter()
     for _ in range(5):
-        new_state, metrics = full_update()
+        new_state, _metrics = full_update()
         mx.eval(new_state.weights)
-    results["full_update"] = TimingResult(
-        "full_update", (time.perf_counter() - t0) * 200, 0, 0, 0, 5
-    )
+    results["full_update"] = TimingResult("full_update", (time.perf_counter() - t0) * 200, 0, 0, 0, 5)
     print(f"  Full update (current):     {results['full_update'].mean_ms:.2f} ms avg")
 
     # Summary
@@ -632,9 +618,7 @@ def identify_bottlenecks(all_results: dict[str, dict[str, Any]]):
         if cms_time > 10:
             print(f"  - CMS retrieval is slow ({cms_time:.1f}ms) - consider reducing num_levels")
         if cms_update > 10:
-            print(
-                f"  - CMS update is slow ({cms_update:.1f}ms) - consider higher update_frequencies"
-            )
+            print(f"  - CMS update is slow ({cms_update:.1f}ms) - consider higher update_frequencies")
         if grad_time > 5:
             print(f"  - Gradient computation is slow ({grad_time:.1f}ms) - batching could help")
 

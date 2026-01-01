@@ -78,16 +78,8 @@ class TrainConfig:
     min_lr: float = 6e-5
 
     # system
-    device: str = (
-        "cuda"
-        if torch.cuda.is_available()
-        else "mps"
-        if torch.backends.mps.is_available()
-        else "cpu"
-    )
-    dtype: str = (
-        "bfloat16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "float16"
-    )
+    device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    dtype: str = "bfloat16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "float16"
     compile: bool = False  # PyTorch 2.0 compile
 
     # derived fields (computed in __post_init__)
@@ -109,12 +101,8 @@ def get_batch(
     data = np.memmap(data_file, dtype=np.uint16, mode="r")
 
     ix = torch.randint(len(data) - config.block_size, (config.batch_size,))
-    x = torch.stack(
-        [torch.from_numpy(data[i : i + config.block_size].astype(np.int64)) for i in ix]
-    )
-    y = torch.stack(
-        [torch.from_numpy(data[i + 1 : i + 1 + config.block_size].astype(np.int64)) for i in ix]
-    )
+    x = torch.stack([torch.from_numpy(data[i : i + config.block_size].astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy(data[i + 1 : i + 1 + config.block_size].astype(np.int64)) for i in ix])
 
     if device_type == "cuda":
         # Pin memory for async transfer
@@ -242,11 +230,7 @@ def train(config: TrainConfig) -> None:
     device_type = "cuda" if "cuda" in config.device else "cpu"
     dtype_map = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
     ptdtype = dtype_map.get(config.dtype, torch.float16)
-    ctx = (
-        nullcontext()
-        if device_type == "cpu"
-        else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
-    )
+    ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
     # Data
     data_dir = Path("data") / config.dataset
@@ -305,9 +289,7 @@ def train(config: TrainConfig) -> None:
         checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
         # Use saved model config as base
         model_config = checkpoint["model_config"]
-        print(
-            f"  Restored model config: n_layer={model_config.n_layer}, n_embd={model_config.n_embd}"
-        )
+        print(f"  Restored model config: n_layer={model_config.n_layer}, n_embd={model_config.n_embd}")
 
         state_dict = checkpoint["model"]
         # Fix state dict if compiled
@@ -317,9 +299,7 @@ def train(config: TrainConfig) -> None:
                 state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
 
         # Check if checkpoint actually has adaptive memory weights (source of truth)
-        ckpt_has_adaptive = any(
-            "to_lr" in k or "to_momentum" in k or "to_decay" in k for k in state_dict
-        )
+        ckpt_has_adaptive = any("to_lr" in k or "to_momentum" in k or "to_decay" in k for k in state_dict)
         upgrade_to_adaptive = config.adaptive_memory and not ckpt_has_adaptive
 
         if upgrade_to_adaptive:
@@ -409,9 +389,7 @@ def train(config: TrainConfig) -> None:
 
     # Pre-compute FLOPS estimation for MFU calculation
     num_params = (
-        model.get_num_params()
-        if hasattr(model, "get_num_params")
-        else sum(p.numel() for p in model.parameters())
+        model.get_num_params() if hasattr(model, "get_num_params") else sum(p.numel() for p in model.parameters())
     )
     flops_per_iter = estimate_flops_per_iter(config, num_params)
     peak_tflops = get_peak_tflops(device_type, config.dtype)
@@ -431,9 +409,7 @@ def train(config: TrainConfig) -> None:
         # Evaluation
         if iter_num % config.eval_interval == 0:
             losses = estimate_loss(model, config, data_dir, device, device_type, ctx)  # type: ignore[arg-type]
-            print(
-                f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
-            )
+            print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
             if config.wandb_log:
                 wandb.log(
@@ -524,8 +500,7 @@ def train(config: TrainConfig) -> None:
                 util_pct = packed_batch.total_tokens / (config.batch_size * config.block_size) * 100
                 utilization = f", util {util_pct:.1f}%"
             print(
-                f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms, "
-                f"mfu {running_mfu * 100:.2f}%{utilization}"
+                f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms, mfu {running_mfu * 100:.2f}%{utilization}"
             )
 
         iter_num += 1
@@ -585,9 +560,7 @@ def main() -> None:
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.95)
     parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument(
-        "--use_8bit_optimizer", action="store_true", help="Use 8-bit AdamW (requires bitsandbytes)"
-    )
+    parser.add_argument("--use_8bit_optimizer", action="store_true", help="Use 8-bit AdamW (requires bitsandbytes)")
     parser.add_argument("--decay_lr", action="store_true", default=True)
     parser.add_argument("--no_decay_lr", action="store_false", dest="decay_lr")
     parser.add_argument("--warmup_iters", type=int, default=100)
@@ -596,18 +569,12 @@ def main() -> None:
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda"
-        if torch.cuda.is_available()
-        else "mps"
-        if torch.backends.mps.is_available()
-        else "cpu",
+        default="cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu",
     )
     parser.add_argument(
         "--dtype",
         type=str,
-        default="bfloat16"
-        if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-        else "float16",
+        default="bfloat16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "float16",
     )
     parser.add_argument("--compile", action="store_true")
 

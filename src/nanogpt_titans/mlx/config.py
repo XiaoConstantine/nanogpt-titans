@@ -1,8 +1,4 @@
-"""
-Configuration for MLX TITANS training.
-
-Compatible with PyTorch TitansQwenConfig for unified training workflows.
-"""
+"""MLX TITANS training config (compatible with PyTorch TitansQwenConfig)."""
 
 from __future__ import annotations
 
@@ -11,7 +7,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class MLXTitansConfig:
-    """Configuration for MLX TITANS training - matches PyTorch TitansQwenConfig."""
+    """MLX TITANS config."""
 
     model_name: str = "Qwen/Qwen2-0.5B"
     memory_layers: list[int] = field(default_factory=lambda: [12])  # Can be multiple layers

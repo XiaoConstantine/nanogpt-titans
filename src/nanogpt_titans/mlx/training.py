@@ -21,9 +21,7 @@ if TYPE_CHECKING:
     from nanogpt_titans.mlx.config import MLXTitansConfig
 
 
-def compute_teach_signal(
-    logits: mx.array, targets: mx.array, lm_head_weight: mx.array
-) -> mx.array:
+def compute_teach_signal(logits: mx.array, targets: mx.array, lm_head_weight: mx.array) -> mx.array:
     """
     Compute teaching signal from logit residuals.
 
@@ -353,9 +351,7 @@ def compute_multi_layer_gate_regularization(
     return mx.mean(mx.stack(penalties))
 
 
-def create_loss_fn(
-    _combined_model: CombinedModel, gate_min_value: float = 0.0, gate_reg_weight: float = 0.0
-):
+def create_loss_fn(_combined_model: CombinedModel, gate_min_value: float = 0.0, gate_reg_weight: float = 0.0):
     """Create a loss function for the combined model."""
 
     def loss_fn(combined_model: CombinedModel, input_ids: mx.array, target_ids: mx.array):
@@ -382,9 +378,7 @@ def create_loss_fn(
 
         # Add gate regularization if enabled (prevents gate from collapsing)
         if gate_min_value > 0 and gate_reg_weight > 0:
-            gate_reg = compute_multi_layer_gate_regularization(
-                combined_model.titans_layers, gate_min_value
-            )
+            gate_reg = compute_multi_layer_gate_regularization(combined_model.titans_layers, gate_min_value)
             total_loss = total_loss + gate_reg_weight * gate_reg
 
         return total_loss
@@ -438,9 +432,8 @@ def get_lr(step: int, config: MLXTitansConfig, use_linear: bool = False) -> floa
 
     if use_linear:
         return config.learning_rate
-    else:
-        progress = (step - warmup_steps) / max(1, config.max_steps - warmup_steps)
-        return config.learning_rate * 0.5 * (1.0 + math.cos(math.pi * progress))
+    progress = (step - warmup_steps) / max(1, config.max_steps - warmup_steps)
+    return config.learning_rate * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
 def create_masked_grads(
@@ -463,7 +456,7 @@ def create_masked_grads(
             k: create_masked_grads(v, keep_gate_scale, f"{path}.{k}" if path else k, freeze_gate)
             for k, v in grads.items()
         }
-    elif isinstance(grads, mx.array):
+    if isinstance(grads, mx.array):
         is_gate = "gate" in path
         is_scale_adaptive = (
             "mem_scale" in path
@@ -481,20 +474,17 @@ def create_masked_grads(
 
         if keep_gate_scale:
             return grads if is_gate_scale else mx.zeros_like(grads)
-        else:
-            return mx.zeros_like(grads) if is_gate_scale else grads
-    else:
-        return grads
+        return mx.zeros_like(grads) if is_gate_scale else grads
+    return grads
 
 
 def scale_grads_recursive(grad_tree: Any, factor: float) -> Any:
     """Recursively scale gradients by a constant factor."""
     if isinstance(grad_tree, dict):
         return {k: scale_grads_recursive(v, factor) for k, v in grad_tree.items()}
-    elif isinstance(grad_tree, mx.array):
+    if isinstance(grad_tree, mx.array):
         return grad_tree * factor
-    else:
-        return grad_tree
+    return grad_tree
 
 
 def accumulate_grads(accum_grads: dict | None, new_grads: dict) -> dict:
@@ -505,10 +495,9 @@ def accumulate_grads(accum_grads: dict | None, new_grads: dict) -> dict:
     def add_grads(a, b):
         if isinstance(a, dict):
             return {k: add_grads(a[k], b[k]) for k in a}
-        elif isinstance(a, mx.array):
+        if isinstance(a, mx.array):
             return a + b
-        else:
-            return a
+        return a
 
     return add_grads(accum_grads, new_grads)
 
@@ -597,10 +586,12 @@ def online_eval(
 
         # Collect metrics for this chunk
         layer_stats = combined_model.get_layer_stats()
-        chunk_metrics.append({
-            "chunk_end": chunk_end,
-            "layer_stats": layer_stats,
-        })
+        chunk_metrics.append(
+            {
+                "chunk_end": chunk_end,
+                "layer_stats": layer_stats,
+            }
+        )
 
         # Store logits if requested
         if return_all_logits:
@@ -616,10 +607,12 @@ def online_eval(
         mx.eval(logits)
 
         layer_stats = combined_model.get_layer_stats()
-        chunk_metrics.append({
-            "chunk_end": T,
-            "layer_stats": layer_stats,
-        })
+        chunk_metrics.append(
+            {
+                "chunk_end": T,
+                "layer_stats": layer_stats,
+            }
+        )
 
         if return_all_logits:
             all_logits.append(logits)
@@ -629,8 +622,7 @@ def online_eval(
 
     if return_all_logits:
         return all_logits, chunk_metrics
-    else:
-        return final_logits, chunk_metrics
+    return final_logits, chunk_metrics
 
 
 def online_generate(
@@ -715,10 +707,12 @@ def online_generate(
         # Update memory periodically
         if (i + 1) % chunk_size == 0:
             layer_stats = combined_model.get_layer_stats()
-            generation_metrics.append({
-                "token_idx": i + 1,
-                "layer_stats": layer_stats,
-            })
+            generation_metrics.append(
+                {
+                    "token_idx": i + 1,
+                    "layer_stats": layer_stats,
+                }
+            )
 
         mx.eval(input_ids)
 

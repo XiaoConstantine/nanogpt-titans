@@ -45,27 +45,26 @@ packages = ["src/nanogpt_titans"]
 
 [tool.ruff]
 target-version = "py313"
-line-length = 100
+line-length = 120
 
 [tool.ruff.lint]
 select = [
-    "E",      # pycodestyle errors
-    "W",      # pycodestyle warnings
-    "F",      # pyflakes
-    "I",      # isort
-    "B",      # flake8-bugbear
-    "C4",     # flake8-comprehensions
-    "UP",     # pyupgrade
-    "ARG",    # flake8-unused-arguments
-    "SIM",    # flake8-simplify
-    "TCH",    # flake8-type-checking
-    "PTH",    # flake8-use-pathlib
-    "RUF",    # Ruff-specific rules
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # isort
+    "B",        # flake8-bugbear
+    "C4",       # flake8-comprehensions
+    "UP",       # pyupgrade
+    "RET",      # flake8-return (no-else-return)
+    "SIM",      # flake8-simplify
+    "RUF",      # ruff-specific
 ]
 ignore = [
-    "E501",   # line too long (handled by formatter)
-    "B008",   # function calls in argument defaults
-    "B905",   # zip without strict=
+    "E501",     # line length (formatter handles)
+    "B008",     # function call in default arg
+    "B905",     # zip without strict=
+    "RET504",   # unnecessary assignment before return (sometimes clearer)
+    "SIM108",   # ternary instead of if-else (not always clearer)
 ]
 
 [tool.ruff.lint.isort]

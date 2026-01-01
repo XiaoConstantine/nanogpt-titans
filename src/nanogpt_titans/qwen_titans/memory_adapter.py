@@ -1,20 +1,4 @@
-"""
-Memory adapter for Qwen models.
-
-Wraps the NeuralMemory class from nanogpt_titans to work with Qwen dimensions,
-providing a clean interface for the decoder layer integration.
-
-Also includes HOPE-inspired components:
-- SelfModifyingLinear: Delta rule weight updates during forward pass
-- SelfModifyingGate: Learned gate that opens as memory becomes useful
-- ContinuumMemorySystem: Multi-frequency memory MLPs
-
-Features from nested_learning:
-- MemoryMetrics: Per-update metrics (grad_norm, surprise, update_skipped)
-- CMSMetrics: Multi-level metrics
-- Surprise threshold: Skip updates for low-surprise tokens
-- Per-level gradient clipping: Prevent any level from dominating
-"""
+"""Memory adapter for Qwen models. Wraps NeuralMemory with HOPE-inspired components."""
 
 from __future__ import annotations
 
@@ -31,31 +15,9 @@ if TYPE_CHECKING:
     from nanogpt_titans.qwen_titans.config import TitansQwenConfig
 
 
-# =============================================================================
-# Memory Metrics (from nested_learning)
-# =============================================================================
-
-
 @dataclass
 class MemoryMetrics:
-    """Metrics collected during a single memory update.
-
-    Per-component metrics from nested_learning for detailed debugging:
-    - grad_norm: Overall gradient norm
-    - surprise: Surprise value (same as grad_norm for memory)
-    - w0_grad_norm: Layer 0 weight gradient norm
-    - w1_grad_norm: Layer 1 weight gradient norm
-    - weight_norm: Current weight magnitude
-    - update_magnitude: Size of weight update applied
-
-    Attributes:
-        grad_norm: L2 norm of gradients before clipping
-        surprise: Average "surprise" value (proxy for how unexpected the input was)
-        update_skipped: Whether update was skipped due to low surprise
-        lr_mean: Mean adaptive learning rate (if adaptive=True)
-        momentum_mean: Mean adaptive momentum (if adaptive=True)
-        decay_mean: Mean adaptive decay (if adaptive=True)
-    """
+    """Metrics from memory update."""
 
     grad_norm: float = 0.0
     surprise: float = 0.0
@@ -67,7 +29,7 @@ class MemoryMetrics:
     # Per-component metrics (from nested_learning)
     w0_grad_norm: float = 0.0  # Layer 0 gradient norm
     w1_grad_norm: float = 0.0  # Layer 1 gradient norm
-    weight_norm: float = 0.0   # Current weight magnitude
+    weight_norm: float = 0.0  # Current weight magnitude
     update_magnitude: float = 0.0  # Size of weight change
 
     def to_dict(self) -> dict[str, float]:
@@ -132,23 +94,9 @@ class CMSMetrics:
             "level_metrics": [m.to_dict() for m in self.level_metrics],
         }
 
-# =============================================================================
-# Self-Modifying Components (from Nested Learning / HOPE)
-# =============================================================================
-
 
 class SelfModifyingLinear(nn.Module):
-    """
-    Linear layer with delta rule weight updates during forward pass.
-
-    Implements online adaptation: weights are updated based on input to reduce
-    reconstruction error, allowing the projection to adapt to current context.
-
-    Update rule: W -= lr * (W @ x @ x^T) / ||x||^2
-
-    This is a simplified Hebbian/delta rule that moves weights toward
-    identity-like behavior on the current input subspace.
-    """
+    """Linear layer with delta rule weight updates. W -= lr * (W @ x @ x^T) / ||x||^2"""
 
     def __init__(
         self,
@@ -260,9 +208,7 @@ class SelfModifyingGate(nn.Module):
 
         # Update statistics
         with torch.no_grad():
-            self._mean_gate = (self._mean_gate * self._gate_count + gate.mean()) / (
-                self._gate_count + 1
-            )
+            self._mean_gate = (self._mean_gate * self._gate_count + gate.mean()) / (self._gate_count + 1)
             self._gate_count += 1
 
         # Gated combination
@@ -288,9 +234,9 @@ class SelfModifyingGate(nn.Module):
         return self._mean_gate.item()
 
 
-# =============================================================================
+# ---
 # Continuum Memory System (Multi-frequency memory)
-# =============================================================================
+# ---
 
 
 @dataclass
@@ -400,25 +346,21 @@ class ContinuumMemorySystem(nn.Module):
             for mem, level_state in zip(self.memories, state.level_states):
                 current = mem(current, level_state)
             return current
-        else:
-            # Weighted sum mode (default): all levels process same input
-            weights = F.softmax(self.level_weights, dim=0)
+        # Weighted sum mode (default): all levels process same input
+        weights = F.softmax(self.level_weights, dim=0)
 
-            # Fused retrieval: stack outputs and apply weights in one operation
-            # This reduces Python loop overhead and enables better GPU utilization
-            level_outputs = torch.stack(
-                [
-                    mem(hidden_states, level_state)
-                    for mem, level_state in zip(self.memories, state.level_states)
-                ],
-                dim=0,
-            )  # [num_levels, B, num_longterm_mem, C]
+        # Fused retrieval: stack outputs and apply weights in one operation
+        # This reduces Python loop overhead and enables better GPU utilization
+        level_outputs = torch.stack(
+            [mem(hidden_states, level_state) for mem, level_state in zip(self.memories, state.level_states)],
+            dim=0,
+        )  # [num_levels, B, num_longterm_mem, C]
 
-            # Apply weights: [num_levels, 1, 1, 1] * [num_levels, B, T, C] -> weighted sum
-            weights_expanded = weights.view(-1, 1, 1, 1)
-            combined = (weights_expanded * level_outputs).sum(dim=0)  # [B, num_longterm_mem, C]
+        # Apply weights: [num_levels, 1, 1, 1] * [num_levels, B, T, C] -> weighted sum
+        weights_expanded = weights.view(-1, 1, 1, 1)
+        combined = (weights_expanded * level_outputs).sum(dim=0)  # [B, num_longterm_mem, C]
 
-            return combined
+        return combined
 
     def _should_update_level(self, level_idx: int, step: int) -> bool:
         """
@@ -491,9 +433,7 @@ class ContinuumMemorySystem(nn.Module):
         # In cascade mode, track the cascaded input for each level
         current_input = hidden_states
 
-        for i, (mem, level_state, freq) in enumerate(
-            zip(self.memories, state.level_states, self.update_frequencies)
-        ):
+        for i, (mem, level_state, _freq) in enumerate(zip(self.memories, state.level_states, self.update_frequencies)):
             count = state.segment_counts[i] + 1
 
             # Check if this level should update (considers warmup and jitter)
@@ -525,11 +465,7 @@ class ContinuumMemorySystem(nn.Module):
 
         # Compute aggregate metrics
         active_metrics = [m for m in level_metrics if not m.update_skipped]
-        avg_surprise = (
-            sum(m.surprise for m in active_metrics) / len(active_metrics)
-            if active_metrics
-            else 0.0
-        )
+        avg_surprise = sum(m.surprise for m in active_metrics) / len(active_metrics) if active_metrics else 0.0
 
         cms_metrics = CMSMetrics(
             level_metrics=level_metrics,
@@ -551,9 +487,9 @@ class ContinuumMemorySystem(nn.Module):
         return self._last_metrics
 
 
-# =============================================================================
+# ---
 # Warm Start Encoder
-# =============================================================================
+# ---
 
 
 class WarmStartEncoder(nn.Module):
@@ -617,9 +553,9 @@ class WarmStartEncoder(nn.Module):
         return mem_init
 
 
-# =============================================================================
+# ---
 # Deep Momentum (Learned gradient compression)
-# =============================================================================
+# ---
 
 
 class DeepMomentumUpdate(nn.Module):

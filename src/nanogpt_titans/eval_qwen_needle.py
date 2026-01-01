@@ -343,9 +343,7 @@ def print_results(results: dict[str, Any], title: str = "EVALUATION RESULTS") ->
     print(title)
     print("=" * 60)
 
-    print(
-        f"\nOverall Accuracy: {results['accuracy']:.1%} ({results['correct']}/{results['total']})"
-    )
+    print(f"\nOverall Accuracy: {results['accuracy']:.1%} ({results['correct']}/{results['total']})")
 
     print("\nAccuracy by Needle Position:")
     for pos, data in results["by_position"].items():
@@ -355,23 +353,17 @@ def print_results(results: dict[str, Any], title: str = "EVALUATION RESULTS") ->
     print("\nAccuracy by Context Length:")
     for length, data in results["by_length"].items():
         if data["total"] > 0:
-            print(
-                f"  {length:5d} tokens: {data['accuracy']:.1%} ({data['correct']}/{data['total']})"
-            )
+            print(f"  {length:5d} tokens: {data['accuracy']:.1%} ({data['correct']}/{data['total']})")
 
     print("\nAccuracy by Needle Depth:")
     for depth, data in results["by_depth"].items():
         if data["total"] > 0:
-            print(
-                f"  {depth:.0%} depth: {data['accuracy']:.1%} ({data['correct']}/{data['total']})"
-            )
+            print(f"  {depth:.0%} depth: {data['accuracy']:.1%} ({data['correct']}/{data['total']})")
 
     print("\nSample Results (first 5):")
     for sample in results["samples"][:5]:
         status = "OK" if sample["correct"] else "WRONG"
-        print(
-            f"  [{status:5s}] Needle: {sample['needle']}, Generated: {sample['generated'][:50]}..."
-        )
+        print(f"  [{status:5s}] Needle: {sample['needle']}, Generated: {sample['generated'][:50]}...")
 
 
 def main() -> None:
@@ -383,12 +375,8 @@ def main() -> None:
     # Model arguments
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2-1.5B")
     parser.add_argument("--titans", action="store_true", help="Use Titans memory")
-    parser.add_argument(
-        "--titans_state", type=str, default=None, help="Path to trained Titans state"
-    )
-    parser.add_argument(
-        "--memory_layers", type=str, default="14", help="Comma-separated layer indices for Titans"
-    )
+    parser.add_argument("--titans_state", type=str, default=None, help="Path to trained Titans state")
+    parser.add_argument("--memory_layers", type=str, default="14", help="Comma-separated layer indices for Titans")
 
     # Titans config
     parser.add_argument("--segment_len", type=int, default=512)
@@ -426,11 +414,7 @@ def main() -> None:
         device = torch.device(args.device)
     else:
         device = torch.device(
-            "cuda"
-            if torch.cuda.is_available()
-            else "mps"
-            if torch.backends.mps.is_available()
-            else "cpu"
+            "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
         )
 
     # Setup dtype

@@ -1,17 +1,7 @@
-"""
-MAG (Memory as Gate) Titans-enhanced Qwen2 decoder layer.
+"""MAG (Memory as Gate) Titans decoder layer.
 
-Implements the MAG variant from the Titans paper where memory and attention
-operate in PARALLEL branches combined via multiplicative gating.
-
-Key difference from MAC:
-- MAC: output = Attn([memory || input])  (memory as context)
-- MAG: output = Attn(input) ⊗ σ(Memory(input))  (memory as gate)
-
-Benefits of MAG:
-1. Avoids gate collapse - multiplicative interaction can't be "turned off"
-2. Parallel computation - attention and memory run simultaneously
-3. Memory MODULATES attention rather than competing with it
+MAG: output = Attn(input) * sigmoid(Memory(input)) - memory gates attention.
+vs MAC: output = Attn([memory || input]) - memory as context.
 """
 
 from __future__ import annotations
@@ -262,8 +252,7 @@ class MAGQwenDecoderLayer(nn.Module):
             "modulation_bias": self.modulation_bias.item(),
             # Mean gate is always ~1.0 due to centering, so report scale instead
             "mean_gate": 1.0
-            + self.modulation_scale.item()
-            * torch.tanh(torch.tensor(self.modulation_bias.item())).item(),
+            + self.modulation_scale.item() * torch.tanh(torch.tensor(self.modulation_bias.item())).item(),
         }
 
     def _compute_memory_surprise(self, hidden_states: torch.Tensor) -> torch.Tensor:

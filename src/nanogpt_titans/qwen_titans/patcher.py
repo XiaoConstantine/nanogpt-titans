@@ -88,8 +88,7 @@ def patch_qwen_with_titans(
         layers = model.layers
     else:
         raise ValueError(
-            f"Cannot find decoder layers in model of type {type(model)}. "
-            "Expected model.model.layers or model.layers"
+            f"Cannot find decoder layers in model of type {type(model)}. Expected model.model.layers or model.layers"
         )
 
     # Validate layer indices
@@ -103,9 +102,7 @@ def patch_qwen_with_titans(
         original_layer = layers[idx]
 
         # Check if already a Titans layer
-        if isinstance(
-            original_layer, (TitansQwenDecoderLayer, MAGQwenDecoderLayer, MALQwenDecoderLayer)
-        ):
+        if isinstance(original_layer, (TitansQwenDecoderLayer, MAGQwenDecoderLayer, MALQwenDecoderLayer)):
             print(f"Layer {idx} is already a Titans layer, skipping")
             continue
 
@@ -185,9 +182,7 @@ def freeze_base_model(model: nn.Module) -> dict[str, int]:
     for idx in model._titans_layer_indices:
         layer = layers[idx]
 
-        if not isinstance(
-            layer, (TitansQwenDecoderLayer, MAGQwenDecoderLayer, MALQwenDecoderLayer)
-        ):
+        if not isinstance(layer, (TitansQwenDecoderLayer, MAGQwenDecoderLayer, MALQwenDecoderLayer)):
             print(f"Warning: Layer {idx} is not a Titans layer")
             continue
 
@@ -291,9 +286,7 @@ def get_titans_layers(model: nn.Module) -> list[nn.Module]:
     return [
         layers[idx]
         for idx in model._titans_layer_indices
-        if isinstance(
-            layers[idx], (TitansQwenDecoderLayer, MAGQwenDecoderLayer, MALQwenDecoderLayer)
-        )
+        if isinstance(layers[idx], (TitansQwenDecoderLayer, MAGQwenDecoderLayer, MALQwenDecoderLayer))
     ]
 
 
@@ -441,14 +434,10 @@ def load_titans_state(model: nn.Module, path: str) -> None:
             # Modulation scale and bias
             scale_key = f"{layer_key}.modulation_scale"
             if scale_key in titans_state:
-                layer.modulation_scale.data.copy_(
-                    titans_state[scale_key].to(layer.modulation_scale.dtype)
-                )
+                layer.modulation_scale.data.copy_(titans_state[scale_key].to(layer.modulation_scale.dtype))
             bias_key = f"{layer_key}.modulation_bias"
             if bias_key in titans_state:
-                layer.modulation_bias.data.copy_(
-                    titans_state[bias_key].to(layer.modulation_bias.dtype)
-                )
+                layer.modulation_bias.data.copy_(titans_state[bias_key].to(layer.modulation_bias.dtype))
         elif isinstance(layer, MALQwenDecoderLayer):
             # MAL: mem_proj and scalar gate
             for name, param in layer.mem_proj.named_parameters():

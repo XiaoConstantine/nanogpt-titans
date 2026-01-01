@@ -96,9 +96,7 @@ def evaluate_needle_retrieval(
 
         # Check if context fits
         if len(input_ids) > model.config.block_size:
-            print(
-                f"Skipping sample {sample['id']}: too long ({len(input_ids)} > {model.config.block_size})"
-            )
+            print(f"Skipping sample {sample['id']}: too long ({len(input_ids)} > {model.config.block_size})")
             continue
 
         x = torch.tensor(input_ids, dtype=torch.long, device=device)[None, ...]
@@ -179,9 +177,7 @@ def print_results(results: dict[str, Any]) -> None:
     print("NEEDLE-IN-HAYSTACK EVALUATION RESULTS")
     print("=" * 60)
 
-    print(
-        f"\nOverall Accuracy: {results['accuracy']:.1%} ({results['correct']}/{results['total']})"
-    )
+    print(f"\nOverall Accuracy: {results['accuracy']:.1%} ({results['correct']}/{results['total']})")
 
     print("\nAccuracy by Needle Position:")
     for pos, data in results["by_position"].items():
@@ -192,16 +188,12 @@ def print_results(results: dict[str, Any]) -> None:
     for length in sorted(results["by_length"].keys()):
         data = results["by_length"][length]
         if data["total"] > 0:
-            print(
-                f"  {length:5d} tokens: {data['accuracy']:.1%} ({data['correct']}/{data['total']})"
-            )
+            print(f"  {length:5d} tokens: {data['accuracy']:.1%} ({data['correct']}/{data['total']})")
 
     print("\nSample Results:")
     for sample in results["samples"][:5]:
         status = "correct" if sample["correct"] else "WRONG"
-        print(
-            f"  [{status:7s}] Needle: {sample['needle']}, Generated: {sample['generated'][:50]}..."
-        )
+        print(f"  [{status:7s}] Needle: {sample['needle']}, Generated: {sample['generated'][:50]}...")
 
 
 def main() -> None:
@@ -242,11 +234,7 @@ def main() -> None:
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda"
-        if torch.cuda.is_available()
-        else "mps"
-        if torch.backends.mps.is_available()
-        else "cpu",
+        default="cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu",
         help="Device to run on",
     )
 

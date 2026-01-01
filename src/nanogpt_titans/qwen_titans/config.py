@@ -75,9 +75,7 @@ class TitansQwenConfig:
     # Continuum Memory System (multi-frequency memory)
     use_cms: bool = True  # Use multi-frequency memory levels
     num_cms_levels: int = 3  # Number of frequency levels
-    cms_update_frequencies: list[int] = field(
-        default_factory=lambda: [1, 4, 16]
-    )  # Update every N segments
+    cms_update_frequencies: list[int] = field(default_factory=lambda: [1, 4, 16])  # Update every N segments
     # Cascade mode: each level transforms previous level's output (hierarchical refinement)
     # vs weighted sum mode: all levels process same input, outputs are weighted sum
     use_cascade: bool = False

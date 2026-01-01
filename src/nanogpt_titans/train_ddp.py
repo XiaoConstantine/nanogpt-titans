@@ -125,12 +125,8 @@ def get_batch(
     data = np.memmap(data_file, dtype=np.uint16, mode="r")
 
     ix = torch.randint(len(data) - config.block_size, (config.batch_size,))
-    x = torch.stack(
-        [torch.from_numpy(data[i : i + config.block_size].astype(np.int64)) for i in ix]
-    )
-    y = torch.stack(
-        [torch.from_numpy(data[i + 1 : i + 1 + config.block_size].astype(np.int64)) for i in ix]
-    )
+    x = torch.stack([torch.from_numpy(data[i : i + config.block_size].astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy(data[i + 1 : i + 1 + config.block_size].astype(np.int64)) for i in ix])
 
     x = x.pin_memory().to(device, non_blocking=True)
     y = y.pin_memory().to(device, non_blocking=True)
@@ -389,9 +385,7 @@ def train(config: TrainConfig) -> None:
         # Eval
         if iter_num % config.eval_interval == 0 and master_process:
             losses = estimate_loss(wrapped_model, config, data_dir, ctx)  # type: ignore[arg-type]
-            print(
-                f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
-            )
+            print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
             if config.wandb_log:
                 wandb.log(
@@ -423,9 +417,7 @@ def train(config: TrainConfig) -> None:
 
         for micro_step in range(config.gradient_accumulation_steps):
             if ddp:
-                wrapped_model.require_backward_grad_sync = (
-                    micro_step == config.gradient_accumulation_steps - 1
-                )  # type: ignore[union-attr]
+                wrapped_model.require_backward_grad_sync = micro_step == config.gradient_accumulation_steps - 1  # type: ignore[union-attr]
 
             with ctx:
                 # Memory persists across micro-steps (contiguous sequence)
@@ -489,9 +481,7 @@ def main() -> None:
     parser.add_argument("--memory_lr", type=float, default=0.01)
     parser.add_argument("--memory_depth", type=int, default=2)
     parser.add_argument("--memory_expansion", type=int, default=2)
-    parser.add_argument(
-        "--memory_layer", type=int, default=-1, help="Which layer has memory (-1=middle, -2=all)"
-    )
+    parser.add_argument("--memory_layer", type=int, default=-1, help="Which layer has memory (-1=middle, -2=all)")
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--learning_rate", type=float, default=6e-4)
     parser.add_argument("--max_iters", type=int, default=10000)

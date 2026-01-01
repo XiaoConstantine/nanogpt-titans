@@ -176,9 +176,7 @@ def prepare_openwebtext(data_dir: Path, num_proc: int = 8) -> None:
         total_batches = 1024
         idx = 0
         for batch_idx in range(total_batches):
-            batch = dset.shard(
-                num_shards=total_batches, index=batch_idx, contiguous=True
-            ).with_format("numpy")
+            batch = dset.shard(num_shards=total_batches, index=batch_idx, contiguous=True).with_format("numpy")
             arr_batch = np.concatenate(batch["ids"])
             arr[idx : idx + len(arr_batch)] = arr_batch
             idx += len(arr_batch)

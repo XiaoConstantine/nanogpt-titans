@@ -36,7 +36,7 @@ except ImportError:
 # Optional Qwen/HuggingFace support
 _TRANSFORMERS_AVAILABLE = False
 try:
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM
 
     from nanogpt_titans.qwen_titans import (
         TitansQwenConfig,
@@ -72,11 +72,7 @@ def profile_training_iteration(
 
     # Setup matching train.py
     device_type = "cuda" if device.type == "cuda" else "cpu"
-    ctx = (
-        nullcontext()
-        if device_type == "cpu"
-        else torch.amp.autocast(device_type=device_type, dtype=dtype)
-    )
+    ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=dtype)
     scaler = torch.amp.GradScaler(enabled=(dtype == torch.float16))
 
     # Optimizer selection
@@ -171,11 +167,7 @@ def profile_with_torch_profiler(
     batch_size = x.shape[0]
 
     device_type = "cuda" if device.type == "cuda" else "cpu"
-    ctx = (
-        nullcontext()
-        if device_type == "cpu"
-        else torch.amp.autocast(device_type=device_type, dtype=dtype)
-    )
+    ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=dtype)
     scaler = torch.amp.GradScaler(enabled=(dtype == torch.float16))
 
     # Optimizer selection
@@ -269,13 +261,7 @@ def profile_with_torch_profiler(
 
         key = e.key.lower()
         # Categorize by operation type
-        if (
-            "attention" in key
-            or "softmax" in key
-            or "flash" in key
-            or "sdpa" in key
-            or "flex" in key
-        ):
+        if "attention" in key or "softmax" in key or "flash" in key or "sdpa" in key or "flex" in key:
             categories["attention"] += cuda_time
         elif "gemm" in key or "matmul" in key or "::mm" in key or "addmm" in key or "bmm" in key:
             categories["matmul/gemm"] += cuda_time
@@ -285,13 +271,7 @@ def profile_with_torch_profiler(
             categories["triton/fused"] += cuda_time
         elif "copy" in key or "memcpy" in key or "memset" in key or "to_copy" in key:
             categories["memory_ops"] += cuda_time
-        elif (
-            "elementwise" in key
-            or "add_" in key
-            or "mul_" in key
-            or "foreach" in key
-            or "vectorized" in key
-        ):
+        elif "elementwise" in key or "add_" in key or "mul_" in key or "foreach" in key or "vectorized" in key:
             categories["elementwise"] += cuda_time
         else:
             categories["other"] += cuda_time
@@ -418,9 +398,7 @@ def diagnose_gradient_flow(
     optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate)
 
     print(f"\nOptimizer param groups: {len(optimizer.param_groups)}")
-    print(
-        f"Total trainable params in optimizer: {sum(p.numel() for g in optimizer.param_groups for p in g['params'])}"
-    )
+    print(f"Total trainable params in optimizer: {sum(p.numel() for g in optimizer.param_groups for p in g['params'])}")
 
     # State manager
     state_manager = TitansStateManager(model)
@@ -437,11 +415,7 @@ def diagnose_gradient_flow(
     model.train()
 
     device_type = "cuda" if device.type == "cuda" else "cpu"
-    ctx = (
-        torch.amp.autocast(device_type=device_type, dtype=dtype)
-        if device_type == "cuda"
-        else nullcontext()
-    )
+    ctx = torch.amp.autocast(device_type=device_type, dtype=dtype) if device_type == "cuda" else nullcontext()
 
     grad_history = []
 
@@ -508,9 +482,7 @@ def diagnose_gradient_flow(
             if hasattr(layer, "mem_proj"):
                 for name, param in layer.mem_proj.named_parameters():
                     if param.grad is not None:
-                        step_grads["grads"][f"{layer_key}.mem_proj.{name}"] = (
-                            param.grad.norm().item()
-                        )
+                        step_grads["grads"][f"{layer_key}.mem_proj.{name}"] = param.grad.norm().item()
 
         grad_history.append(step_grads)
 
@@ -629,9 +601,7 @@ def diagnose_gradient_flow(
 
     return {
         "grad_history": grad_history,
-        "initial_values": {
-            k: v.item() if v.numel() == 1 else v.tolist() for k, v in initial_values.items()
-        },
+        "initial_values": {k: v.item() if v.numel() == 1 else v.tolist() for k, v in initial_values.items()},
         "issues": issues,
     }
 
@@ -716,9 +686,7 @@ def profile_qwen_training(
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total params: {total_params / 1e6:.1f}M")
-    print(
-        f"Trainable params: {trainable_params / 1e6:.1f}M ({100 * trainable_params / total_params:.2f}%)"
-    )
+    print(f"Trainable params: {trainable_params / 1e6:.1f}M ({100 * trainable_params / total_params:.2f}%)")
 
     # Setup optimizer
     optimizer = torch.optim.AdamW(
@@ -731,11 +699,7 @@ def profile_qwen_training(
 
     # Setup autocast
     device_type = "cuda" if device.type == "cuda" else "cpu"
-    ctx = (
-        nullcontext()
-        if device_type == "cpu"
-        else torch.amp.autocast(device_type=device_type, dtype=dtype)
-    )
+    ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=dtype)
     scaler = torch.amp.GradScaler(enabled=(dtype == torch.float16))
 
     model.train()
@@ -916,9 +880,7 @@ def profile_qwen_training(
         print()
         print(f"Throughput: {results['tokens_per_sec']:,.0f} tokens/sec")
         print(f"Segments per sequence: {num_segments}")
-        print(
-            f"Avg time per segment: {(results['forward_ms'] + results['backward_ms']) / num_segments:.2f} ms"
-        )
+        print(f"Avg time per segment: {(results['forward_ms'] + results['backward_ms']) / num_segments:.2f} ms")
 
         # Per-segment breakdown (last iteration)
         if segment_times:
@@ -1040,9 +1002,7 @@ def profile_qwen_training(
     if device.type == "cuda":
         mem_allocated = torch.cuda.max_memory_allocated() / 1e9
         mem_reserved = torch.cuda.max_memory_reserved() / 1e9
-        print(
-            f"\nPeak GPU memory: {mem_allocated:.2f} GB allocated, {mem_reserved:.2f} GB reserved"
-        )
+        print(f"\nPeak GPU memory: {mem_allocated:.2f} GB allocated, {mem_reserved:.2f} GB reserved")
 
     return results
 
@@ -1054,17 +1014,13 @@ def main() -> None:
     )
 
     # Model selection
-    parser.add_argument(
-        "--qwen", action="store_true", help="Profile Qwen-Titans instead of TitansGPT"
-    )
+    parser.add_argument("--qwen", action="store_true", help="Profile Qwen-Titans instead of TitansGPT")
     parser.add_argument(
         "--diagnose",
         action="store_true",
         help="Diagnose gradient flow for mem_scale/gate (use with --qwen)",
     )
-    parser.add_argument(
-        "--model_name", type=str, default="Qwen/Qwen2-0.5B", help="Qwen model name (for --qwen)"
-    )
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2-0.5B", help="Qwen model name (for --qwen)")
     parser.add_argument(
         "--memory_layers",
         type=str,
@@ -1073,9 +1029,7 @@ def main() -> None:
     )
 
     # Profiling options
-    parser.add_argument(
-        "--detailed", action="store_true", help="Use torch.profiler for kernel analysis"
-    )
+    parser.add_argument("--detailed", action="store_true", help="Use torch.profiler for kernel analysis")
     parser.add_argument("--export-trace", action="store_true", help="Export Chrome trace file")
     parser.add_argument("--num-iters", type=int, default=10, help="Number of iterations to profile")
 
@@ -1091,9 +1045,7 @@ def main() -> None:
     # Training config
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
     parser.add_argument("--seq_len", type=int, default=512, help="Sequence length (for --qwen)")
-    parser.add_argument(
-        "--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16", "float16"]
-    )
+    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16", "float16"])
     parser.add_argument("--compile", action="store_true", help="Use torch.compile()")
     parser.add_argument(
         "--8bit",
@@ -1236,9 +1188,7 @@ def main() -> None:
         if device.type == "cuda":
             mem_allocated = torch.cuda.max_memory_allocated() / 1e9
             mem_reserved = torch.cuda.max_memory_reserved() / 1e9
-            print(
-                f"Peak GPU memory: {mem_allocated:.2f} GB allocated, {mem_reserved:.2f} GB reserved"
-            )
+            print(f"Peak GPU memory: {mem_allocated:.2f} GB allocated, {mem_reserved:.2f} GB reserved")
 
 
 if __name__ == "__main__":

@@ -1,16 +1,4 @@
-"""
-Titans: Learning to Memorize at Test Time
-Implementation of Memory as Context (MAC) architecture on top of nanoGPT.
-
-Based on: https://arxiv.org/abs/2501.00663
-
-Fixed version addressing:
-- Proper prefix-LM attention masking
-- Per-sequence memory state (not global)
-- Memory updates during training
-- Correct state passing between segments
-- FIXED: Causal memory retrieval (no future token leakage)
-"""
+"""Titans: Memory as Context (MAC) on nanoGPT. https://arxiv.org/abs/2501.00663"""
 
 from __future__ import annotations
 
@@ -23,23 +11,14 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-# =============================================================================
-# Compile-friendly Memory State (NamedTuples instead of dicts)
-# =============================================================================
-
 
 class MemoryWeights(NamedTuple):
-    """
-    Memory MLP weights as a NamedTuple (compile-friendly).
+    """Memory MLP weights (NamedTuple for torch.compile compatibility)."""
 
-    Using NamedTuple instead of dict avoids graph breaks in torch.compile.
-    Supports 2-layer MLP with optional bias.
-    """
-
-    w0: torch.Tensor  # [B, H, C] - layer 0 weight
-    b0: torch.Tensor | None  # [B, H] - layer 0 bias (optional)
-    w1: torch.Tensor  # [B, C, H] - layer 1 weight
-    b1: torch.Tensor | None  # [B, C] - layer 1 bias (optional)
+    w0: torch.Tensor  # [B, H, C]
+    b0: torch.Tensor | None  # [B, H]
+    w1: torch.Tensor  # [B, C, H]
+    b1: torch.Tensor | None  # [B, C]
 
 
 # FlexAttention imports (available in PyTorch 2.5+)
@@ -99,54 +78,28 @@ except ImportError:
     pass
 
 
-# --- FlexAttention mask functions ---
-
-
 def causal_mask(_b, _h, q_idx, kv_idx):
-    """Standard causal mask: each position can only attend to previous positions."""
+    """Standard causal mask."""
     return q_idx >= kv_idx
 
 
 def prefix_lm_mask(prefix_len: int):
-    """
-    Create prefix-LM mask function.
-
-    Prefix tokens (0:prefix_len) can attend to all prefix tokens.
-    Suffix tokens (prefix_len:) can attend to prefix + causally to suffix.
-    """
+    """Prefix-LM: prefix attends to prefix; suffix attends to prefix + causal suffix."""
 
     def mask_fn(_b, _h, q_idx, kv_idx):
-        # If query is in prefix, it can attend to all prefix tokens
         in_prefix = q_idx < prefix_len
-        # If key is in prefix, it can always be attended to
         key_in_prefix = kv_idx < prefix_len
-        # Causal mask for suffix
         causal = q_idx >= kv_idx
-        # Prefix can attend to prefix; suffix can attend to prefix + causal suffix
-        return (
-            (in_prefix & key_in_prefix)
-            | (key_in_prefix & ~in_prefix)
-            | (~in_prefix & ~key_in_prefix & causal)
-        )
+        return (in_prefix & key_in_prefix) | (key_in_prefix & ~in_prefix) | (~in_prefix & ~key_in_prefix & causal)
 
     return mask_fn
 
 
 def document_causal_mask(document_ids: torch.Tensor):
-    """
-    Create document-aware causal mask for packed sequences.
-
-    Each position can only attend to positions in the same document,
-    with causal masking within each document.
-
-    Args:
-        document_ids: [seq_len] tensor where document_ids[i] = doc index for token i
-    """
+    """Document-aware causal mask for packed sequences."""
 
     def mask_fn(_b, _h, q_idx, kv_idx):
-        same_doc = document_ids[q_idx] == document_ids[kv_idx]
-        causal = q_idx >= kv_idx
-        return same_doc & causal
+        return (document_ids[q_idx] == document_ids[kv_idx]) & (q_idx >= kv_idx)
 
     return mask_fn
 
@@ -167,48 +120,18 @@ def get_causal_block_mask(seq_len: int, device: torch.device):
 
 
 def parallel_scan_log(gates: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
-    """
-    Parallel associative scan via cumsum trick.
-
-    Solves the recurrence: x[t] = gate[t] * x[t-1] + token[t]
-
-    This is O(n) and fully parallelizable on CPU/GPU/TPU using cumsum.
-    Based on: https://github.com/PeaBrane/mamba-tiny
-    See also: https://srush.github.io/annotated-mamba/hard.html
-
-    Args:
-        gates: Decay/gate values [*, T] in range (0, 1), e.g., momentum coefficient
-        tokens: Input values [*, T, ...] to accumulate, e.g., surprises
-
-    Returns:
-        Accumulated values [*, T, ...] where each position contains
-        the momentum-weighted sum of all previous tokens
-    """
-    # Handle the case where tokens has more dims than gates
-    # gates: [*, T], tokens: [*, T, D1, D2, ...]
+    """Parallel scan: x[t] = gate[t] * x[t-1] + token[t]. O(n) via cumsum."""
+    # Broadcast gates to match token dims
     token_dims = tokens.dim() - gates.dim()
     for _ in range(token_dims):
         gates = gates.unsqueeze(-1)
 
-    # Clamp gates to avoid log(0)
     gates = gates.clamp(min=1e-7, max=1.0 - 1e-7)
-
-    # Log-space computation for numerical stability
     log_gates = torch.log(gates)
-    log_cumsum_gates = torch.cumsum(log_gates, dim=-2 - token_dims + 1)  # cumsum along T dim
-
-    # Scale tokens by inverse cumulative gate product
-    # This "normalizes" each token to the same reference point
+    log_cumsum_gates = torch.cumsum(log_gates, dim=-2 - token_dims + 1)
     scaling = torch.exp(-log_cumsum_gates)
-    scaled_tokens = tokens * scaling
-
-    # Cumsum of scaled tokens
-    cumsum_scaled = torch.cumsum(scaled_tokens, dim=-2 - token_dims + 1)
-
-    # Rescale back by cumulative gate product
-    result = cumsum_scaled * torch.exp(log_cumsum_gates)
-
-    return result
+    cumsum_scaled = torch.cumsum(tokens * scaling, dim=-2 - token_dims + 1)
+    return cumsum_scaled * torch.exp(log_cumsum_gates)
 
 
 def parallel_momentum(
@@ -216,40 +139,17 @@ def parallel_momentum(
     momentum: float,
     prev_momentum: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """
-    Compute momentum updates in parallel using cumsum trick.
-
-    Computes: m[t] = momentum * m[t-1] + (1 - momentum) * surprise[t]
-
-    This is equivalent to exponential moving average of surprises.
-
-    Args:
-        surprises: Surprise values [B, T, ...] to accumulate
-        momentum: Momentum coefficient (e.g., 0.9)
-        prev_momentum: Previous momentum state [B, ...] from last segment
-
-    Returns:
-        Momentum values [B, T, ...] for each timestep
-    """
+    """EMA of surprises: m[t] = momentum * m[t-1] + (1 - momentum) * surprise[t]."""
     B, T = surprises.shape[:2]
     device = surprises.device
-
-    # Gates are constant momentum value
     gates = torch.full((B, T), momentum, device=device, dtype=surprises.dtype)
-
-    # Scale surprises by (1 - momentum)
     tokens = (1 - momentum) * surprises
 
-    # If we have previous momentum, prepend it and adjust
     if prev_momentum is not None:
-        # Prepend previous momentum as first "token" with gate 1.0
-        # This propagates the previous state through the scan
-        prev_expanded = prev_momentum.unsqueeze(1)  # [B, 1, ...]
-        tokens = torch.cat([prev_expanded, tokens], dim=1)  # [B, T+1, ...]
+        # Prepend previous state to propagate through scan
+        tokens = torch.cat([prev_momentum.unsqueeze(1), tokens], dim=1)
         gates = torch.cat([torch.ones(B, 1, device=device), gates], dim=1)
-
-        result = parallel_scan_log(gates, tokens)
-        return result[:, 1:]  # Remove the prepended position
+        return parallel_scan_log(gates, tokens)[:, 1:]
 
     return parallel_scan_log(gates, tokens)
 
@@ -298,25 +198,18 @@ class LayerNorm(nn.Module):
         return F.layer_norm(x, self.weight.shape, self.weight, self.bias, 1e-5)
 
 
-@dataclass
+@dataclass(slots=True)
 class MemoryState:
-    """Per-sequence memory state - stores MLP weights as the memory."""
+    """Per-sequence memory state (MLP weights as memory)."""
 
-    # MLP weights per batch item: dict mapping param_name -> [B, *param_shape]
-    weights: dict[str, torch.Tensor]
-    # Last momentum value for each weight (for continuity across segments): [B, *param_shape]
-    last_momentum: dict[str, torch.Tensor]
-    # Last segment's output representation for causal retrieval: [B, T, C] or None
-    last_segment_output: torch.Tensor | None = None
+    weights: dict[str, torch.Tensor]  # {name: [B, *param_shape]}
+    last_momentum: dict[str, torch.Tensor]  # {name: [B, *param_shape]}
+    last_segment_output: torch.Tensor | None = None  # [B, T, C] for causal retrieval
     step: int = 0
 
 
 class MemoryMLP(nn.Module):
-    """
-    Small MLP whose weights serve as the memory.
-
-    This is a stateless module - actual weights are passed in via functional_call.
-    """
+    """MLP whose weights serve as memory (stateless - weights passed via functional_call)."""
 
     def __init__(self, dim: int, hidden_dim: int, depth: int = 2, bias: bool = True) -> None:
         super().__init__()
@@ -334,18 +227,7 @@ class MemoryMLP(nn.Module):
 
 
 class NeuralMemory(nn.Module):
-    """
-    Neural Memory Module that learns at test time.
-
-    Correct implementation based on Titans paper:
-    - Memory IS the MLP weights (stored per-sequence in MemoryState)
-    - Surprise = gradient of MSE loss w.r.t. MLP weights
-    - Memory update = weight update with momentum and decay
-    - Retrieval = forward pass through MLP with per-sequence weights
-
-    FIXED: Retrieval now uses previous segment's output (stored in state)
-    to avoid leaking future token information.
-    """
+    """Neural Memory that learns at test time. Memory = MLP weights, updated via surprise gradients."""
 
     def __init__(self, config: TitansConfig) -> None:
         super().__init__()
@@ -434,16 +316,12 @@ class NeuralMemory(nn.Module):
 
         for name, param in self.memory_mlp.named_parameters():
             # Expand weights to [B, *param_shape] and clone - ensure contiguous
-            expanded = (
-                param.detach().unsqueeze(0).expand(batch_size, *param.shape).clone().contiguous()
-            )
+            expanded = param.detach().unsqueeze(0).expand(batch_size, *param.shape).clone().contiguous()
             weights[name] = expanded.to(device)
             # Last momentum starts at zero - already contiguous
             last_momentum[name] = torch.zeros_like(expanded)
 
-        return MemoryState(
-            weights=weights, last_momentum=last_momentum, last_segment_output=None, step=0
-        )
+        return MemoryState(weights=weights, last_momentum=last_momentum, last_segment_output=None, step=0)
 
     @torch.compiler.disable  # State reset modifies dicts - incompatible with compile
     def reset_state(self, state: MemoryState) -> None:
@@ -486,8 +364,7 @@ class NeuralMemory(nn.Module):
         """
         if enabled and not hasattr(self, "to_lr"):
             raise ValueError(
-                "Adaptive mode requires projection layers. "
-                "Set adaptive_memory=True in config when creating the model."
+                "Adaptive mode requires projection layers. Set adaptive_memory=True in config when creating the model."
             )
         self.adaptive = enabled
 
@@ -510,9 +387,7 @@ class NeuralMemory(nn.Module):
             return grads
 
         # Compute global grad norm
-        total_norm_sq = sum(
-            (g ** 2).sum() for g in grads.values()
-        )
+        total_norm_sq = sum((g**2).sum() for g in grads.values())
         total_norm = total_norm_sq.sqrt()
 
         # Clip if needed
@@ -834,8 +709,7 @@ class NeuralMemory(nn.Module):
 
             with torch.enable_grad():
                 params_for_grad = {
-                    name: w.contiguous().clone().requires_grad_(True)
-                    for name, w in state.weights.items()
+                    name: w.contiguous().clone().requires_grad_(True) for name, w in state.weights.items()
                 }
                 all_grads = self._batched_grad_fn(params_for_grad, keys, values)
 
@@ -846,9 +720,7 @@ class NeuralMemory(nn.Module):
         # Apply updates with parallel momentum
         # Check if we can use the batched Triton kernel (single kernel for all params)
         first_grad = next(iter(all_grads.values()))
-        use_batched = (
-            _TRITON_AVAILABLE and first_grad.is_cuda and triton_batched_weight_update is not None
-        )
+        use_batched = _TRITON_AVAILABLE and first_grad.is_cuda and triton_batched_weight_update is not None
 
         if use_batched:
             # Single kernel launch for ALL parameters - most efficient
@@ -1157,9 +1029,7 @@ class TitansBlock(nn.Module):
         # Neural memory module (only if this layer has memory)
         if has_memory:
             self.memory = NeuralMemory(config)
-            self.persist_mem = nn.Parameter(
-                torch.randn(1, config.num_persist_mem, config.n_embd) * 0.02
-            )
+            self.persist_mem = nn.Parameter(torch.randn(1, config.num_persist_mem, config.n_embd) * 0.02)
         else:
             self.memory = None  # type: ignore[assignment]
             self.persist_mem = None  # type: ignore[assignment]
@@ -1284,10 +1154,7 @@ class TitansGPT(nn.Module):
                 "wpe": nn.Embedding(config.block_size, config.n_embd),
                 "drop": nn.Dropout(config.dropout),
                 "h": nn.ModuleList(
-                    [
-                        TitansBlock(config, has_memory=(i in memory_layers))
-                        for i in range(config.n_layer)
-                    ]
+                    [TitansBlock(config, has_memory=(i in memory_layers)) for i in range(config.n_layer)]
                 ),
                 "ln_f": LayerNorm(config.n_embd, bias=config.bias),
             }
@@ -1395,15 +1262,12 @@ class TitansGPT(nn.Module):
         # Decide whether to use fused linear cross-entropy
         # FLCE avoids materializing full [B, T, V] logits tensor - significant memory savings
         use_fused_ce = (
-            targets is not None
-            and _TRITON_AVAILABLE
-            and fused_linear_cross_entropy is not None
-            and idx.is_cuda
+            targets is not None and _TRITON_AVAILABLE and fused_linear_cross_entropy is not None and idx.is_cuda
         )
 
         # Collect either hidden states (for FLCE) or logits
-        all_hidden: list[torch.Tensor] = [] if use_fused_ce else []
-        all_logits: list[torch.Tensor] = [] if not use_fused_ce else []
+        all_hidden: list[torch.Tensor] = []
+        all_logits: list[torch.Tensor] = []
 
         for seg_idx in range(num_segments):
             start = seg_idx * segment_len
@@ -1546,9 +1410,7 @@ class TitansGPT(nn.Module):
         # Use 8-bit AdamW if requested and available
         if use_8bit:
             if not _BITSANDBYTES_AVAILABLE:
-                raise ImportError(
-                    "8-bit AdamW requires bitsandbytes. Install with: pip install bitsandbytes"
-                )
+                raise ImportError("8-bit AdamW requires bitsandbytes. Install with: pip install bitsandbytes")
             print("Using 8-bit AdamW (bitsandbytes)")
             return bnb_AdamW8bit(optim_groups, lr=learning_rate, betas=betas)
 
@@ -1567,9 +1429,7 @@ class TitansGPT(nn.Module):
     ) -> torch.Tensor:
         """Generate tokens autoregressively with memory."""
         for _ in range(max_new_tokens):
-            idx_cond = (
-                idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size :]
-            )
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size :]
 
             logits, _, memory_states = self(idx_cond, memory_states=memory_states)
             logits = logits[:, -1, :] / temperature

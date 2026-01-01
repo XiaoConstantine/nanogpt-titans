@@ -169,9 +169,7 @@ class PackedDataset:
 
         # Build attention mask that prevents cross-document attention
         # For each row, documents can only attend within themselves
-        attention_mask = self._build_packed_attention_mask(
-            sequence_lengths, self.block_size, device
-        )
+        attention_mask = self._build_packed_attention_mask(sequence_lengths, self.block_size, device)
 
         # Build cu_seqlens for Flash Attention (optional)
         cu_seqlens = self._build_cu_seqlens(sequence_lengths, device)

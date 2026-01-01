@@ -449,29 +449,25 @@ class TitansQwenDecoderLayer(nn.Module):
         sample = hidden_states[:, :1, :]  # Just use first token to save compute
         proj_out = self.mem_proj(sample)
         ln_out = self.mem_ln(proj_out)
-        proj_reg = (ln_out ** 2).mean() * 0.0  # Zero weight but creates gradient path
+        proj_reg = (ln_out**2).mean() * 0.0  # Zero weight but creates gradient path
 
         # =========================================================================
         # Adaptive parameter training (matches MLX version)
         # =========================================================================
         adaptive_reg = torch.tensor(0.0, device=hidden_states.device)
-        if hasattr(mem, 'to_lr') and mem.to_lr is not None:
+        if hasattr(mem, "to_lr") and mem.to_lr is not None:
             # L2 regularization on adaptive outputs - gives direct gradients
             lr_out = mem.to_lr(x[:, :1, :])
             mom_out = mem.to_momentum(x[:, :1, :])
             decay_out = mem.to_decay(x[:, :1, :])
 
-            adaptive_reg = (
-                (lr_out ** 2).mean() +
-                (mom_out ** 2).mean() +
-                (decay_out ** 2).mean()
-            ) * 0.001
+            adaptive_reg = ((lr_out**2).mean() + (mom_out**2).mean() + (decay_out**2).mean()) * 0.001
 
         # Also train query_proj
         query_reg = torch.tensor(0.0, device=hidden_states.device)
-        if hasattr(mem, 'query_proj'):
+        if hasattr(mem, "query_proj"):
             query_out = mem.query_proj(x[:, :1, :])
-            query_reg = (query_out ** 2).mean() * 0.001
+            query_reg = (query_out**2).mean() * 0.001
 
         total_loss = recon_loss + 0.01 * scale_reg + proj_reg + adaptive_reg + query_reg
 

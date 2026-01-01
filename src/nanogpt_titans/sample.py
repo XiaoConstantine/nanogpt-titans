@@ -23,11 +23,7 @@ def sample(
     max_new_tokens: int = 500,
     temperature: float = 0.8,
     top_k: int = 200,
-    device: str = "cuda"
-    if torch.cuda.is_available()
-    else "mps"
-    if torch.backends.mps.is_available()
-    else "cpu",
+    device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu",
 ) -> list[str]:
     """
     Generate samples from a trained model.
@@ -147,11 +143,7 @@ def main() -> None:
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda"
-        if torch.cuda.is_available()
-        else "mps"
-        if torch.backends.mps.is_available()
-        else "cpu",
+        default="cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu",
         help="Device to run on",
     )
 

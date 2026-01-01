@@ -138,9 +138,7 @@ class MLXTitansLayer(nn.Module):
         """Initialize memory state for this layer."""
         return self.memory.init_state(batch_size)
 
-    def __call__(
-        self, hidden_states: mx.array, state: TitansLayerState
-    ) -> tuple[mx.array, TitansLayerState]:
+    def __call__(self, hidden_states: mx.array, state: TitansLayerState) -> tuple[mx.array, TitansLayerState]:
         """
         Apply HOPE-style memory enhancement to hidden states.
 

@@ -255,12 +255,8 @@ def aggregated_gradient_memory_update(
         if isinstance(mom_coef, torch.Tensor):
             mom_coef_bias = mom_coef.squeeze(-1)  # [B, 1] for [B, H] bias
             one_minus_mom_bias = 1.0 - mom_coef_bias
-            new_mom_b0 = (
-                mom_coef_bias * momentum["layers.0.bias"] + one_minus_mom_bias * db0_agg * scale
-            )
-            new_mom_b1 = (
-                mom_coef_bias * momentum["layers.1.bias"] + one_minus_mom_bias * db1_agg * scale
-            )
+            new_mom_b0 = mom_coef_bias * momentum["layers.0.bias"] + one_minus_mom_bias * db0_agg * scale
+            new_mom_b1 = mom_coef_bias * momentum["layers.1.bias"] + one_minus_mom_bias * db1_agg * scale
         else:
             new_mom_b0 = mom_coef * momentum["layers.0.bias"] + one_minus_mom * db0_agg * scale
             new_mom_b1 = mom_coef * momentum["layers.1.bias"] + one_minus_mom * db1_agg * scale
@@ -276,9 +272,7 @@ def aggregated_gradient_memory_update(
     # Build dicts in named_parameters() order: weight, bias, weight, bias
     if has_bias:
         if isinstance(decay_factor, torch.Tensor) or isinstance(lr, torch.Tensor):
-            decay_factor_bias = (
-                decay_factor.squeeze(-1) if isinstance(decay_factor, torch.Tensor) else decay_factor
-            )
+            decay_factor_bias = decay_factor.squeeze(-1) if isinstance(decay_factor, torch.Tensor) else decay_factor
             lr_bias = lr.squeeze(-1) if isinstance(lr, torch.Tensor) else lr
             new_b0 = decay_factor_bias * b0 - lr_bias * new_mom_b0
             new_b1 = decay_factor_bias * b1 - lr_bias * new_mom_b1
