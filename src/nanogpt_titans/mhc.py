@@ -100,8 +100,6 @@ class HyperConnection(nn.Module):
         Returns:
             output tensor [B, T, C]
         """
-        B, T, C = x.shape
-
         # Get connection matrix [B, n+1, n+1]
         conn = self.get_connection_matrix(x)
 

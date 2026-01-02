@@ -681,10 +681,10 @@ def profile_full_training_loop(config: MLXTitansConfig, num_steps: int = 5, eage
     # Warmup
     for _ in range(2):
         combined_model.reset_memory_state()
-        loss, grads = loss_and_grad_fn(combined_model, input_ids, target_ids)
+        loss, _grads = loss_and_grad_fn(combined_model, input_ids, target_ids)
         mx.eval(loss)
 
-    for step in range(num_steps):
+    for _step in range(num_steps):
         step_start = time.perf_counter()
 
         # 1. Reset memory state
@@ -788,7 +788,7 @@ def profile_full_training_loop(config: MLXTitansConfig, num_steps: int = 5, eage
 
     # Print results
     print("\n" + "-" * 60)
-    print("TIMING BREAKDOWN (averages over {} steps)".format(num_steps))
+    print(f"TIMING BREAKDOWN (averages over {num_steps} steps)")
     print("-" * 60)
 
     import statistics
@@ -839,7 +839,7 @@ def profile_full_training_loop(config: MLXTitansConfig, num_steps: int = 5, eage
     print(f"  Grad processing ({accum_steps}x):    {(filter_avg + scale_avg + accum_avg) * accum_steps:>8.2f} ms ({(filter_avg + scale_avg + accum_avg) * accum_steps / total_avg * 100:>5.1f}%)")
     print(f"  Optimizer + eval:          {opt_avg + eval_avg:>8.2f} ms ({(opt_avg + eval_avg) / total_avg * 100:>5.1f}%)")
     print(f"  Other overhead:            {reset_avg + mask_avg + stats_avg + misc_avg:>8.2f} ms ({(reset_avg + mask_avg + stats_avg + misc_avg) / total_avg * 100:>5.1f}%)")
-    print(f"  ---")
+    print("  ---")
     print(f"  Accounted:                 {accounted_total:>8.2f} ms")
     print(f"  Unaccounted:               {misc_avg:>8.2f} ms ({misc_avg / total_avg * 100:>5.1f}%)")
     print(f"  Total:                     {total_avg:>8.2f} ms")
@@ -875,7 +875,7 @@ def profile_titans_vs_base(config: MLXTitansConfig):
     model, _ = mlx_load(config.model_name)
 
     dim = model.model.layers[0].self_attn.q_proj.weight.shape[0]
-    num_layers = len(model.model.layers)
+    _num_layers = len(model.model.layers)  # For reference
 
     # Create dummy data
     input_ids = mx.random.randint(0, 32000, (1, config.segment_len))
@@ -1080,7 +1080,7 @@ def identify_bottlenecks(all_results: dict[str, dict[str, Any]]):
 
         if total > 0:
             steps_per_sec = 1000 / total
-            print(f"\n  Full Loop Analysis:")
+            print("\n  Full Loop Analysis:")
             print(f"  - Total step time: {total:.1f}ms ({steps_per_sec:.2f} step/s)")
 
             # Identify biggest contributor

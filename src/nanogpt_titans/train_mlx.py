@@ -354,11 +354,6 @@ def train(config: MLXTitansConfig):
         # Reset memory state at start of each step
         combined_model.reset_memory_state()
 
-        # Timing breakdown
-        t_fwd_bwd = 0.0
-        t_opt = 0.0
-        t_eval = 0.0
-
         # Gradient accumulation loop
         accumulated_grads = None
         accumulated_backbone_grads = None
@@ -372,10 +367,8 @@ def train(config: MLXTitansConfig):
             input_ids = batch[:-1].reshape(1, -1)
             target_ids = batch[1:].reshape(1, -1)
 
-            t_fwd_start = time.perf_counter()
             loss, full_grads = loss_and_grad_fn(combined_model, input_ids, target_ids)
             titans_grads = filter_titans_grads(full_grads)
-            t_fwd_bwd += time.perf_counter() - t_fwd_start
 
             # Extract backbone gradients if unfreezing is enabled
             backbone_grads = None
@@ -480,7 +473,7 @@ def train(config: MLXTitansConfig):
                         optimizer_backbone.update(backbone_layer, layer_grads)
                         params_to_eval.extend(tree_flatten(backbone_layer.parameters()))
 
-        t_opt = time.perf_counter() - t_opt_start
+        _t_opt = time.perf_counter() - t_opt_start  # Keep for debugging
 
         # OPTIMIZATION: Release intermediate references before eval to reduce peak memory
         # This allows MLX to free gradient arrays before computing parameter updates
@@ -492,7 +485,7 @@ def train(config: MLXTitansConfig):
         # Eval all updated parameters
         t_eval_start = time.perf_counter()
         mx.eval(*[p for _, p in params_to_eval])
-        t_eval = time.perf_counter() - t_eval_start
+        _t_eval = time.perf_counter() - t_eval_start  # Keep for debugging
 
         # Track step time
         step_time = time.perf_counter() - step_start

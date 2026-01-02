@@ -5,7 +5,6 @@ from __future__ import annotations
 import mlx.core as mx
 import mlx.nn as nn
 
-
 # =============================================================================
 # Phase 2: Custom Metal Kernel for Sinkhorn (fuses exp + 4 iterations)
 # =============================================================================
@@ -218,13 +217,11 @@ class HyperConnection(nn.Module):
         full_input = mx.concatenate([layer_input, mixed_streams], axis=2)
 
         # === Connection matmul (optimized) ===
-        J = matrix_size
-        I = matrix_size
-        inp_flat = full_input.reshape(B * T, J, C)
+        inp_flat = full_input.reshape(B * T, matrix_size, C)
 
         # Phase 1: Force contiguous before matmul
-        conn_exp = mx.broadcast_to(conn[:, None, :, :], (B, T, I, J))
-        conn_exp = conn_exp.reshape(B * T, I, J)
+        conn_exp = mx.broadcast_to(conn[:, None, :, :], (B, T, matrix_size, matrix_size))
+        conn_exp = conn_exp.reshape(B * T, matrix_size, matrix_size)
 
         # === Fused output: weighted sum approach (5x faster than slice+mean) ===
         # Instead of: matmul → slice → mean → combine

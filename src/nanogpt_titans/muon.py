@@ -28,7 +28,7 @@ class Muon(Optimizer):
 
     def __init__(self, params, lr: float = 0.02, momentum: float = 0.95,
                  nesterov: bool = True, ns_steps: int = 5, weight_decay: float = 0.0):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, weight_decay=weight_decay)
+        defaults = {"lr": lr, "momentum": momentum, "nesterov": nesterov, "ns_steps": ns_steps, "weight_decay": weight_decay}
         super().__init__(params, defaults)
 
     @torch.no_grad()
