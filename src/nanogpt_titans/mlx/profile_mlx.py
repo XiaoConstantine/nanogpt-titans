@@ -583,6 +583,435 @@ def profile_update_breakdown(dim: int = 896, batch_size: int = 2, seq_len: int =
     return results
 
 
+def _eval_grad_tree(tree):
+    """Recursively evaluate all arrays in gradient tree."""
+    arrays = []
+    def collect(t):
+        if isinstance(t, dict):
+            for v in t.values():
+                collect(v)
+        elif isinstance(t, mx.array):
+            arrays.append(t)
+    collect(tree)
+    if arrays:
+        mx.eval(*arrays)
+
+
+def profile_full_training_loop(config: MLXTitansConfig, num_steps: int = 5, eager_eval: bool = False):
+    """Profile a COMPLETE training loop to find ALL bottlenecks.
+
+    This profiles everything including overhead not captured in partial timings:
+    - Memory state reset
+    - Dict manipulation
+    - Gradient filtering and masking
+    - Layer-by-layer updates
+    - Logging/stats overhead
+
+    Args:
+        config: MLX config
+        num_steps: Number of training steps
+        eager_eval: If True, evaluate gradients immediately (prevents lazy accumulation)
+    """
+    print("\n" + "=" * 60)
+    print("FULL TRAINING LOOP PROFILING")
+    print("=" * 60)
+    print(f"Eager eval: {eager_eval}")
+
+    try:
+        from mlx_lm import load as mlx_load
+    except ImportError:
+        print("mlx-lm not installed, skipping")
+        return {}
+
+    print(f"Loading {config.model_name}...")
+    model, _ = mlx_load(config.model_name)
+
+    dim = model.model.layers[0].self_attn.q_proj.weight.shape[0]
+    num_layers = len(model.model.layers)
+
+    # Create TITANS layers
+    titans_layers = {}
+    for layer_idx in config.memory_layers:
+        idx = min(layer_idx, num_layers - 1)
+        titans_layers[idx] = MLXTitansLayer(
+            dim=dim,
+            use_cms=config.use_cms,
+            num_cms_levels=config.num_cms_levels,
+            memory_depth=config.memory_depth,
+            memory_expansion=config.memory_expansion,
+            adaptive_memory=config.adaptive_memory,
+        )
+
+    combined_model = CombinedModel(
+        model,
+        titans_layers,
+        use_internal_loss=config.use_internal_loss,
+    )
+
+    loss_fn = create_loss_fn(combined_model, config.gate_min_value, config.gate_reg_weight)
+    loss_and_grad_fn = nn.value_and_grad(combined_model, loss_fn)
+
+    optimizer_memory = optim.AdamW(learning_rate=config.learning_rate)
+    optimizer_gate = optim.AdamW(learning_rate=config.learning_rate * config.gate_lr_scale)
+
+    # Create dummy data
+    input_ids = mx.random.randint(0, 32000, (1, config.segment_len))
+    target_ids = mx.random.randint(0, 32000, (1, config.segment_len))
+    mx.eval(input_ids, target_ids)
+
+    from mlx.utils import tree_flatten
+
+    # Timing accumulators
+    timings = {
+        "reset_memory": [],
+        "forward_backward": [],
+        "filter_grads": [],
+        "scale_grads": [],
+        "accumulate_grads": [],
+        "create_masked_grads": [],
+        "optimizer_update": [],
+        "eval_params": [],
+        "get_layer_stats": [],
+        "total_step": [],
+        "misc_overhead": [],
+    }
+
+    print(f"\nRunning {num_steps} training steps with {config.gradient_accumulation_steps} accumulation steps each...")
+
+    # Warmup
+    for _ in range(2):
+        combined_model.reset_memory_state()
+        loss, grads = loss_and_grad_fn(combined_model, input_ids, target_ids)
+        mx.eval(loss)
+
+    for step in range(num_steps):
+        step_start = time.perf_counter()
+
+        # 1. Reset memory state
+        t0 = time.perf_counter()
+        combined_model.reset_memory_state()
+        timings["reset_memory"].append((time.perf_counter() - t0) * 1000)
+
+        # Gradient accumulation loop (matches train_mlx.py structure)
+        accumulated_grads = None
+        total_loss = mx.array(0.0)
+
+        for _micro_step in range(config.gradient_accumulation_steps):
+            # 2. Forward + backward
+            t0 = time.perf_counter()
+            loss, full_grads = loss_and_grad_fn(combined_model, input_ids, target_ids)
+            if eager_eval:
+                # Force evaluation of loss AND gradients - prevents lazy accumulation
+                mx.eval(loss)
+                _eval_grad_tree(full_grads)
+            else:
+                mx.eval(loss)  # Only force loss, gradients stay lazy
+            timings["forward_backward"].append((time.perf_counter() - t0) * 1000)
+
+            # 3. Filter TITANS grads
+            t0 = time.perf_counter()
+            titans_grads = filter_titans_grads(full_grads)
+            timings["filter_grads"].append((time.perf_counter() - t0) * 1000)
+
+            # 4. Scale grads
+            t0 = time.perf_counter()
+            scale_factor = 1.0 / config.gradient_accumulation_steps
+            scaled_grads = scale_grads_recursive(titans_grads, scale_factor)
+            timings["scale_grads"].append((time.perf_counter() - t0) * 1000)
+
+            # 5. Accumulate grads
+            t0 = time.perf_counter()
+            accumulated_grads = accumulate_grads(accumulated_grads, scaled_grads)
+            timings["accumulate_grads"].append((time.perf_counter() - t0) * 1000)
+
+            total_loss = total_loss + loss
+
+        # Extract layer grads
+        if "titans_layers" in accumulated_grads:
+            titans_grads = accumulated_grads["titans_layers"]
+        elif "titans_layer" in accumulated_grads:
+            titans_grads = accumulated_grads["titans_layer"]
+        else:
+            titans_grads = accumulated_grads
+
+        # 6. Create masked grads for each layer
+        t0 = time.perf_counter()
+        all_memory_grads = {}
+        all_gate_grads = {}
+        for layer_idx, _layer in titans_layers.items():
+            if isinstance(titans_grads, dict) and str(layer_idx) in titans_grads:
+                layer_grads = titans_grads[str(layer_idx)]
+            elif isinstance(titans_grads, dict) and layer_idx in titans_grads:
+                layer_grads = titans_grads[layer_idx]
+            else:
+                layer_grads = titans_grads
+            all_memory_grads[layer_idx] = create_masked_grads(layer_grads, keep_gate_scale=False)
+            all_gate_grads[layer_idx] = create_masked_grads(layer_grads, keep_gate_scale=True)
+        timings["create_masked_grads"].append((time.perf_counter() - t0) * 1000)
+
+        # 7. Optimizer updates
+        t0 = time.perf_counter()
+        params_to_eval = []
+        for layer_idx, layer in titans_layers.items():
+            optimizer_memory.update(layer, all_memory_grads[layer_idx])
+            optimizer_gate.update(layer, all_gate_grads[layer_idx])
+            params_to_eval.extend(tree_flatten(layer.parameters()))
+        timings["optimizer_update"].append((time.perf_counter() - t0) * 1000)
+
+        # 8. Eval all params
+        t0 = time.perf_counter()
+        mx.eval(*[p for _, p in params_to_eval])
+        timings["eval_params"].append((time.perf_counter() - t0) * 1000)
+
+        # 9. Get layer stats (logging overhead)
+        t0 = time.perf_counter()
+        _layer_stats = combined_model.get_layer_stats()
+        timings["get_layer_stats"].append((time.perf_counter() - t0) * 1000)
+
+        # Total step time
+        total = (time.perf_counter() - step_start) * 1000
+        timings["total_step"].append(total)
+
+        # Calculate misc overhead (unaccounted time)
+        accounted = (
+            timings["reset_memory"][-1]
+            + sum(timings["forward_backward"][-config.gradient_accumulation_steps:])
+            + sum(timings["filter_grads"][-config.gradient_accumulation_steps:])
+            + sum(timings["scale_grads"][-config.gradient_accumulation_steps:])
+            + sum(timings["accumulate_grads"][-config.gradient_accumulation_steps:])
+            + timings["create_masked_grads"][-1]
+            + timings["optimizer_update"][-1]
+            + timings["eval_params"][-1]
+            + timings["get_layer_stats"][-1]
+        )
+        timings["misc_overhead"].append(total - accounted)
+
+    # Print results
+    print("\n" + "-" * 60)
+    print("TIMING BREAKDOWN (averages over {} steps)".format(num_steps))
+    print("-" * 60)
+
+    import statistics
+
+    def print_timing(name, values, indent=2):
+        mean = statistics.mean(values)
+        std = statistics.stdev(values) if len(values) > 1 else 0
+        print(f"{'  ' * indent}{name:<30} {mean:>8.2f} ms (±{std:.2f})")
+        return mean
+
+    total_avg = print_timing("Total step time:", timings["total_step"], 0)
+    print()
+
+    accum_steps = config.gradient_accumulation_steps
+    print(f"  Per-microstep ({accum_steps}x accumulated):")
+    fwd_bwd_avg = print_timing("Forward+backward:", timings["forward_backward"])
+    filter_avg = print_timing("Filter grads:", timings["filter_grads"])
+    scale_avg = print_timing("Scale grads:", timings["scale_grads"])
+    accum_avg = print_timing("Accumulate grads:", timings["accumulate_grads"])
+    micro_total = fwd_bwd_avg + filter_avg + scale_avg + accum_avg
+    print(f"    {'Subtotal per micro:':<28} {micro_total:>8.2f} ms")
+    print(f"    {'x{} accumulated:':<28} {micro_total * accum_steps:>8.2f} ms".format(accum_steps))
+
+    print()
+    print("  Per-step (once per optimizer step):")
+    reset_avg = print_timing("Reset memory:", timings["reset_memory"])
+    mask_avg = print_timing("Create masked grads:", timings["create_masked_grads"])
+    opt_avg = print_timing("Optimizer update:", timings["optimizer_update"])
+    eval_avg = print_timing("Eval params:", timings["eval_params"])
+    stats_avg = print_timing("Get layer stats:", timings["get_layer_stats"])
+    misc_avg = print_timing("Misc/unaccounted:", timings["misc_overhead"])
+
+    print()
+    print("-" * 60)
+    print("BREAKDOWN SUMMARY")
+    print("-" * 60)
+
+    accounted_total = (
+        reset_avg
+        + micro_total * accum_steps
+        + mask_avg
+        + opt_avg
+        + eval_avg
+        + stats_avg
+    )
+
+    print(f"  Forward+backward ({accum_steps}x):   {fwd_bwd_avg * accum_steps:>8.2f} ms ({fwd_bwd_avg * accum_steps / total_avg * 100:>5.1f}%)")
+    print(f"  Grad processing ({accum_steps}x):    {(filter_avg + scale_avg + accum_avg) * accum_steps:>8.2f} ms ({(filter_avg + scale_avg + accum_avg) * accum_steps / total_avg * 100:>5.1f}%)")
+    print(f"  Optimizer + eval:          {opt_avg + eval_avg:>8.2f} ms ({(opt_avg + eval_avg) / total_avg * 100:>5.1f}%)")
+    print(f"  Other overhead:            {reset_avg + mask_avg + stats_avg + misc_avg:>8.2f} ms ({(reset_avg + mask_avg + stats_avg + misc_avg) / total_avg * 100:>5.1f}%)")
+    print(f"  ---")
+    print(f"  Accounted:                 {accounted_total:>8.2f} ms")
+    print(f"  Unaccounted:               {misc_avg:>8.2f} ms ({misc_avg / total_avg * 100:>5.1f}%)")
+    print(f"  Total:                     {total_avg:>8.2f} ms")
+    print(f"  Steps/sec:                 {1000 / total_avg:>8.2f}")
+
+    # Return results
+    results = {}
+    for name, values in timings.items():
+        results[name] = TimingResult(
+            name=name,
+            mean_ms=statistics.mean(values),
+            std_ms=statistics.stdev(values) if len(values) > 1 else 0,
+            min_ms=min(values),
+            max_ms=max(values),
+            samples=len(values),
+        )
+    return results
+
+
+def profile_titans_vs_base(config: MLXTitansConfig):
+    """Profile TITANS overhead vs base model cost to show actual bottleneck."""
+    print("\n" + "=" * 60)
+    print("TITANS vs BASE MODEL COST ANALYSIS")
+    print("=" * 60)
+
+    try:
+        from mlx_lm import load as mlx_load
+    except ImportError:
+        print("mlx-lm not installed, skipping")
+        return {}
+
+    print(f"Loading {config.model_name}...")
+    model, _ = mlx_load(config.model_name)
+
+    dim = model.model.layers[0].self_attn.q_proj.weight.shape[0]
+    num_layers = len(model.model.layers)
+
+    # Create dummy data
+    input_ids = mx.random.randint(0, 32000, (1, config.segment_len))
+    target_ids = mx.random.randint(0, 32000, (1, config.segment_len))
+    mx.eval(input_ids, target_ids)
+
+    results = {}
+
+    # Profile BASE MODEL ONLY (no TITANS)
+    print("\n1. Base model forward pass (no TITANS)...")
+
+    def base_forward():
+        return model(input_ids)
+
+    # Warmup
+    for _ in range(3):
+        out = base_forward()
+        mx.eval(out)
+
+    times = []
+    for _ in range(10):
+        t0 = time.perf_counter()
+        out = base_forward()
+        mx.eval(out)
+        times.append((time.perf_counter() - t0) * 1000)
+
+    import statistics
+    base_fwd_mean = statistics.mean(times)
+    results["base_forward"] = TimingResult("base_forward", base_fwd_mean, statistics.stdev(times), min(times), max(times), 10)
+    print(f"   Base forward: {base_fwd_mean:.2f} ms")
+
+    # Profile BASE MODEL + LOSS (backward)
+    print("\n2. Base model forward + backward (loss gradient)...")
+
+    def base_loss_fn(model, inp, tgt):
+        logits = model(inp)
+        if hasattr(logits, 'logits'):
+            logits = logits.logits
+        B, T, V = logits.shape
+        return nn.losses.cross_entropy(logits.reshape(B * T, V), tgt.reshape(-1), reduction='mean')
+
+    loss_and_grad = nn.value_and_grad(model, base_loss_fn)
+
+    # Warmup
+    for _ in range(3):
+        loss, grads = loss_and_grad(model, input_ids, target_ids)
+        mx.eval(loss)
+        _eval_grad_tree(grads)
+
+    times = []
+    for _ in range(10):
+        t0 = time.perf_counter()
+        loss, grads = loss_and_grad(model, input_ids, target_ids)
+        mx.eval(loss)
+        _eval_grad_tree(grads)
+        times.append((time.perf_counter() - t0) * 1000)
+
+    base_fwd_bwd_mean = statistics.mean(times)
+    results["base_forward_backward"] = TimingResult("base_forward_backward", base_fwd_bwd_mean, statistics.stdev(times), min(times), max(times), 10)
+    print(f"   Base forward+backward: {base_fwd_bwd_mean:.2f} ms")
+
+    # Profile TITANS layer ONLY (isolated)
+    print("\n3. TITANS layer forward (isolated)...")
+
+    titans_layer = MLXTitansLayer(
+        dim=dim,
+        use_cms=config.use_cms,
+        num_cms_levels=config.num_cms_levels,
+        memory_depth=config.memory_depth,
+        memory_expansion=config.memory_expansion,
+        adaptive_memory=config.adaptive_memory,
+    )
+
+    hidden = mx.random.normal((1, config.segment_len, dim))
+    state = titans_layer.init_state(1)
+    mx.eval(hidden, state)
+
+    # Warmup
+    for _ in range(5):
+        out, _new_state = titans_layer(hidden, state)
+        mx.eval(out)
+
+    times = []
+    for _ in range(20):
+        t0 = time.perf_counter()
+        out, _new_state = titans_layer(hidden, state)
+        mx.eval(out)
+        times.append((time.perf_counter() - t0) * 1000)
+
+    titans_fwd_mean = statistics.mean(times)
+    results["titans_forward"] = TimingResult("titans_forward", titans_fwd_mean, statistics.stdev(times), min(times), max(times), 20)
+    print(f"   TITANS forward: {titans_fwd_mean:.2f} ms")
+
+    # Profile TITANS layer with gradient
+    print("\n4. TITANS layer forward + backward (isolated)...")
+
+    def titans_loss_fn(layer, x, state):
+        out, _ = layer(x, state)
+        return mx.mean(out)
+
+    titans_loss_and_grad = nn.value_and_grad(titans_layer, titans_loss_fn)
+
+    # Warmup
+    for _ in range(5):
+        loss, grads = titans_loss_and_grad(titans_layer, hidden, state)
+        mx.eval(loss)
+        _eval_grad_tree(grads)
+
+    times = []
+    for _ in range(20):
+        t0 = time.perf_counter()
+        loss, grads = titans_loss_and_grad(titans_layer, hidden, state)
+        mx.eval(loss)
+        _eval_grad_tree(grads)
+        times.append((time.perf_counter() - t0) * 1000)
+
+    titans_fwd_bwd_mean = statistics.mean(times)
+    results["titans_forward_backward"] = TimingResult("titans_forward_backward", titans_fwd_bwd_mean, statistics.stdev(times), min(times), max(times), 20)
+    print(f"   TITANS forward+backward: {titans_fwd_bwd_mean:.2f} ms")
+
+    # Summary
+    print("\n" + "-" * 60)
+    print("COST BREAKDOWN SUMMARY")
+    print("-" * 60)
+    print(f"Base model forward:          {base_fwd_mean:>8.2f} ms")
+    print(f"Base model forward+backward: {base_fwd_bwd_mean:>8.2f} ms")
+    print(f"TITANS layer forward:        {titans_fwd_mean:>8.2f} ms")
+    print(f"TITANS layer fwd+bwd:        {titans_fwd_bwd_mean:>8.2f} ms")
+    print()
+    print(f"TITANS overhead per step:    {titans_fwd_bwd_mean:>8.2f} ms ({titans_fwd_bwd_mean / base_fwd_bwd_mean * 100:.1f}% of base)")
+    print(f"Expected step time (4x acc): {(base_fwd_bwd_mean + titans_fwd_bwd_mean) * 4:>8.2f} ms")
+    print(f"Expected steps/sec:          {1000 / ((base_fwd_bwd_mean + titans_fwd_bwd_mean) * 4):>8.2f}")
+
+    return results
+
+
 def identify_bottlenecks(all_results: dict[str, dict[str, Any]]):
     """Analyze results and identify bottlenecks."""
     print("\n" + "=" * 60)
@@ -641,6 +1070,32 @@ def identify_bottlenecks(all_results: dict[str, dict[str, Any]]):
             print(f"  - Gradient accumulation overhead is high ({overhead:.1f}ms)")
             print("    Consider fusing accumulation operations")
 
+    # Check full training loop
+    if "full_loop" in all_results:
+        loop = all_results["full_loop"]
+        total = loop.get("total_step", TimingResult("", 0, 0, 0, 0, 0)).mean_ms
+        fwd_bwd = loop.get("forward_backward", TimingResult("", 0, 0, 0, 0, 0)).mean_ms
+        eval_time = loop.get("eval_params", TimingResult("", 0, 0, 0, 0, 0)).mean_ms
+        misc = loop.get("misc_overhead", TimingResult("", 0, 0, 0, 0, 0)).mean_ms
+
+        if total > 0:
+            steps_per_sec = 1000 / total
+            print(f"\n  Full Loop Analysis:")
+            print(f"  - Total step time: {total:.1f}ms ({steps_per_sec:.2f} step/s)")
+
+            # Identify biggest contributor
+            if fwd_bwd * 4 / total > 0.7:  # Assuming 4x accumulation
+                print(f"  - Forward+backward dominates ({fwd_bwd:.1f}ms per micro-step)")
+                print("    This is the base model cost - consider smaller model or sequence length")
+
+            if eval_time / total > 0.2:
+                print(f"  - mx.eval overhead is high ({eval_time:.1f}ms, {eval_time/total*100:.1f}%)")
+                print("    Consider batching evaluations or using async_eval")
+
+            if misc / total > 0.1:
+                print(f"  - Unaccounted overhead is high ({misc:.1f}ms, {misc/total*100:.1f}%)")
+                print("    May indicate Python GC, memory allocation, or hidden syncs")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Profile MLX TITANS training")
@@ -651,6 +1106,12 @@ def main():
     parser.add_argument("--memory-only", action="store_true", help="Only profile memory ops")
     parser.add_argument("--training-only", action="store_true", help="Only profile training step")
     parser.add_argument("--breakdown", action="store_true", help="Detailed update breakdown")
+    parser.add_argument("--full-loop", action="store_true", help="Profile complete training loop (find all bottlenecks)")
+    parser.add_argument("--num-steps", type=int, default=5, help="Number of steps for full-loop profiling")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=4, help="Gradient accumulation steps")
+    parser.add_argument("--eager-eval", action="store_true", help="Evaluate gradients immediately (test eager vs lazy)")
+    parser.add_argument("--compare-modes", action="store_true", help="Compare lazy vs eager evaluation modes")
+    parser.add_argument("--titans-vs-base", action="store_true", help="Compare TITANS overhead vs base model cost")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -671,11 +1132,44 @@ def main():
         memory_layers=memory_layers,
         use_cms=True,
         num_cms_levels=3,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
 
     all_results = {}
 
-    if args.breakdown:
+    if args.titans_vs_base:
+        # Show TITANS overhead vs base model cost
+        all_results["titans_vs_base"] = profile_titans_vs_base(config)
+    elif args.compare_modes:
+        # Compare lazy vs eager evaluation
+        print("\n>>> LAZY EVALUATION MODE <<<")
+        all_results["full_loop_lazy"] = profile_full_training_loop(config, num_steps=args.num_steps, eager_eval=False)
+
+        print("\n>>> EAGER EVALUATION MODE <<<")
+        all_results["full_loop_eager"] = profile_full_training_loop(config, num_steps=args.num_steps, eager_eval=True)
+
+        # Print comparison
+        print("\n" + "=" * 60)
+        print("LAZY VS EAGER COMPARISON")
+        print("=" * 60)
+        lazy_total = all_results["full_loop_lazy"]["total_step"].mean_ms
+        eager_total = all_results["full_loop_eager"]["total_step"].mean_ms
+        lazy_eval = all_results["full_loop_lazy"]["eval_params"].mean_ms
+        eager_eval_time = all_results["full_loop_eager"]["eval_params"].mean_ms
+        lazy_fwd = all_results["full_loop_lazy"]["forward_backward"].mean_ms
+        eager_fwd = all_results["full_loop_eager"]["forward_backward"].mean_ms
+
+        print(f"{'Metric':<30} {'Lazy':>12} {'Eager':>12} {'Diff':>12}")
+        print("-" * 66)
+        print(f"{'Total step time (ms)':<30} {lazy_total:>12.1f} {eager_total:>12.1f} {eager_total - lazy_total:>+12.1f}")
+        print(f"{'Forward+backward (ms)':<30} {lazy_fwd:>12.1f} {eager_fwd:>12.1f} {eager_fwd - lazy_fwd:>+12.1f}")
+        print(f"{'Eval params (ms)':<30} {lazy_eval:>12.1f} {eager_eval_time:>12.1f} {eager_eval_time - lazy_eval:>+12.1f}")
+        print(f"{'Steps/sec':<30} {1000/lazy_total:>12.2f} {1000/eager_total:>12.2f} {1000/eager_total - 1000/lazy_total:>+12.2f}")
+
+    elif args.full_loop:
+        # Profile COMPLETE training loop to find all bottlenecks
+        all_results["full_loop"] = profile_full_training_loop(config, num_steps=args.num_steps, eager_eval=args.eager_eval)
+    elif args.breakdown:
         all_results["update_breakdown"] = profile_update_breakdown()
     elif args.memory_only:
         all_results["memory_ops"] = profile_memory_operations()

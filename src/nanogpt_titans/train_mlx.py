@@ -577,12 +577,12 @@ def train(config: MLXTitansConfig):
             else:
                 gates_str = f", gate={gate_mean:.3f}"
 
-            # Timing info
+            # Timing info - note: fwd_bwd/opt show graph build time, eval shows actual compute
+            # With lazy evaluation, most computation happens during eval
             avg_step_time = sum(step_times[-10:]) / len(step_times[-10:]) if step_times else 0
             steps_per_sec = 1.0 / avg_step_time if avg_step_time > 0 else 0
-            timing_str = (
-                f" [{t_fwd_bwd * 1000:.0f}+{t_opt * 1000:.0f}+{t_eval * 1000:.0f}ms, {steps_per_sec:.1f} step/s]"
-            )
+            # Show actual step time (more accurate than sum of components due to lazy eval)
+            timing_str = f" [{avg_step_time * 1000:.0f}ms, {steps_per_sec:.1f} step/s]"
 
             print(
                 f"step {step}: loss={avg_loss:.4f}, mem_scale={mem_scale:.3f}{gates_str}{cms_str}{il_str}, lr={lr:.2e}{timing_str}"
