@@ -59,6 +59,9 @@ class TrainConfig:
     memory_momentum: float = 0.9
     memory_decay: float = 0.001
     adaptive_memory: bool = True
+    use_mhc: bool = False  # Use mHC residual connections
+    mhc_n: int = 4  # mHC expansion rate
+    mhc_dynamic: bool = True  # DHC (True) vs SHC (False)
     dropout: float = 0.0
     bias: bool = False
 
@@ -70,6 +73,8 @@ class TrainConfig:
     beta2: float = 0.95
     grad_clip: float = 1.0
     use_8bit_optimizer: bool = False  # Use 8-bit AdamW (requires bitsandbytes)
+    use_muon: bool = False  # Use Muon optimizer for hidden layers
+    muon_lr: float = 0.02  # Muon learning rate (higher than AdamW)
 
     # learning rate schedule
     decay_lr: bool = True
@@ -280,6 +285,9 @@ def train(config: TrainConfig) -> None:
             memory_momentum=config.memory_momentum,
             memory_decay=config.memory_decay,
             adaptive_memory=config.adaptive_memory,
+            use_mhc=config.use_mhc,
+            mhc_n=config.mhc_n,
+            mhc_dynamic=config.mhc_dynamic,
         )
         print("Initializing model from scratch")
         model = TitansGPT(model_config)
@@ -335,15 +343,24 @@ def train(config: TrainConfig) -> None:
 
     # Optimizer
     scaler = torch.amp.GradScaler(enabled=(config.dtype == "float16"))
-    optimizer = model.configure_optimizers(
-        weight_decay=config.weight_decay,
-        learning_rate=config.learning_rate,
-        betas=(config.beta1, config.beta2),
-        device_type=device_type,
-        use_8bit=config.use_8bit_optimizer,
-    )
+    if config.use_muon:
+        optimizers = model.configure_muon_optimizers(
+            muon_lr=config.muon_lr,
+            adam_lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+            betas=(config.beta1, config.beta2),
+            device_type=device_type,
+        )
+    else:
+        optimizers = [model.configure_optimizers(
+            weight_decay=config.weight_decay,
+            learning_rate=config.learning_rate,
+            betas=(config.beta1, config.beta2),
+            device_type=device_type,
+            use_8bit=config.use_8bit_optimizer,
+        )]
 
-    if config.init_from == "resume" and "optimizer" in checkpoint and not upgraded_model:
+    if config.init_from == "resume" and "optimizer" in checkpoint and not upgraded_model and not config.use_muon:
         # Check for optimizer type mismatch (e.g., resuming with 8-bit when saved with 32-bit)
         saved_8bit = checkpoint.get("use_8bit_optimizer", False)
         if saved_8bit != config.use_8bit_optimizer:
@@ -354,7 +371,7 @@ def train(config: TrainConfig) -> None:
             print("  Optimizer will start fresh")
         else:
             try:
-                optimizer.load_state_dict(checkpoint["optimizer"])
+                optimizers[0].load_state_dict(checkpoint["optimizer"])
             except (KeyError, ValueError) as e:
                 print(f"  Warning: Could not load optimizer state: {e}")
                 print("  Optimizer will start fresh")
@@ -403,8 +420,13 @@ def train(config: TrainConfig) -> None:
     while iter_num < config.max_iters:
         # Learning rate schedule
         lr = get_lr(iter_num, config) if config.decay_lr else config.learning_rate
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
+        for opt in optimizers:
+            for param_group in opt.param_groups:
+                # Scale LR proportionally for Muon (it uses higher base LR)
+                if config.use_muon and hasattr(opt, 'defaults') and opt.defaults.get('nesterov'):
+                    param_group["lr"] = lr * (config.muon_lr / config.learning_rate)
+                else:
+                    param_group["lr"] = lr
 
         # Evaluation
         if iter_num % config.eval_interval == 0:
@@ -427,12 +449,13 @@ def train(config: TrainConfig) -> None:
                 if iter_num > 0:
                     checkpoint = {
                         "model": model.state_dict(),  # type: ignore[union-attr]
-                        "optimizer": optimizer.state_dict(),
+                        "optimizer": optimizers[0].state_dict() if not config.use_muon else None,
                         "model_config": model_config,
                         "iter_num": iter_num,
                         "best_val_loss": best_val_loss,
                         "config": config,
                         "use_8bit_optimizer": config.use_8bit_optimizer,
+                        "use_muon": config.use_muon,
                     }
                     print(f"Saving checkpoint to {config.out_dir}")
                     torch.save(checkpoint, Path(config.out_dir) / "ckpt.pt")
@@ -473,15 +496,17 @@ def train(config: TrainConfig) -> None:
             # Reset memory in-place for new batch (avoids reallocation)
             model.reset_memory_states(memory_states)  # type: ignore[union-attr]
 
-        # Gradient clipping
+        # Gradient clipping and optimizer step
         if config.grad_clip != 0.0:
-            scaler.unscale_(optimizer)
+            for opt in optimizers:
+                scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)  # type: ignore[union-attr]
 
-        # Optimizer step
-        scaler.step(optimizer)
+        for opt in optimizers:
+            scaler.step(opt)
         scaler.update()
-        optimizer.zero_grad(set_to_none=True)
+        for opt in optimizers:
+            opt.zero_grad(set_to_none=True)
 
         # Timing and logging
         t1 = time.time()
@@ -552,6 +577,9 @@ def main() -> None:
         dest="adaptive_memory",
         help="Disable adaptive memory, use fixed lr/momentum/decay",
     )
+    parser.add_argument("--use_mhc", action="store_true", help="Use mHC residual connections")
+    parser.add_argument("--mhc_n", type=int, default=4, help="mHC expansion rate (default: 4)")
+    parser.add_argument("--mhc_dynamic", action="store_true", default=True, help="Use dynamic mHC (DHC)")
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--bias", action="store_true")
     parser.add_argument("--learning_rate", type=float, default=6e-4)
@@ -561,6 +589,8 @@ def main() -> None:
     parser.add_argument("--beta2", type=float, default=0.95)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--use_8bit_optimizer", action="store_true", help="Use 8-bit AdamW (requires bitsandbytes)")
+    parser.add_argument("--use_muon", action="store_true", help="Use Muon optimizer for hidden layers (~2x faster)")
+    parser.add_argument("--muon_lr", type=float, default=0.02, help="Muon learning rate (default: 0.02)")
     parser.add_argument("--decay_lr", action="store_true", default=True)
     parser.add_argument("--no_decay_lr", action="store_false", dest="decay_lr")
     parser.add_argument("--warmup_iters", type=int, default=100)

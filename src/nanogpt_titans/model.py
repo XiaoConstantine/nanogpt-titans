@@ -185,6 +185,11 @@ class TitansConfig:
     surprise_threshold: float = 0.0  # Skip updates when grad_norm < threshold (0=disabled)
     memory_grad_clip: float = 1.0  # Per-level gradient clipping (0=disabled)
 
+    # mHC: Manifold-Constrained Hyper-Connections (https://arxiv.org/abs/2512.24880)
+    use_mhc: bool = False  # Use mHC for residual connections
+    mhc_n: int = 4  # Expansion rate (paper recommends 4)
+    mhc_dynamic: bool = True  # DHC (True) vs SHC (False)
+
 
 class LayerNorm(nn.Module):
     """LayerNorm with optional bias (PyTorch doesn't support bias=False directly)."""
@@ -1042,6 +1047,13 @@ class TitansBlock(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.mlp = MLP(config)
 
+        # mHC residual connections (optional)
+        self.use_mhc = config.use_mhc
+        if self.use_mhc:
+            from nanogpt_titans.mhc import HyperConnection
+            self.mhc_attn = HyperConnection(config.n_embd, n=config.mhc_n, dynamic=config.mhc_dynamic)
+            self.mhc_mlp = HyperConnection(config.n_embd, n=config.mhc_n, dynamic=config.mhc_dynamic)
+
     def init_state(self, batch_size: int, device: torch.device) -> MemoryState | None:
         """Initialize memory state for this block."""
         if not self.has_memory:
@@ -1073,8 +1085,10 @@ class TitansBlock(nn.Module):
         """
         # If no memory, just do standard transformer block
         if not self.has_memory:
-            x = x + self.attn(self.ln_1(x), packed_mask=packed_mask)
-            x = x + self.mlp(self.ln_2(x))
+            attn_out = self.attn(self.ln_1(x), packed_mask=packed_mask)
+            x = self.mhc_attn(x, attn_out) if self.use_mhc else x + attn_out
+            mlp_out = self.mlp(self.ln_2(x))
+            x = self.mhc_mlp(x, mlp_out) if self.use_mhc else x + mlp_out
             return x, None
 
         b, _t, _c = x.shape
@@ -1109,10 +1123,12 @@ class TitansBlock(nn.Module):
             attn_out = self.attn(self.ln_1(context), prefix_len=prefix_len)
 
         # 5. Extract only the current segment positions (residual connection)
-        x = x + attn_out[:, prefix_len:]
+        attn_segment = attn_out[:, prefix_len:]
+        x = self.mhc_attn(x, attn_segment) if self.use_mhc else x + attn_segment
 
         # 6. MLP with residual
-        x = x + self.mlp(self.ln_2(x))
+        mlp_out = self.mlp(self.ln_2(x))
+        x = self.mhc_mlp(x, mlp_out) if self.use_mhc else x + mlp_out
 
         # 7. Update memory based on this segment (stores x for next segment's retrieval)
         new_state = self.memory.update(x, memory_state) if self.update_memory else memory_state
@@ -1173,9 +1189,8 @@ class TitansGPT(nn.Module):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
 
         mem_layers_str = ",".join(str(i) for i in sorted(memory_layers))
-        print(
-            f"TitansGPT initialized with {self.get_num_params() / 1e6:.2f}M parameters (memory on layer {mem_layers_str})"
-        )
+        n_params = self.get_num_params() / 1e6
+        print(f"TitansGPT initialized with {n_params:.2f}M parameters (memory on layer {mem_layers_str})")
 
     def _init_weights(self, module: nn.Module) -> None:
         match module:
@@ -1417,6 +1432,52 @@ class TitansGPT(nn.Module):
         # Standard fused AdamW for CUDA
         use_fused = device_type == "cuda"
         return torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=use_fused)
+
+    def configure_muon_optimizers(
+        self,
+        muon_lr: float = 0.02,
+        adam_lr: float = 6e-4,
+        weight_decay: float = 0.1,
+        betas: tuple[float, float] = (0.9, 0.95),
+        muon_momentum: float = 0.95,
+        device_type: str = "cuda",
+    ) -> list[torch.optim.Optimizer]:
+        """Configure hybrid Muon + AdamW optimizers. Muon for hidden layers, AdamW for rest."""
+        from nanogpt_titans.muon import Muon
+
+        muon_patterns = {"c_attn.weight", "c_proj.weight", "c_fc.weight", "query_proj.weight",
+                         "key_proj.weight", "value_proj.weight", "out_proj.weight"}
+        nodecay_patterns = {"bias", "ln_", "wte", "wpe", "memory_mlp", "persist_mem",
+                            "init_query", "to_lr", "to_momentum", "to_decay"}
+
+        muon_params, adam_decay, adam_nodecay = [], [], []
+        for name, p in self.named_parameters():
+            if not p.requires_grad or name == "lm_head.weight":
+                continue
+            is_muon = p.dim() == 2 and any(pat in name for pat in muon_patterns)
+            is_nodecay = any(pat in name.lower() for pat in nodecay_patterns)
+
+            if is_muon:
+                muon_params.append(p)
+            elif is_nodecay:
+                adam_nodecay.append(p)
+            else:
+                adam_decay.append(p)
+
+        optimizers = []
+        if muon_params:
+            optimizers.append(Muon(muon_params, lr=muon_lr, momentum=muon_momentum, weight_decay=weight_decay))
+            print(f"Muon: {len(muon_params)} params, lr={muon_lr}")
+        adam_groups = []
+        if adam_decay:
+            adam_groups.append({"params": adam_decay, "weight_decay": weight_decay})
+        if adam_nodecay:
+            adam_groups.append({"params": adam_nodecay, "weight_decay": 0.0})
+        if adam_groups:
+            use_fused = device_type == "cuda"
+            optimizers.append(torch.optim.AdamW(adam_groups, lr=adam_lr, betas=betas, fused=use_fused))
+            print(f"AdamW: {len(adam_decay)} decay + {len(adam_nodecay)} no_decay params, lr={adam_lr}")
+        return optimizers
 
     @torch.no_grad()
     def generate(
