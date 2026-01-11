@@ -15,24 +15,30 @@ Usage:
 from __future__ import annotations
 
 import json
+import logging
 import math
 import time
 from pathlib import Path
-from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten
 
+# Configure logger for debug output
+logger = logging.getLogger(__name__)
+
 # Import from MLX module
 from nanogpt_titans.mlx import (
     CombinedModel,
     MLXTitansConfig,
     MLXTitansLayer,
+    accumulate_grads,
     create_loss_fn,
+    create_masked_grads,
     filter_titans_grads,
     get_lr,
+    scale_grads_recursive,
 )
 
 # For loading HuggingFace models
@@ -49,6 +55,152 @@ def load_model_and_tokenizer(model_name: str):
     return model, tokenizer
 
 
+def load_training_data(
+    tokenizer,
+    config: MLXTitansConfig,
+) -> mx.array:
+    """
+    Load and tokenize training data from various datasets.
+
+    Supports:
+    - wikitext: Small dataset for testing (default)
+    - fineweb-edu: Large educational dataset (recommended for TITANS)
+    - slimpajama: Medium-sized diverse dataset
+
+    Args:
+        tokenizer: Tokenizer for encoding text
+        config: Training config with dataset settings
+
+    Returns:
+        mx.array of all tokens concatenated
+    """
+    from datasets import load_dataset
+
+    dataset_name = config.dataset.lower()
+    min_tokens = config.min_doc_length
+    max_tokens = config.max_doc_length
+    num_examples = config.num_examples
+
+    print(f"\nLoading dataset: {dataset_name}")
+    print(f"  Min document length: {min_tokens} tokens")
+    print(f"  Max document length: {max_tokens} tokens")
+
+    all_tokens = []
+    docs_processed = 0
+    docs_filtered = 0
+
+    if dataset_name == "wikitext":
+        # Small dataset for testing
+        dataset = load_dataset("wikitext", "wikitext-2-raw-v1")
+        texts = [ex["text"] for ex in dataset["train"] if ex["text"].strip()]
+
+        for text in texts:
+            tokens = tokenizer.encode(text)
+            if len(tokens) >= min_tokens:
+                all_tokens.extend(tokens[:max_tokens])
+                docs_processed += 1
+            else:
+                docs_filtered += 1
+
+            if num_examples > 0 and docs_processed >= num_examples:
+                break
+
+    elif dataset_name == "fineweb-edu":
+        # Large educational dataset - stream to avoid memory issues
+        print("  Streaming FineWeb-Edu (this may take a moment to start)...")
+
+        dataset = load_dataset(
+            "HuggingFaceFW/fineweb-edu",
+            split="train",
+            streaming=True,
+        )
+
+        # Shuffle for randomness
+        dataset = dataset.shuffle(seed=42, buffer_size=10000)
+
+        # Target tokens based on training needs
+        # For 50K steps with segment_len=1024 and grad_accum=4: ~200M tokens
+        target_tokens = config.max_steps * config.gradient_accumulation_steps * config.segment_len * 2
+        print(f"  Target tokens: {target_tokens:,}")
+
+        for example in dataset:
+            text = example.get("text", "")
+            if not text or len(text) < 200:  # Quick pre-filter
+                continue
+
+            tokens = tokenizer.encode(text)
+
+            if len(tokens) >= min_tokens:
+                all_tokens.extend(tokens[:max_tokens])
+                docs_processed += 1
+
+                # Progress update every 100 docs
+                if docs_processed % 100 == 0:
+                    print(f"  Processed {docs_processed} docs, {len(all_tokens):,} tokens...")
+
+            else:
+                docs_filtered += 1
+
+            # Stop conditions
+            if num_examples > 0 and docs_processed >= num_examples:
+                break
+            if len(all_tokens) >= target_tokens:
+                print("  Reached target token count")
+                break
+
+    elif dataset_name == "slimpajama":
+        # Medium-sized diverse dataset
+        print("  Streaming SlimPajama...")
+
+        dataset = load_dataset(
+            "cerebras/SlimPajama-627B",
+            split="train",
+            streaming=True,
+        )
+
+        dataset = dataset.shuffle(seed=42, buffer_size=10000)
+
+        target_tokens = config.max_steps * config.gradient_accumulation_steps * config.segment_len * 2
+
+        for example in dataset:
+            text = example.get("text", "")
+            if not text:
+                continue
+
+            tokens = tokenizer.encode(text)
+
+            if len(tokens) >= min_tokens:
+                all_tokens.extend(tokens[:max_tokens])
+                docs_processed += 1
+
+                if docs_processed % 100 == 0:
+                    print(f"  Processed {docs_processed} docs, {len(all_tokens):,} tokens...")
+
+            else:
+                docs_filtered += 1
+
+            if num_examples > 0 and docs_processed >= num_examples:
+                break
+            if len(all_tokens) >= target_tokens:
+                break
+
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}. Use 'wikitext', 'fineweb-edu', or 'slimpajama'")
+
+    print("\nDataset loaded:")
+    print(f"  Documents processed: {docs_processed:,}")
+    print(f"  Documents filtered (too short): {docs_filtered:,}")
+    print(f"  Total tokens: {len(all_tokens):,}")
+
+    if min_tokens >= 2048:
+        print(f"  (Using min_doc_length={min_tokens} for memory training - good!)")
+    elif min_tokens < 1024:
+        print(f"  WARNING: min_doc_length={min_tokens} is low for memory training.")
+        print("  Consider --min_doc_length 2048 for better memory utilization.")
+
+    return mx.array(all_tokens)
+
+
 def get_model_dim(model) -> int:
     """Get hidden dimension from model."""
     if hasattr(model, "model") and hasattr(model.model, "layers"):
@@ -59,23 +211,6 @@ def get_model_dim(model) -> int:
             return sample_layer.self_attn.hidden_size
         return sample_layer.self_attn.q_proj.weight.shape[0]
     return 896  # Default for Qwen2-0.5B
-
-
-def create_titans_layer(model, config: MLXTitansConfig) -> MLXTitansLayer:
-    """Create a single TITANS layer matching model dimensions."""
-    dim = get_model_dim(model)
-
-    return MLXTitansLayer(
-        dim=dim,
-        use_cms=config.use_cms,
-        num_cms_levels=config.num_cms_levels,
-        cms_update_frequencies=config.cms_update_frequencies,
-        memory_depth=config.memory_depth,
-        memory_expansion=config.memory_expansion,
-        adaptive_memory=config.adaptive_memory,
-        memory_lr_max=config.memory_lr_max,
-        gate_init_bias=config.gate_init_bias,
-    )
 
 
 def create_titans_layers(model, config: MLXTitansConfig) -> dict[int, MLXTitansLayer]:
@@ -103,60 +238,6 @@ def create_titans_layers(model, config: MLXTitansConfig) -> dict[int, MLXTitansL
         )
 
     return titans_layers
-
-
-def scale_grads_recursive(grad_tree: Any, factor: float) -> Any:
-    """Recursively scale gradients by a constant factor (for averaging)."""
-    if isinstance(grad_tree, dict):
-        return {k: scale_grads_recursive(v, factor) for k, v in grad_tree.items()}
-    if isinstance(grad_tree, mx.array):
-        return grad_tree * factor
-    return grad_tree
-
-
-def accumulate_grads(accum_grads: dict | None, new_grads: dict) -> dict:
-    """Add new gradients to accumulated gradients."""
-    if accum_grads is None:
-        return new_grads
-
-    def add_grads(a, b):
-        if isinstance(a, dict):
-            return {k: add_grads(a[k], b[k]) for k in a}
-        if isinstance(a, mx.array):
-            return a + b
-        return a
-
-    return add_grads(accum_grads, new_grads)
-
-
-def create_masked_grads(
-    grads: dict[str, Any], keep_gate_scale: bool, path: str = "", freeze_gate: bool = False
-) -> dict[str, Any]:
-    """Create grads with zeros for non-target params."""
-    if isinstance(grads, dict):
-        return {
-            k: create_masked_grads(v, keep_gate_scale, f"{path}.{k}" if path else k, freeze_gate)
-            for k, v in grads.items()
-        }
-    if isinstance(grads, mx.array):
-        is_gate = "gate" in path
-        is_scale_adaptive = (
-            "mem_scale" in path
-            or "mem_ln" in path
-            or "level_weights" in path
-            or "to_lr" in path
-            or "to_momentum" in path
-            or "to_decay" in path
-        )
-        is_gate_scale = is_gate or is_scale_adaptive
-
-        if freeze_gate and is_gate:
-            return mx.zeros_like(grads)
-
-        if keep_gate_scale:
-            return grads if is_gate_scale else mx.zeros_like(grads)
-        return mx.zeros_like(grads) if is_gate_scale else grads
-    return grads
 
 
 def get_layers_to_unfreeze(memory_layers: list, num_backbone_layers: int, radius: int) -> set:
@@ -274,29 +355,16 @@ def train(config: MLXTitansConfig):
     if unfrozen_backbone_indices:
         print(f"  Backbone params: {backbone_lr:.2e} (0.1x base LR)")
 
-    # Load training data
-    print("\nLoading training data...")
+    # Load training data using configurable dataset
     try:
-        from datasets import load_dataset
-
-        dataset = load_dataset("wikitext", "wikitext-2-raw-v1")
-        texts = [ex["text"] for ex in dataset["train"] if len(ex["text"]) > 100][:500]
+        all_tokens = load_training_data(tokenizer, config)
     except Exception as e:
         print(f"Failed to load dataset: {e}")
-        texts = ["This is a test sentence for training. " * 50] * 100
-
-    print(f"Training examples: {len(texts)}")
-
-    # Tokenize
-    print("Tokenizing...")
-    all_tokens = []
-    for text in texts:
-        tokens = tokenizer.encode(text)
-        if len(tokens) >= 100:
-            all_tokens.extend(tokens[: config.max_length])
-
-    all_tokens = mx.array(all_tokens)
-    print(f"Total tokens: {len(all_tokens):,}")
+        print("Falling back to dummy data for testing...")
+        dummy_text = "This is a test sentence for training. " * 100
+        tokens = tokenizer.encode(dummy_text)
+        all_tokens = mx.array(tokens * 100)  # Repeat to get enough data
+        print(f"Total tokens (dummy): {len(all_tokens):,}")
 
     # Training loop
     print("\nStarting training...")
@@ -370,18 +438,49 @@ def train(config: MLXTitansConfig):
             loss, full_grads = loss_and_grad_fn(combined_model, input_ids, target_ids)
             titans_grads = filter_titans_grads(full_grads)
 
+            # Debug: show gradient structure at step 0
+            if step == 0 and micro_step == 0 and unfrozen_backbone_indices:
+                logger.debug("full_grads keys: %s", list(full_grads.keys()))
+                if "base_model" in full_grads:
+                    base_grads = full_grads["base_model"]
+                    logger.debug("base_model keys: %s", list(base_grads.keys()) if isinstance(base_grads, dict) else type(base_grads))
+                    if isinstance(base_grads, dict) and "model" in base_grads:
+                        model_grads = base_grads["model"]
+                        logger.debug("model keys: %s", list(model_grads.keys()) if isinstance(model_grads, dict) else type(model_grads))
+                        if "layers" in model_grads:
+                            layers_grads = model_grads["layers"]
+                            logger.debug("layers type: %s, len: %s", type(layers_grads), len(layers_grads) if hasattr(layers_grads, '__len__') else 'N/A')
+                            logger.debug("unfrozen_backbone_indices: %s", sorted(unfrozen_backbone_indices))
+                            # Check if layers is list (indexed by position) or dict
+                            if isinstance(layers_grads, list):
+                                logger.debug("layers is LIST - will index by position")
+                                found = [idx for idx in unfrozen_backbone_indices if idx < len(layers_grads) and layers_grads[idx] is not None]
+                                logger.debug("unfrozen layers with grads: %s", found)
+                            else:
+                                logger.debug("layers is DICT with keys: %s", list(layers_grads.keys())[:5])
+                else:
+                    logger.debug("'base_model' NOT in full_grads - backbone unfreezing may not work!")
+
             # Extract backbone gradients if unfreezing is enabled
             backbone_grads = None
             if unfrozen_backbone_indices and "base_model" in full_grads:
                 base_grads = full_grads.get("base_model", {})
                 model_grads = base_grads.get("model", {})
-                layers_grads = model_grads.get("layers", {})
+                layers_grads = model_grads.get("layers", [])
                 if layers_grads:
-                    backbone_grads = {
-                        str(idx): layers_grads.get(str(idx), layers_grads.get(idx))
-                        for idx in unfrozen_backbone_indices
-                        if str(idx) in layers_grads or idx in layers_grads
-                    }
+                    # Handle both list (MLX) and dict (potential future) formats
+                    if isinstance(layers_grads, list):
+                        backbone_grads = {
+                            idx: layers_grads[idx]
+                            for idx in unfrozen_backbone_indices
+                            if idx < len(layers_grads) and layers_grads[idx] is not None
+                        }
+                    else:
+                        backbone_grads = {
+                            idx: layers_grads.get(str(idx), layers_grads.get(idx))
+                            for idx in unfrozen_backbone_indices
+                            if str(idx) in layers_grads or idx in layers_grads
+                        }
 
             # OPTIMIZATION: Use async_eval to pipeline graph construction with computation
             # This returns control immediately, allowing next iteration to start building graph
@@ -460,18 +559,23 @@ def train(config: MLXTitansConfig):
             params_to_eval.extend(tree_flatten(layer.parameters()))
 
         # Update backbone layers if unfreezing is enabled
+        backbone_updated_count = 0
         if unfrozen_backbone_indices and accumulated_backbone_grads and optimizer_backbone:
             lr_backbone = lr * 0.1  # Lower LR for backbone
             optimizer_backbone.learning_rate = lr_backbone
 
             for idx in unfrozen_backbone_indices:
-                layer_key = str(idx)
-                if layer_key in accumulated_backbone_grads:
-                    layer_grads = accumulated_backbone_grads[layer_key]
-                    if layer_grads is not None:
-                        backbone_layer = model.model.layers[idx]
-                        optimizer_backbone.update(backbone_layer, layer_grads)
-                        params_to_eval.extend(tree_flatten(backbone_layer.parameters()))
+                # Try both int and string keys for compatibility
+                layer_grads = accumulated_backbone_grads.get(idx, accumulated_backbone_grads.get(str(idx)))
+                if layer_grads is not None:
+                    backbone_layer = model.model.layers[idx]
+                    optimizer_backbone.update(backbone_layer, layer_grads)
+                    params_to_eval.extend(tree_flatten(backbone_layer.parameters()))
+                    backbone_updated_count += 1
+
+            # Debug: show backbone update count at step 0
+            if step == 0:
+                logger.debug("Updated %d/%d backbone layers", backbone_updated_count, len(unfrozen_backbone_indices))
 
         _t_opt = time.perf_counter() - t_opt_start  # Keep for debugging
 
@@ -499,14 +603,14 @@ def train(config: MLXTitansConfig):
 
             # Debug gradients at key steps
             if step == 0 or step == 50 or step == 90:
-                print(f"\n  DEBUG step {step} gradients:")
+                logger.debug("step %d gradients:", step)
                 for path, g in tree_flatten(titans_grads):
                     name = ".".join(str(x) for x in path) if isinstance(path, tuple) else str(path)
                     if "mem_scale" in name or "linear2.bias" in name or "to_lr" in name:
                         grad_val = float(mx.mean(mx.abs(g)).item()) if g.size > 1 else float(g.item())
-                        print(f"    {name}: grad_mean_abs={grad_val:.6f}")
-                print(f"    LR memory={lr:.6f}, LR gate={lr_gate:.6f}")
-                print(f"    Gate warmup active: {gate_warmup_active}")
+                        logger.debug("  %s: grad_mean_abs=%.6f", name, grad_val)
+                logger.debug("  LR memory=%.6f, LR gate=%.6f", lr, lr_gate)
+                logger.debug("  Gate warmup active: %s", gate_warmup_active)
 
             # Collect stats from all layers
             layer_stats = combined_model.get_layer_stats()
@@ -721,6 +825,33 @@ def main():
         help="Per-level gradient clipping for CMS",
     )
 
+    # Dataset arguments
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="wikitext",
+        choices=["wikitext", "fineweb-edu", "slimpajama"],
+        help="Training dataset: 'wikitext' (small, for testing), 'fineweb-edu' (recommended for TITANS), 'slimpajama' (diverse)",
+    )
+    parser.add_argument(
+        "--min_doc_length",
+        type=int,
+        default=100,
+        help="Minimum document length in tokens. Use 2048+ for memory training (default: 100)",
+    )
+    parser.add_argument(
+        "--max_doc_length",
+        type=int,
+        default=8192,
+        help="Maximum document length in tokens (default: 8192)",
+    )
+    parser.add_argument(
+        "--num_examples",
+        type=int,
+        default=0,
+        help="Number of examples to use (0 = auto based on max_steps)",
+    )
+
     args = parser.parse_args()
 
     # Parse memory layers
@@ -749,6 +880,11 @@ def main():
         unfreeze_backbone_layers=args.unfreeze_backbone_layers,
         surprise_threshold=args.surprise_threshold,
         memory_grad_clip=args.memory_grad_clip,
+        # Dataset config
+        dataset=args.dataset,
+        min_doc_length=args.min_doc_length,
+        max_doc_length=args.max_doc_length,
+        num_examples=args.num_examples,
     )
 
     train(config)

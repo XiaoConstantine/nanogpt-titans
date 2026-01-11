@@ -183,7 +183,6 @@ class TitansQwenDecoderLayer(nn.Module):
 
         # Cache isinstance checks for faster forward pass
         self._use_self_mod_proj = isinstance(self.mem_proj, SelfModifyingLinear)
-        self._use_cms = titans_config.use_cms
 
         # Copy attributes that Qwen's internal code expects
         if hasattr(original_layer, "self_attn"):

@@ -86,6 +86,13 @@ class MLXTitansConfig:
     use_teach_signal: bool = False
     teach_signal_weight: float = 0.1
 
+    # Dataset configuration
+    dataset: str = "wikitext"  # "wikitext", "fineweb-edu", "slimpajama"
+    min_doc_length: int = 100  # Minimum document length in tokens (2048 recommended for memory training)
+    max_doc_length: int = 8192  # Maximum document length in tokens
+    streaming: bool = True  # Stream dataset (required for large datasets like fineweb-edu)
+    num_examples: int = 0  # Number of examples to use (0 = unlimited/streaming)
+
 
 def config_to_mlx(pytorch_config) -> MLXTitansConfig:
     """

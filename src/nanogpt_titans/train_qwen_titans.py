@@ -490,9 +490,6 @@ def train(config: QwenTitansTrainConfig) -> None:
     # Gradient scaler for mixed precision (only works on CUDA)
     scaler = torch.amp.GradScaler(enabled=(config.dtype == "float16" and device.type == "cuda"))
 
-    # Calculate number of segments per sequence for proper loss scaling
-    max(1, config.max_length // config.segment_len)
-
     # Starting step (may be overwritten by checkpoint)
     start_step = 0
 
@@ -965,9 +962,10 @@ def main() -> None:
                 from nanogpt_titans.train_mlx import train as mlx_train
 
                 # Convert config to MLX format
+                memory_layers = [int(x.strip()) for x in args.memory_layers.split(",")]
                 mlx_config = MLXTitansConfig(
                     model_name=args.model_name,
-                    memory_layer=int(args.memory_layers.split(",")[0]),
+                    memory_layers=memory_layers,
                     segment_len=args.segment_len,
                     use_cms=args.use_cms and not args.no_cms,
                     num_cms_levels=args.num_cms_levels,
@@ -979,6 +977,8 @@ def main() -> None:
                     gradient_accumulation_steps=args.gradient_accumulation_steps,
                     gate_warmup_steps=args.gate_warmup_steps,
                     output_dir=args.output_dir,
+                    use_internal_loss=args.use_internal_loss and not args.no_internal_loss,
+                    internal_loss_weight=args.internal_loss_weight,
                 )
                 mlx_train(mlx_config)
                 return
