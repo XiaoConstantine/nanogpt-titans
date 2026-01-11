@@ -9,8 +9,20 @@ from dataclasses import dataclass, field
 class MLXTitansConfig:
     """MLX TITANS config."""
 
+    # Training mode
+    train_from_scratch: bool = False  # True = train GPT from scratch, False = fine-tune Qwen
+
+    # For fine-tuning mode (train_from_scratch=False)
     model_name: str = "Qwen/Qwen2-0.5B"
     memory_layers: list[int] = field(default_factory=lambda: [12])  # Can be multiple layers
+
+    # For from-scratch mode (train_from_scratch=True)
+    model_size: str = "nano"  # "nano" (10M), "small" (45M), "medium" (124M), "large" (250M)
+    vocab_size: int = 50257   # GPT-2 tokenizer vocab size
+    n_layer: int = 6          # Override: number of layers
+    n_head: int = 6           # Override: number of attention heads
+    n_embd: int = 384         # Override: embedding dimension
+    block_size: int = 1024    # Maximum sequence length
 
     # Memory config
     segment_len: int = 512

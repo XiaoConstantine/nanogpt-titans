@@ -40,12 +40,72 @@ from nanogpt_titans.mlx import (
     get_lr,
     scale_grads_recursive,
 )
+from nanogpt_titans.mlx.visualizer import Visualizer, generate_sample
+from nanogpt_titans.mlx.inspector import Inspector
+from nanogpt_titans.mlx.model import GPT, GPTConfig, GPTWithMemory
 
-# For loading HuggingFace models
+# For loading HuggingFace models (fine-tuning mode)
 try:
     from mlx_lm import load as mlx_load
-except ImportError as e:
-    raise ImportError("mlx-lm required: uv add mlx-lm") from e
+    HAS_MLX_LM = True
+except ImportError:
+    HAS_MLX_LM = False
+    mlx_load = None
+
+# For training from scratch (tiktoken GPT-2 tokenizer)
+try:
+    import tiktoken
+    HAS_TIKTOKEN = True
+except ImportError:
+    HAS_TIKTOKEN = False
+    tiktoken = None
+
+
+def load_tokenizer_scratch():
+    """Load GPT-2 tokenizer for from-scratch training."""
+    if not HAS_TIKTOKEN:
+        raise ImportError("tiktoken required for from-scratch training: uv add tiktoken")
+    return tiktoken.get_encoding("gpt2")
+
+
+def create_model_scratch(config: MLXTitansConfig):
+    """Create GPT model from scratch (nanoGPT style)."""
+    # Get vocab size from tokenizer
+    tokenizer = load_tokenizer_scratch()
+    vocab_size = tokenizer.n_vocab
+
+    # Create config based on size preset or explicit values
+    size_presets = {
+        "nano": GPTConfig.nano,
+        "small": GPTConfig.small,
+        "medium": GPTConfig.medium,
+        "large": GPTConfig.large,
+    }
+
+    if config.model_size in size_presets:
+        gpt_config = size_presets[config.model_size](vocab_size=vocab_size)
+    else:
+        # Use explicit config values
+        gpt_config = GPTConfig(
+            vocab_size=vocab_size,
+            block_size=config.block_size,
+            n_layer=config.n_layer,
+            n_head=config.n_head,
+            n_embd=config.n_embd,
+        )
+
+    # Override block_size from training config
+    gpt_config.block_size = max(config.segment_len * 2, gpt_config.block_size)
+
+    # Create model with optional TITANS memory
+    if config.use_cms or config.memory_layers:
+        gpt_config.use_memory = True
+        gpt_config.memory_layer = config.memory_layers[0] if config.memory_layers else -1
+        model = GPTWithMemory(gpt_config)
+    else:
+        model = GPT(gpt_config)
+
+    return model, tokenizer
 
 
 def load_model_and_tokenizer(model_name: str):
@@ -257,12 +317,18 @@ def get_layers_to_unfreeze(memory_layers: list, num_backbone_layers: int, radius
 
 
 def train(config: MLXTitansConfig):
-    """Main MLX training loop with full HOPE architecture."""
+    """Main MLX training loop - supports both from-scratch and fine-tuning."""
     print("=" * 60)
-    print("MLX TITANS Training (Full HOPE Architecture)")
-    print("=" * 60)
-    print(f"Model: {config.model_name}")
-    print(f"Memory layers: {config.memory_layers}")
+    if config.train_from_scratch:
+        print("NanoGPT-style Training FROM SCRATCH")
+        print("=" * 60)
+        print(f"Model size: {config.model_size}")
+        print(f"Architecture: {config.n_layer} layers, {config.n_head} heads, {config.n_embd} dim")
+    else:
+        print("MLX TITANS Training (Fine-tuning Mode)")
+        print("=" * 60)
+        print(f"Base model: {config.model_name}")
+        print(f"Memory layers: {config.memory_layers}")
     print(f"CMS enabled: {config.use_cms}")
     if config.use_cms:
         print(f"CMS levels: {config.num_cms_levels}")
@@ -274,7 +340,7 @@ def train(config: MLXTitansConfig):
         print(f"Surprise threshold: {config.surprise_threshold}")
     if config.memory_grad_clip > 0:
         print(f"Memory grad clip: {config.memory_grad_clip}")
-    if config.unfreeze_backbone_layers > 0:
+    if not config.train_from_scratch and config.unfreeze_backbone_layers > 0:
         print(f"Backbone unfreezing: {config.unfreeze_backbone_layers} layers near TITANS")
     print()
 
@@ -282,17 +348,45 @@ def train(config: MLXTitansConfig):
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load model
-    model, tokenizer = load_model_and_tokenizer(config.model_name)
+    # Initialize visualizer for real-time training inspection
+    viz = Visualizer(
+        output_dir=str(output_dir / "viz"),
+        plot_every=10,
+    )
+    inspector = Inspector(
+        verbose=False,
+        save_history=True,
+        history_dir=str(output_dir / "inspection"),
+    )
+    print(f"Visualization enabled: {output_dir}/viz/")
 
-    # Create TITANS layers (independent memory per layer)
-    titans_layers = create_titans_layers(model, config)
-    num_titans_layers = len(titans_layers)
-    print(f"Created {num_titans_layers} TITANS layer(s) at indices: {sorted(titans_layers.keys())}")
+    # Load or create model
+    if config.train_from_scratch:
+        print("\nCreating model from scratch...")
+        model, tokenizer = create_model_scratch(config)
+        # For from-scratch, we train ALL parameters
+        titans_layers = {}  # No separate TITANS layers - memory is built into GPTWithMemory
+        unfrozen_backbone_indices = set()  # All params trained
+    else:
+        print("\nLoading pre-trained model...")
+        model, tokenizer = load_model_and_tokenizer(config.model_name)
 
-    # Count parameters
-    titans_params = sum(p.size for layer in titans_layers.values() for _, p in tree_flatten(layer.parameters()))
-    print(f"TITANS trainable params: {titans_params:,} ({titans_params // num_titans_layers:,} per layer)")
+        # Create TITANS layers (independent memory per layer)
+        titans_layers = create_titans_layers(model, config)
+        num_titans_layers = len(titans_layers)
+        print(f"Created {num_titans_layers} TITANS layer(s) at indices: {sorted(titans_layers.keys())}")
+
+        # Count parameters
+        titans_params = sum(p.size for layer in titans_layers.values() for _, p in tree_flatten(layer.parameters()))
+        print(f"TITANS trainable params: {titans_params:,} ({titans_params // num_titans_layers:,} per layer)")
+
+        # Get number of backbone layers for unfreezing logic
+        num_backbone_layers = len(model.model.layers)
+
+        # Determine which backbone layers to unfreeze (if any)
+        unfrozen_backbone_indices = get_layers_to_unfreeze(
+            config.memory_layers, num_backbone_layers, config.unfreeze_backbone_layers
+        )
 
     # Separate param groups for different LRs
     def count_param_groups_from_module(module):
@@ -322,38 +416,48 @@ def train(config: MLXTitansConfig):
         g, m = count_param_groups_from_module(layer)
         gate_scale_count += g
         memory_count += m
-    print(f"Gate/scale/CMS params: {gate_scale_count:,}")
-    print(f"Memory params: {memory_count:,}")
+    if titans_layers:
+        print(f"Gate/scale/CMS params: {gate_scale_count:,}")
+        print(f"Memory params: {memory_count:,}")
 
-    # Get number of backbone layers for unfreezing logic
-    num_backbone_layers = len(model.model.layers)
+    # For from-scratch mode, count total params
+    if config.train_from_scratch:
+        total_params = sum(p.size for _, p in tree_flatten(model.parameters()))
+        print(f"Total trainable params: {total_params:,} ({total_params/1e6:.2f}M)")
+        num_backbone_layers = 0  # Not applicable
 
-    # Determine which backbone layers to unfreeze (if any)
-    unfrozen_backbone_indices = get_layers_to_unfreeze(
-        config.memory_layers, num_backbone_layers, config.unfreeze_backbone_layers
-    )
-    if unfrozen_backbone_indices:
-        print(f"Unfreezing backbone layers: {sorted(unfrozen_backbone_indices)}")
-        unfrozen_backbone_params = sum(
-            p.size for idx in unfrozen_backbone_indices for _, p in tree_flatten(model.model.layers[idx].parameters())
+    # Setup optimizers based on mode
+    if config.train_from_scratch:
+        # From-scratch: single optimizer for all params
+        optimizer = optim.AdamW(learning_rate=config.learning_rate, weight_decay=0.01)
+        optimizer_memory = None
+        optimizer_gate = None
+        optimizer_backbone = None
+        print(f"\nOptimizer: AdamW, LR={config.learning_rate:.2e}")
+    else:
+        # Fine-tuning: separate optimizers for different param groups
+        if unfrozen_backbone_indices:
+            print(f"Unfreezing backbone layers: {sorted(unfrozen_backbone_indices)}")
+            unfrozen_backbone_params = sum(
+                p.size for idx in unfrozen_backbone_indices for _, p in tree_flatten(model.model.layers[idx].parameters())
+            )
+            print(f"Unfrozen backbone params: {unfrozen_backbone_params:,}")
+
+        gate_lr = config.learning_rate * config.gate_lr_scale
+        backbone_lr = config.learning_rate * 0.1
+
+        optimizer = None  # Not used in fine-tuning mode
+        optimizer_memory = optim.AdamW(learning_rate=config.learning_rate, weight_decay=0.0)
+        optimizer_gate = optim.AdamW(learning_rate=gate_lr, weight_decay=0.0)
+        optimizer_backbone = (
+            optim.AdamW(learning_rate=backbone_lr, weight_decay=0.01) if unfrozen_backbone_indices else None
         )
-        print(f"Unfrozen backbone params: {unfrozen_backbone_params:,}")
 
-    # Create optimizers for different param groups
-    gate_lr = config.learning_rate * config.gate_lr_scale
-    backbone_lr = config.learning_rate * 0.1  # Lower LR for backbone (fine-tuning)
-
-    optimizer_memory = optim.AdamW(learning_rate=config.learning_rate, weight_decay=0.0)
-    optimizer_gate = optim.AdamW(learning_rate=gate_lr, weight_decay=0.0)
-    optimizer_backbone = (
-        optim.AdamW(learning_rate=backbone_lr, weight_decay=0.01) if unfrozen_backbone_indices else None
-    )
-
-    print("\nOptimizer learning rates:")
-    print(f"  Memory params: {config.learning_rate:.2e}")
-    print(f"  Gate/scale params: {gate_lr:.2e} ({config.gate_lr_scale}x)")
-    if unfrozen_backbone_indices:
-        print(f"  Backbone params: {backbone_lr:.2e} (0.1x base LR)")
+        print("\nOptimizer learning rates:")
+        print(f"  Memory params: {config.learning_rate:.2e}")
+        print(f"  Gate/scale params: {gate_lr:.2e} ({config.gate_lr_scale}x)")
+        if unfrozen_backbone_indices:
+            print(f"  Backbone params: {backbone_lr:.2e} (0.1x base LR)")
 
     # Load training data using configurable dataset
     try:
@@ -685,6 +789,48 @@ def train(config: MLXTitansConfig):
                 f"step {step}: loss={avg_loss:.4f}, mem_scale={mem_scale:.3f}{gates_str}{cms_str}{il_str}, lr={lr:.2e}{timing_str}"
             )
 
+            # === VISUALIZATION: Log metrics ===
+            gate_values = {idx: 1 / (1 + math.exp(-s["gate_bias"])) for idx, s in layer_stats.items()}
+            cms_list = [cms_weights.get(f"cms_weight_{i}", 0.0) for i in range(config.num_cms_levels)] if cms_weights else None
+
+            viz.log_step(
+                step=step,
+                loss=avg_loss,
+                mem_scale=mem_scale,
+                gate_values=gate_values,
+                cms_weights=cms_list,
+                lr=lr,
+                step_time=step_time,
+                internal_loss=internal_loss_val,
+            )
+
+            # Log gradient statistics
+            if titans_grads:
+                viz.log_gradients(titans_grads, combined_model.parameters())
+
+            # Log memory states
+            for layer_idx, layer in titans_layers.items():
+                if hasattr(layer, "memory") and hasattr(layer.memory, "mlp"):
+                    if hasattr(layer.memory.mlp, "layers") and layer.memory.mlp.layers:
+                        w = layer.memory.mlp.layers[0].weight
+                        viz.log_memory_state(w, level=0)
+
+            # Update plots
+            viz.update_plots()
+
+            # Generate sample every 50 steps to see learning progress
+            if step > 0 and step % 50 == 0:
+                prompt = "The"
+                try:
+                    generated = generate_sample(model, tokenizer, prompt=prompt, max_tokens=20)
+                    viz.log_generation(step, prompt, generated, avg_loss)
+                    print(f"  Sample: '{generated[:60]}...'")
+                except Exception as e:
+                    logger.debug(f"Generation failed: {e}")
+
+            # Create inspector snapshot
+            inspector.snapshot(step, avg_loss, lr)
+
     # Save results
     log_path = output_dir / "mlx_training_log.json"
     with log_path.open("w") as f:
@@ -729,6 +875,255 @@ def train(config: MLXTitansConfig):
                     f"  Level {i} (freq={config.cms_update_frequencies[i]}): {first.get(key, 0):.3f} → {last.get(key, 0):.3f}"
                 )
 
+    # === VISUALIZATION: Final report ===
+    viz.save_final_report()
+    viz.print_sample_generations(last_n=5)
+    print(f"\nVisualization plots saved to: {output_dir}/viz/training_progress.png")
+
+
+def train_scratch(config: MLXTitansConfig):
+    """
+    NanoGPT-style training from scratch.
+
+    Simple, clean training loop for educational purposes.
+    Train ALL parameters of a small GPT model from scratch.
+    """
+    print("=" * 60)
+    print("NanoGPT-style Training FROM SCRATCH")
+    print("=" * 60)
+    print(f"Model size: {config.model_size}")
+    print(f"Max steps: {config.max_steps}")
+    print(f"Learning rate: {config.learning_rate}")
+    print()
+
+    # Create output directory
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Initialize visualizer
+    viz = Visualizer(output_dir=str(output_dir / "viz"), plot_every=10)
+    print(f"Visualization: {output_dir}/viz/")
+
+    # Create model from scratch
+    print("\nCreating model from scratch...")
+    model, tokenizer = create_model_scratch(config)
+
+    # Count params
+    total_params = sum(p.size for _, p in tree_flatten(model.parameters()))
+    print(f"Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
+
+    # Single optimizer for all params
+    optimizer = optim.AdamW(learning_rate=config.learning_rate, weight_decay=0.01)
+
+    # Load data
+    print("\nLoading training data...")
+    all_tokens = load_training_data(tokenizer, config)
+
+    # Training loop
+    print(f"\nStarting training for {config.max_steps} steps...")
+    log_history = []
+    t0 = time.time()
+
+    for step in range(config.max_steps):
+        step_start = time.perf_counter()
+
+        # Get batch
+        idx = (step * config.segment_len) % (len(all_tokens) - config.segment_len - 1)
+        batch = all_tokens[idx : idx + config.segment_len + 1]
+        inputs = batch[:-1].reshape(1, -1)
+        targets = batch[1:].reshape(1, -1)
+
+        # Forward + loss + backward
+        def loss_fn(model):
+            logits, _ = model(inputs)
+            # Cross-entropy loss
+            logits_flat = logits.reshape(-1, logits.shape[-1])
+            targets_flat = targets.reshape(-1)
+            loss = nn.losses.cross_entropy(logits_flat, targets_flat, reduction="mean")
+            return loss
+
+        loss, grads = nn.value_and_grad(model, loss_fn)(model)
+        mx.eval(loss, grads)
+
+        # === INSPECT DATA STRUCTURES (every 10 steps) ===
+        if step % 10 == 0:
+            print(f"\n{'─'*60}")
+            print(f"STEP {step} - DATA STRUCTURE INSPECTION")
+            print(f"{'─'*60}")
+
+            # 1. Input tokens
+            print(f"\n[INPUT]")
+            print(f"  Shape: {inputs.shape} (batch, seq_len)")
+            print(f"  First 10 tokens: {inputs[0, :10].tolist()}")
+            print(f"  Text: '{tokenizer.decode(inputs[0, :20].tolist())[:50]}...'")
+
+            # 2. Forward pass - inspect intermediate values
+            if True:  # MLX doesn't need no_grad context
+                # Embeddings
+                tok_emb = model.wte(inputs)
+                pos_emb = model.wpe(mx.arange(inputs.shape[1]))
+                embeddings = tok_emb + pos_emb
+                mx.eval(embeddings)
+
+                print(f"\n[EMBEDDINGS]")
+                print(f"  Token emb shape: {tok_emb.shape}")
+                print(f"  Position emb shape: {pos_emb.shape}")
+                print(f"  Combined shape: {embeddings.shape}")
+                emb_np = embeddings[0, 0, :8].tolist()
+                print(f"  First token, first 8 dims: [{', '.join(f'{v:.3f}' for v in emb_np)}]")
+
+                # Logits
+                logits, _ = model(inputs)
+                mx.eval(logits)
+                print(f"\n[LOGITS]")
+                print(f"  Shape: {logits.shape} (batch, seq_len, vocab_size)")
+                print(f"  Range: [{float(mx.min(logits)):.2f}, {float(mx.max(logits)):.2f}]")
+
+                # Predictions vs targets
+                probs = mx.softmax(logits[0, -1], axis=-1)
+                top_prob = float(mx.max(probs))
+                top_token = int(mx.argmax(probs))
+                true_token = int(targets[0, -1])
+                print(f"\n[PREDICTION @ last position]")
+                print(f"  Predicted: '{tokenizer.decode([top_token])}' (prob={top_prob:.3f})")
+                print(f"  Actual: '{tokenizer.decode([true_token])}'")
+                print(f"  Correct: {'✓' if top_token == true_token else '✗'}")
+
+            # 3. Gradient inspection
+            print(f"\n[GRADIENTS]")
+            grad_norms = []
+            for name, g in tree_flatten(grads):
+                if isinstance(g, mx.array):
+                    mx.eval(g)
+                    import numpy as np
+                    norm = float(np.linalg.norm(np.array(g)))
+                    grad_norms.append((name, norm, g.shape))
+
+            # Sort by norm, show top 5
+            grad_norms.sort(key=lambda x: x[1], reverse=True)
+            print(f"  Top 5 gradients by magnitude:")
+            for name, norm, shape in grad_norms[:5]:
+                print(f"    {name}: norm={norm:.4f}, shape={shape}")
+
+            # 4. Weight norms
+            print(f"\n[WEIGHTS]")
+            weight_norms = []
+            for name, p in tree_flatten(model.parameters()):
+                if isinstance(p, mx.array):
+                    mx.eval(p)
+                    import numpy as np
+                    norm = float(np.linalg.norm(np.array(p)))
+                    weight_norms.append((name, norm, p.shape))
+
+            # Show key weights
+            for name, norm, shape in weight_norms[:5]:
+                print(f"    {name}: norm={norm:.4f}, shape={shape}")
+
+            print(f"\n[LOSS] {loss.item():.4f}")
+
+            # === VISUALIZATIONS ===
+
+            # 5. Attention Heatmap - shows softmax(QK^T / √d)
+            print(f"\n[ATTENTION HEATMAP]")
+            try:
+                attention_maps = model.get_attention_maps(inputs)
+                # Visualize first layer's attention
+                if attention_maps:
+                    mx.eval(attention_maps[0])
+                    tokens_for_viz = [tokenizer.decode([int(t)]) for t in inputs[0, :32].tolist()]
+                    viz.plot_attention_heatmap(
+                        attention_maps[0],
+                        tokens=tokens_for_viz,
+                        layer_idx=0,
+                        max_heads=4,
+                        max_seq=32,
+                    )
+                    print(f"  Saved: attention_layer0.png")
+                    print(f"  Shows: which tokens each position 'looks at'")
+                    # Also save last layer
+                    if len(attention_maps) > 1:
+                        mx.eval(attention_maps[-1])
+                        viz.plot_attention_heatmap(
+                            attention_maps[-1],
+                            tokens=tokens_for_viz,
+                            layer_idx=len(attention_maps)-1,
+                            max_heads=4,
+                            max_seq=32,
+                        )
+                        print(f"  Saved: attention_layer{len(attention_maps)-1}.png")
+            except Exception as e:
+                print(f"  (attention viz failed: {e})")
+
+            # 6. Gradient Flow Bar Chart - shows ∂Loss/∂W
+            print(f"\n[GRADIENT FLOW BAR CHART]")
+            try:
+                grad_list = [(name, norm) for name, norm, _ in grad_norms]
+                viz.plot_gradient_flow(grad_list, step=step)
+                print(f"  Saved: gradient_flow_step{step}.png")
+                print(f"  Shows: learning signal strength per layer")
+            except Exception as e:
+                print(f"  (gradient viz failed: {e})")
+
+            print(f"{'─'*60}\n")
+
+        # Update
+        optimizer.update(model, grads)
+        mx.eval(model.parameters())
+
+        loss_val = loss.item()
+        step_time = time.perf_counter() - step_start
+
+        # Logging every 10 steps
+        if step % 10 == 0:
+            # Log to visualizer
+            viz.log_step(
+                step=step,
+                loss=loss_val,
+                mem_scale=0.0,
+                gate_values={},
+                lr=config.learning_rate,
+                step_time=step_time,
+            )
+            viz.update_plots()
+
+            log_history.append({"step": step, "loss": loss_val})
+
+            steps_per_sec = 1.0 / step_time if step_time > 0 else 0
+            print(f"step {step}: loss={loss_val:.4f} [{step_time*1000:.0f}ms, {steps_per_sec:.1f} step/s]")
+
+        # Generate sample every 100 steps
+        if step > 0 and step % 100 == 0:
+            try:
+                prompt_tokens = mx.array([[tokenizer.encode("The")[0]]])
+                generated = model.generate(prompt_tokens, max_new_tokens=20, temperature=0.8)
+                text = tokenizer.decode(generated[0].tolist())
+                viz.log_generation(step, "The", text, loss_val)
+                print(f"  Sample: '{text[:60]}...'")
+            except Exception as e:
+                logger.debug(f"Generation failed: {e}")
+
+    # Save results
+    print("\n" + "=" * 60)
+    print("Training Complete!")
+    print("=" * 60)
+
+    if log_history:
+        print(f"Loss: {log_history[0]['loss']:.4f} -> {log_history[-1]['loss']:.4f}")
+
+    # Save model
+    weights_path = output_dir / "model_weights.safetensors"
+    model_weights = {name: param for name, param in tree_flatten(model.parameters())}
+    mx.save_safetensors(str(weights_path), model_weights)
+    print(f"Saved model to {weights_path}")
+
+    # Save log
+    log_path = output_dir / "training_log.json"
+    with open(log_path, "w") as f:
+        json.dump(log_history, f, indent=2)
+
+    viz.save_final_report()
+    print(f"\nVisualization: {output_dir}/viz/training_progress.png")
+
 
 def parse_memory_layers(s: str) -> list:
     """Parse comma-separated layer indices."""
@@ -740,7 +1135,23 @@ def parse_memory_layers(s: str) -> list:
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="MLX TITANS Training (Full HOPE)")
+    parser = argparse.ArgumentParser(description="MLX TITANS Training")
+
+    # Mode selection
+    parser.add_argument(
+        "--from_scratch",
+        action="store_true",
+        help="Train GPT from scratch (nanoGPT style) instead of fine-tuning",
+    )
+    parser.add_argument(
+        "--model_size",
+        type=str,
+        default="nano",
+        choices=["nano", "small", "medium", "large"],
+        help="Model size for from-scratch training: nano (10M), small (45M), medium (124M), large (250M)",
+    )
+
+    # Fine-tuning options
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2-0.5B")
     parser.add_argument(
         "--memory_layers",
@@ -858,8 +1269,13 @@ def main():
     memory_layers = parse_memory_layers(args.memory_layers)
 
     config = MLXTitansConfig(
+        # Mode
+        train_from_scratch=args.from_scratch,
+        model_size=args.model_size,
+        # Fine-tuning
         model_name=args.model_name,
         memory_layers=memory_layers,
+        # Training
         max_steps=args.max_steps,
         warmup_steps=args.warmup_steps,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -887,7 +1303,11 @@ def main():
         num_examples=args.num_examples,
     )
 
-    train(config)
+    # Choose training function based on mode
+    if config.train_from_scratch:
+        train_scratch(config)
+    else:
+        train(config)
 
 
 if __name__ == "__main__":
